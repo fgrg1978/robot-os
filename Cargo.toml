@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "crates/common",
+    "crates/arch",
+    "crates/sync",
+    "crates/drivers",
+    "crates/mm",
+    "crates/sched",
+    "crates/syscall",
+    "crates/fs",
+    "crates/net",
+    "crates/ipc",
+    "crates/service",
+    "crates/robot",
+    "crates/shell",
+    "crates/ml",
+    "crates/camera",
+    "crates/config",
+    "crates/imu",
+    "crates/baro",
+    "crates/dtb",
+    "crates/behavior",
+    "crates/channel",
+    "crates/ahrs",
+    "crates/gps",
+    "crates/flight",
+    "crates/telemetry",
+    "crates/nav",
+    "crates/libsys",
+]
+
+[workspace.dependencies]
+bitflags = "2"
+log = "0.4"
+static_assertions = "1.1"
+linked_list_allocator = { version = "0.10", default-features = false }
+
+# Internal crates
+robot_os_common = { path = "crates/common" }
+robot_os_arch = { path = "crates/arch" }
+robot_os_sync = { path = "crates/sync" }
+robot_os_drivers = { path = "crates/drivers" }
+robot_os_mm = { path = "crates/mm" }
+robot_os_sched = { path = "crates/sched" }
+robot_os_syscall = { path = "crates/syscall" }
+robot_os_fs = { path = "crates/fs" }
+robot_os_net = { path = "crates/net" }
+robot_os_ipc = { path = "crates/ipc" }
+robot_os_service = { path = "crates/service" }
+robot_os_robot = { path = "crates/robot" }
+robot_os_shell  = { path = "crates/shell" }
+robot_os_ml     = { path = "crates/ml" }
+robot_os_camera = { path = "crates/camera" }
+robot_os_config = { path = "crates/config" }
+robot_os_imu    = { path = "crates/imu" }
+robot_os_baro   = { path = "crates/baro" }
+robot_os_dtb      = { path = "crates/dtb" }
+robot_os_behavior = { path = "crates/behavior" }
+robot_os_channel  = { path = "crates/channel" }
+robot_os_ahrs     = { path = "crates/ahrs" }
+robot_os_gps       = { path = "crates/gps" }
+robot_os_flight    = { path = "crates/flight" }
+robot_os_telemetry = { path = "crates/telemetry" }
+robot_os_nav       = { path = "crates/nav" }
+robot_os_libsys    = { path = "crates/libsys" }
+
+[profile.release]
+opt-level = 2
+debug = true       # Keep debug info for GDB
+lto = false        # LTO breaks global_asm sometimes
+panic = "abort"
+
+[profile.dev]
+opt-level = 1      # Some optimization even in debug (kernel needs it)
+panic = "abort"

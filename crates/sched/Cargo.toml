@@ -1,0 +1,14 @@
+[package]
+name = "robot_os_sched"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+esp32c3 = ["robot_os_arch/esp32c3"]
+no-mmu = []
+
+[dependencies]
+robot_os_mm = { workspace = true }
+robot_os_arch = { workspace = true }
+robot_os_sync = { workspace = true }
+robot_os_common = { workspace = true }

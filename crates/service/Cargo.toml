@@ -1,0 +1,10 @@
+[package]
+name = "robot_os_service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+robot_os_ipc = { workspace = true }
+robot_os_sched = { workspace = true }
+robot_os_sync = { workspace = true }
+robot_os_common = { workspace = true }

@@ -1,0 +1,25 @@
+# Build artifacts
+/target/
+/build/
+
+# Disk images
+*.img
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Documentation (generated, not tracked)
+/docs/
+

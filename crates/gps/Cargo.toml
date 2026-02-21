@@ -1,0 +1,8 @@
+[package]
+name = "robot_os_gps"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+robot_os_channel = { workspace = true }
+robot_os_drivers = { workspace = true }

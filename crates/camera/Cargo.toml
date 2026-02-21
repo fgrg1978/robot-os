@@ -1,0 +1,11 @@
+[package]
+name = "robot_os_camera"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+rvv = ["robot_os_arch/rvv"]
+
+[dependencies]
+robot_os_arch    = { workspace = true }
+robot_os_drivers = { workspace = true }

@@ -1,0 +1,48 @@
+[package]
+name = "robot_os_kernel"
+version = "0.1.0"
+edition = "2021"
+
+# Pass --features vf2 to target StarFive VisionFive 2 (JH7110).
+# Pass --features k1  to target SpacemiT K1 (BananaPi BPI-F3, RV64GCVB + RVV1.0).
+# Pass --features rvv to enable RISC-V Vector Extension benchmarks (QEMU only).
+# vf2 and rvv are mutually exclusive (VF2 has no V extension).
+# k1 includes rvv because the K1 has native RVV 1.0 (VLEN=256).
+[features]
+vf2 = ["robot_os_drivers/vf2"]
+k1  = ["robot_os_drivers/k1", "robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv"]
+rvv = ["robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv"]
+no-ml   = ["robot_os_shell/no-ml", "robot_os_behavior/no-ml"]
+no-mmu  = ["robot_os_shell/no-mmu", "robot_os_sched/no-mmu"]
+esp32c3 = ["no-mmu", "no-ml", "robot_os_drivers/esp32c3", "robot_os_shell/esp32c3", "robot_os_mm/small-mem", "robot_os_mm/esp32c3", "robot_os_arch/esp32c3", "robot_os_sched/esp32c3"]
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+[dependencies]
+robot_os_common = { workspace = true }
+robot_os_arch = { workspace = true }
+robot_os_sync = { workspace = true }
+robot_os_drivers = { workspace = true }
+robot_os_mm = { workspace = true }
+robot_os_sched = { workspace = true }
+robot_os_syscall = { workspace = true }
+robot_os_fs = { workspace = true }
+robot_os_net = { workspace = true }
+robot_os_ipc = { workspace = true }
+robot_os_service = { workspace = true }
+robot_os_robot = { workspace = true }
+robot_os_shell  = { workspace = true }
+robot_os_ml     = { workspace = true }
+robot_os_camera = { workspace = true }
+robot_os_config = { workspace = true }
+robot_os_imu    = { workspace = true }
+robot_os_baro   = { workspace = true }
+robot_os_dtb      = { workspace = true }
+robot_os_behavior = { workspace = true }
+robot_os_ahrs     = { workspace = true }
+robot_os_gps       = { workspace = true }
+robot_os_flight    = { workspace = true }
+robot_os_telemetry = { workspace = true }
+robot_os_nav       = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "robot_os_syscall"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+robot_os_sched = { workspace = true }
+robot_os_mm = { workspace = true }
+robot_os_fs = { workspace = true }
+robot_os_net = { workspace = true }
+robot_os_ipc = { workspace = true }
+robot_os_service = { workspace = true }
+robot_os_robot = { workspace = true }
+robot_os_arch = { workspace = true }
+robot_os_sync = { workspace = true }
+robot_os_drivers = { workspace = true }
+robot_os_imu = { workspace = true }
+robot_os_gps = { workspace = true }
+robot_os_common = { workspace = true }

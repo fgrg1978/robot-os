@@ -1,0 +1,4 @@
+[package]
+name = "robot_os_libsys"
+version = "0.1.0"
+edition = "2021"
