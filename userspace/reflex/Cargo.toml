@@ -1,0 +1,12 @@
+[package]
+name = "reflex"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+robot_os_libsys = { path = "../../crates/libsys" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

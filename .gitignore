@@ -23,3 +23,5 @@ CLAUDE.md
 # Documentation (generated, not tracked)
 /docs/
 
+userspace/reflex/target/
+userspace/brain_client/target/

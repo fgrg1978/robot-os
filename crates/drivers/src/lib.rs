@@ -83,3 +83,15 @@ pub mod csi;
 
 // WiFi driver (ESP32-C3 only; no-op stub on other targets).
 pub mod wifi;
+
+// PID velocity controller for wheeled robots (4WD differential drive).
+pub mod motor_pid;
+
+// ADS1115 16-bit 4-channel I2C ADC (battery voltage, analog sensors).
+pub mod ads1115;
+
+// PWM-based piezo buzzer for audio feedback (beeps, tones, alerts).
+pub mod buzzer;
+
+// LD19 (LD-06) 2D LiDAR UART driver — 360° scan, 12m range.
+pub mod lidar;

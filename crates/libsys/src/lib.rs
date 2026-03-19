@@ -159,6 +159,16 @@ const SYS_SENSOR_INFO: u64 = 330;
 const SYS_SENSOR_ADD: u64 = 331;
 const SYS_SENSOR_READ: u64 = 332;
 
+// Sensor type IDs for sensor_read()
+pub const SENSOR_TYPE_IMU: u64 = 0;
+pub const SENSOR_TYPE_ODOM: u64 = 1;
+pub const SENSOR_TYPE_ENCODER: u64 = 2;
+pub const SENSOR_TYPE_RANGE: u64 = 3;
+pub const SENSOR_TYPE_BATTERY: u64 = 4;
+pub const SENSOR_TYPE_GPS: u64 = 5;
+pub const SENSOR_TYPE_LIDAR: u64 = 6;
+pub const SENSOR_TYPE_GPIO_FLAGS: u64 = 7;
+
 // Platform
 const SYS_PLATFORM_INFO: u64 = 340;
 const SYS_PLATFORM_TYPE: u64 = 341;

@@ -168,6 +168,13 @@ pub const SYS_BRK:    u64 = 400;
 pub const SYS_MMAP:   u64 = 401;
 pub const SYS_MUNMAP: u64 = 402;
 
+// ADC
+pub const SYS_ADC_READ: u64 = 410;
+
+// Buzzer
+pub const SYS_BUZZER_TONE: u64 = 420;
+pub const SYS_BUZZER_OFF:  u64 = 421;
+
 // Service manager
 pub const SYS_SERVICE_REGISTER:   u64 = 390;
 pub const SYS_SERVICE_UNREGISTER: u64 = 391;

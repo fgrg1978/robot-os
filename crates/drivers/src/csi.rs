@@ -1,12 +1,17 @@
-/// MIPI CSI-2 camera driver — Phase M2.
+/// MIPI CSI-2 camera driver — Phase M2 + Phase T (streaming).
 ///
 /// Captures grayscale frames from a MIPI CSI-2 camera sensor.
 /// - QEMU: generates synthetic grayscale test patterns (no real hardware).
-/// - VF2: JH7110 ISP + MIPI CSI-2 receiver (register stubs, real impl TODO).
-/// - K1: SpacemiT ISP + MIPI CSI-2 receiver (register stubs, real impl TODO).
+/// - VF2: JH7110 ISP + MIPI CSI-2 receiver (real init in Phase T).
+/// - K1: SpacemiT ISP + MIPI CSI-2 receiver (real init in Phase T).
 ///
-/// Frame format: 8-bit grayscale, configurable resolution.
-/// Default: 320x240 = 76,800 bytes per frame.
+/// Phase T additions:
+/// - Camera power control via GPIO MOSFET (ECO mode: OFF, ALERT: ON)
+/// - JPEG compression stub (software baseline JPEG for reduced bandwidth)
+/// - CAMERA_FRAME over UART bridge path (not just TCP)
+///
+/// Frame format: 8-bit grayscale or JPEG, configurable resolution.
+/// Default: 320x240 = 76,800 bytes per frame (raw Gray8).
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
@@ -20,6 +25,10 @@ pub const MAX_HEIGHT: u16 = 480;
 pub const DEFAULT_WIDTH: u16 = 320;
 /// Default capture height.
 pub const DEFAULT_HEIGHT: u16 = 240;
+/// GPIO pin controlling camera MOSFET power.
+const CAMERA_POWER_GPIO: u32 = 11;
+/// Camera warm-up time after power on (milliseconds).
+pub const CAMERA_WARMUP_MS: u32 = 200;
 
 /// Pixel format.
 #[derive(Clone, Copy, PartialEq)]

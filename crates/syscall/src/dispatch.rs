@@ -108,6 +108,13 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         SYS_MMAP   => sys_mmap(a0, a1, a2, a3, a4, _a5),
         SYS_MUNMAP => sys_munmap(a0, a1),
 
+        // ADC
+        SYS_ADC_READ => sys_adc_read(a0),
+
+        // Buzzer
+        SYS_BUZZER_TONE => sys_buzzer_tone(a0, a1),
+        SYS_BUZZER_OFF  => sys_buzzer_off(),
+
         // IPC channels
         SYS_IPC_CREATE  => sys_ipc_create(),
         SYS_IPC_SEND    => sys_ipc_send(a0, a1, a2),

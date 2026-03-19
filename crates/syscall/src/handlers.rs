@@ -883,6 +883,38 @@ pub const SENSOR_TYPE_ENCODER:   u64 = 2;  // 16 bytes: enc_l(i64) + enc_r(i64)
 pub const SENSOR_TYPE_RANGE:     u64 = 3;  //  4 bytes: front_mm(u16) + right_mm(u16)
 pub const SENSOR_TYPE_BATTERY:   u64 = 4;  //  2 bytes: mv(u16)
 pub const SENSOR_TYPE_GPS:       u64 = 5;  // 16 bytes: lat_deg7(i32) + lon_deg7(i32) + alt_cm(i32) + fix(u8) + sats(u8) + pad(u16)
+pub const SENSOR_TYPE_LIDAR:     u64 = 6;  // N×4 bytes: [angle_cdeg(u16) + distance_mm(u16)] per point
+pub const SENSOR_TYPE_GPIO_FLAGS: u64 = 7; // 2 bytes: u16 LE — PIR(0x0001) | SOUND(0x0002) | IR(0x0004)
+
+// GPIO pins for digital sensors (must match guard mode pin assignment)
+const GPIO_PIN_PIR: u32 = 13;
+const GPIO_PIN_IR: u32 = 14;
+const GPIO_PIN_SOUND: u32 = 15;
+
+// Sensor flag bits (must match brain_protocol.rs)
+const SENSOR_FLAG_PIR: u16   = 0x0001;
+const SENSOR_FLAG_SOUND: u16 = 0x0002;
+const SENSOR_FLAG_IR: u16    = 0x0004;
+
+/// Helper: write sensor data to user buffer (handles both kernel and user-space callers).
+/// Builds data in a kernel-side tmp buffer, then copies to user via copy_to_user if needed.
+fn sensor_write_to_user(buf_ptr: u64, data: &[u8]) -> i64 {
+    if robot_os_sched::current_user_pt() != 0 {
+        // User-space caller — safe copy via page table walk
+        if robot_os_sched::copy_to_user(buf_ptr as usize, data.as_ptr(), data.len()) {
+            data.len() as i64
+        } else {
+            -1
+        }
+    } else {
+        // Kernel caller — direct copy
+        let out = unsafe {
+            core::slice::from_raw_parts_mut(buf_ptr as *mut u8, data.len())
+        };
+        out.copy_from_slice(data);
+        data.len() as i64
+    }
+}
 
 /// SYS_SENSOR_READ: read sensor data.
 ///   a0 = sensor_type, a1 = user_buf_ptr, a2 = buf_len
@@ -895,19 +927,16 @@ pub fn sys_sensor_read(sensor_type: u64, buf_ptr: u64, buf_len: u64) -> i64 {
             const IMU_DATA_SIZE: usize = 24; // 6 × i32
             if (buf_len as usize) < IMU_DATA_SIZE { return -1; }
             if let Some(imu) = robot_os_imu::imu_read_scaled() {
-                let out = unsafe {
-                    core::slice::from_raw_parts_mut(buf_ptr as *mut u8, IMU_DATA_SIZE)
-                };
-                // accel_mg[0..3] then gyro_mdps[0..3], each i32 LE
+                let mut tmp = [0u8; IMU_DATA_SIZE];
                 for i in 0..3 {
                     let b = imu.accel_mg[i].to_le_bytes();
-                    out[i * 4..i * 4 + 4].copy_from_slice(&b);
+                    tmp[i * 4..i * 4 + 4].copy_from_slice(&b);
                 }
                 for i in 0..3 {
                     let b = imu.gyro_mdps[i].to_le_bytes();
-                    out[12 + i * 4..12 + i * 4 + 4].copy_from_slice(&b);
+                    tmp[12 + i * 4..12 + i * 4 + 4].copy_from_slice(&b);
                 }
-                IMU_DATA_SIZE as i64
+                sensor_write_to_user(buf_ptr, &tmp)
             } else {
                 -1 // IMU not ready
             }
@@ -916,69 +945,118 @@ pub fn sys_sensor_read(sensor_type: u64, buf_ptr: u64, buf_len: u64) -> i64 {
             const ODOM_DATA_SIZE: usize = 16; // 2 × i64
             if (buf_len as usize) < ODOM_DATA_SIZE { return -1; }
             let (dist_mm, heading_cdeg) = robot_os_robot::odom_get();
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(buf_ptr as *mut u8, ODOM_DATA_SIZE)
-            };
-            out[0..8].copy_from_slice(&dist_mm.to_le_bytes());
-            out[8..16].copy_from_slice(&heading_cdeg.to_le_bytes());
-            ODOM_DATA_SIZE as i64
+            let mut tmp = [0u8; ODOM_DATA_SIZE];
+            tmp[0..8].copy_from_slice(&dist_mm.to_le_bytes());
+            tmp[8..16].copy_from_slice(&heading_cdeg.to_le_bytes());
+            sensor_write_to_user(buf_ptr, &tmp)
         }
         SENSOR_TYPE_ENCODER => {
             const ENC_DATA_SIZE: usize = 16; // 2 × i64
             if (buf_len as usize) < ENC_DATA_SIZE { return -1; }
             let (enc_l, enc_r) = robot_os_robot::encoder_read();
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(buf_ptr as *mut u8, ENC_DATA_SIZE)
-            };
-            out[0..8].copy_from_slice(&enc_l.to_le_bytes());
-            out[8..16].copy_from_slice(&enc_r.to_le_bytes());
-            ENC_DATA_SIZE as i64
+            let mut tmp = [0u8; ENC_DATA_SIZE];
+            tmp[0..8].copy_from_slice(&enc_l.to_le_bytes());
+            tmp[8..16].copy_from_slice(&enc_r.to_le_bytes());
+            sensor_write_to_user(buf_ptr, &tmp)
         }
         SENSOR_TYPE_RANGE => {
             const RANGE_DATA_SIZE: usize = 4; // 2 × u16
             if (buf_len as usize) < RANGE_DATA_SIZE { return -1; }
             let front = robot_os_drivers::rangefinder::us_read_mm(0).unwrap_or(0) as u16;
             let right = robot_os_drivers::rangefinder::us_read_mm(1).unwrap_or(0) as u16;
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(buf_ptr as *mut u8, RANGE_DATA_SIZE)
-            };
-            out[0..2].copy_from_slice(&front.to_le_bytes());
-            out[2..4].copy_from_slice(&right.to_le_bytes());
-            RANGE_DATA_SIZE as i64
+            let mut tmp = [0u8; RANGE_DATA_SIZE];
+            tmp[0..2].copy_from_slice(&front.to_le_bytes());
+            tmp[2..4].copy_from_slice(&right.to_le_bytes());
+            sensor_write_to_user(buf_ptr, &tmp)
         }
         SENSOR_TYPE_BATTERY => {
             const BATT_DATA_SIZE: usize = 2; // u16
             if (buf_len as usize) < BATT_DATA_SIZE { return -1; }
-            // Simulated battery — in real hardware, read ADC
             const SIMULATED_BATTERY_MV: u16 = 3700;
-            let mv: u16 = SIMULATED_BATTERY_MV;
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(buf_ptr as *mut u8, BATT_DATA_SIZE)
+            const BATTERY_ADC_CHANNEL: u8 = 0;
+            const BATTERY_DIVIDER_RATIO: u32 = 2; // 1:1 voltage divider halves Vbat
+            let mv: u16 = if robot_os_drivers::ads1115::ads1115_is_initialized() {
+                robot_os_drivers::ads1115::ads1115_read_battery_mv(
+                    BATTERY_ADC_CHANNEL, BATTERY_DIVIDER_RATIO
+                ).unwrap_or(SIMULATED_BATTERY_MV as u32) as u16
+            } else {
+                SIMULATED_BATTERY_MV
             };
-            out[0..2].copy_from_slice(&mv.to_le_bytes());
-            BATT_DATA_SIZE as i64
+            sensor_write_to_user(buf_ptr, &mv.to_le_bytes())
         }
         SENSOR_TYPE_GPS => {
             const GPS_DATA_SIZE: usize = 16;
             if (buf_len as usize) < GPS_DATA_SIZE { return -1; }
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(buf_ptr as *mut u8, GPS_DATA_SIZE)
-            };
+            let mut tmp = [0u8; GPS_DATA_SIZE];
             if let Some(pos) = robot_os_gps::gps_read() {
-                out[0..4].copy_from_slice(&pos.lat_deg7.to_le_bytes());
-                out[4..8].copy_from_slice(&pos.lon_deg7.to_le_bytes());
-                out[8..12].copy_from_slice(&pos.alt_mm.to_le_bytes());
-                out[12] = pos.fix;
-                out[13] = pos.sats;
-                out[14..16].copy_from_slice(&0u16.to_le_bytes()); // padding
-            } else {
-                // No GPS fix available — zero-fill
-                out[..GPS_DATA_SIZE].fill(0);
+                tmp[0..4].copy_from_slice(&pos.lat_deg7.to_le_bytes());
+                tmp[4..8].copy_from_slice(&pos.lon_deg7.to_le_bytes());
+                tmp[8..12].copy_from_slice(&pos.alt_mm.to_le_bytes());
+                tmp[12] = pos.fix;
+                tmp[13] = pos.sats;
+                tmp[14..16].copy_from_slice(&0u16.to_le_bytes());
             }
-            GPS_DATA_SIZE as i64
+            sensor_write_to_user(buf_ptr, &tmp)
+        }
+        SENSOR_TYPE_LIDAR => {
+            // Read latest LiDAR scan into user buffer
+            // Data format: N × [angle_cdeg(u16 LE) + distance_mm(u16 LE)]
+            let count = robot_os_drivers::lidar::lidar_scan_count();
+            if count == 0 { return 0; } // no scan available
+            let needed = count * robot_os_drivers::lidar::SCAN_POINT_SIZE;
+            if (buf_len as usize) < needed { return -1; }
+            // Read into kernel tmp buffer, then copy to user
+            let mut tmp = [0u8; robot_os_drivers::lidar::SCAN_DATA_MAX_BYTES];
+            let bytes = robot_os_drivers::lidar::lidar_read_scan(&mut tmp);
+            if bytes == 0 { return 0; }
+            sensor_write_to_user(buf_ptr, &tmp[..bytes])
+        }
+        SENSOR_TYPE_GPIO_FLAGS => {
+            const FLAGS_DATA_SIZE: usize = 2; // u16
+            if (buf_len as usize) < FLAGS_DATA_SIZE { return -1; }
+            let mut flags: u16 = 0;
+            if robot_os_drivers::gpio::gpio_read(GPIO_PIN_PIR) == 1 {
+                flags |= SENSOR_FLAG_PIR;
+            }
+            if robot_os_drivers::gpio::gpio_read(GPIO_PIN_SOUND) == 1 {
+                flags |= SENSOR_FLAG_SOUND;
+            }
+            if robot_os_drivers::gpio::gpio_read(GPIO_PIN_IR) == 1 {
+                flags |= SENSOR_FLAG_IR;
+            }
+            sensor_write_to_user(buf_ptr, &flags.to_le_bytes())
         }
         _ => -1,
     }
+}
+
+// ── ADC (ADS1115) ────────────────────────────────────────────────────────────
+
+/// Read ADC channel in millivolts.  a0 = channel (0-3), returns mv or -1.
+pub fn sys_adc_read(channel: u64) -> i64 {
+    if channel > 3 { return -1; }
+    match robot_os_drivers::ads1115::ads1115_read_mv(channel as u8) {
+        Some(mv) => mv as i64,
+        None => -1,
+    }
+}
+
+// ── Buzzer ───────────────────────────────────────────────────────────────────
+
+/// Play a tone.  a0 = frequency in Hz, a1 = duration in ms.
+pub fn sys_buzzer_tone(freq_hz: u64, duration_ms: u64) -> i64 {
+    const MAX_BUZZER_FREQ_HZ: u16 = 20_000;
+    const MAX_BUZZER_DURATION_MS: u32 = 10_000;
+    let freq = (freq_hz as u16).min(MAX_BUZZER_FREQ_HZ);
+    let dur = (duration_ms as u32).min(MAX_BUZZER_DURATION_MS);
+    robot_os_drivers::buzzer::buzzer_tone(freq, dur);
+    0
+}
+
+/// Stop buzzer.
+pub fn sys_buzzer_off() -> i64 {
+    robot_os_drivers::buzzer::buzzer_off();
+    0
 }
 
 // ── Stubs for unimplemented subsystems ───────────────────────────────────────

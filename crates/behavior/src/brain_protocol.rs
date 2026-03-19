@@ -4,12 +4,15 @@
 //!   MAGIC[2] | TYPE[1] | LEN[2 LE] | PAYLOAD[0..1400] | CRC8[1]
 //!
 //! Robot → Server (0x01-0x7F):
-//!   0x01  SENSOR_PACKET   62 bytes (wheeled: 34B header + 28B payload)
+//!   0x01  SENSOR_PACKET   64 bytes (wheeled: 34B header + 28B payload + 2B flags)
 //!   0x02  CAMERA_FRAME    5B header + JPEG
 //!   0x03  STATUS          8 bytes
 //!
 //! Server → Robot (0x80-0xFF):
 //!   0x80  ACTUATOR_CMD    3 + 2*N bytes
+//!   0x81  MODE_CMD        1 byte
+//!   0x82  WAYPOINT_CMD    14 bytes
+//!   0x83  CONFIG_CMD      4 bytes (key + value + reserved)
 //!
 //! SensorPacket common header (34 bytes, little-endian):
 //!   timestamp_ms: u64   (8B)
@@ -17,13 +20,14 @@
 //!   gyro_mdps[3]: i32×3 (12B)
 //!   battery_mv:   u16   (2B)
 //!
-//! SensorPacket wheeled extra (28 bytes):
+//! SensorPacket wheeled extra (30 bytes):
 //!   odom_dist_mm:  i32  (4B)
 //!   odom_hdg_cdeg: i32  (4B)
 //!   encoder_l:     i64  (8B)
 //!   encoder_r:     i64  (8B)
 //!   range_front:   u16  (2B)
 //!   range_right:   u16  (2B)
+//!   sensor_flags:  u16  (2B)  — PIR/sound/IR digital trigger flags
 //!
 //! StatusPacket (8 bytes):
 //!   mode:       u8
@@ -37,6 +41,11 @@
 //!   n_channels:    u8
 //!   flags:         u8  (bit0=emergency, bit1=alert)
 //!   channels:      [i16; N] LE
+//!
+//! ConfigCmd payload (4 bytes):
+//!   config_key: u8   — subsystem selector (LED, buzzer, power, etc.)
+//!   value:      u8   — command value
+//!   reserved:   u16  — reserved for future use
 
 pub const MAGIC: [u8; 2]       = *b"BR";
 
@@ -69,13 +78,95 @@ pub const CAMERA_HDR_SIZE: usize = 5;
 pub const CAMERA_FMT_GRAY8: u8 = 0;
 pub const CAMERA_FMT_JPEG:  u8 = 1;
 
+// ── Config keys (CONFIG_CMD config_key field) ───────────────────────────────
+
+/// LED state control.
+pub const CFG_KEY_LED:       u8 = 0x10;
+/// Power mode (ECO / ALERT).
+pub const CFG_KEY_POWER:     u8 = 0x11;
+/// Camera power GPIO (on / off).
+pub const CFG_KEY_CAMERA:    u8 = 0x12;
+/// ESP32 WiFi sleep mode (batch / continuous).
+pub const CFG_KEY_WIFI:      u8 = 0x13;
+/// LiDAR scan rate in Hz.
+pub const CFG_KEY_LIDAR_HZ:  u8 = 0x14;
+/// Buzzer pattern.
+pub const CFG_KEY_BUZZER:    u8 = 0x15;
+/// Siren module (12V MOSFET).
+pub const CFG_KEY_SIREN:     u8 = 0x16;
+/// LED 10W COB spotlight (MOSFET).
+pub const CFG_KEY_SPOTLIGHT: u8 = 0x17;
+/// Green laser 532nm (MOSFET).
+pub const CFG_KEY_LASER:     u8 = 0x18;
+/// Pan servo angle (0-180 degrees).
+pub const CFG_KEY_SERVO_PAN: u8 = 0x19;
+/// Tilt servo angle (0-180 degrees).
+pub const CFG_KEY_SERVO_TILT: u8 = 0x1A;
+/// Speaker / amplifier audio file ID.
+pub const CFG_KEY_SPEAKER:   u8 = 0x1B;
+
+// ── LED state codes ─────────────────────────────────────────────────────────
+
+#[allow(dead_code)] pub const LED_OFF:          u8 = 0x00;
+#[allow(dead_code)] pub const LED_GREEN:        u8 = 0x01;
+#[allow(dead_code)] pub const LED_GREEN_BLINK:  u8 = 0x02;
+#[allow(dead_code)] pub const LED_YELLOW:       u8 = 0x03;
+#[allow(dead_code)] pub const LED_YELLOW_BLINK: u8 = 0x04;
+#[allow(dead_code)] pub const LED_RED:          u8 = 0x05;
+#[allow(dead_code)] pub const LED_RED_BLINK:    u8 = 0x06;
+#[allow(dead_code)] pub const LED_RED_STROBE:   u8 = 0x07;
+#[allow(dead_code)] pub const LED_BLUE:         u8 = 0x08;
+#[allow(dead_code)] pub const LED_BLUE_BLINK:   u8 = 0x09;
+#[allow(dead_code)] pub const LED_WHITE_FLASH:  u8 = 0x0A;
+
+// ── Buzzer patterns ─────────────────────────────────────────────────────────
+
+pub const BUZZER_OFF:   u8 = 0x00;
+pub const BUZZER_BEEP:  u8 = 0x01;
+pub const BUZZER_SIREN: u8 = 0x02;
+#[allow(dead_code)] pub const BUZZER_CHIRP: u8 = 0x03;
+
+// ── Power modes ─────────────────────────────────────────────────────────────
+
+#[allow(dead_code)] pub const POWER_ECO:   u8 = 0x00;
+#[allow(dead_code)] pub const POWER_ALERT: u8 = 0x01;
+
+// ── Camera power ────────────────────────────────────────────────────────────
+
+#[allow(dead_code)] pub const CAMERA_PWR_OFF: u8 = 0x00;
+#[allow(dead_code)] pub const CAMERA_PWR_ON:  u8 = 0x01;
+
+// ── WiFi modes ──────────────────────────────────────────────────────────────
+
+#[allow(dead_code)] pub const WIFI_BATCH:      u8 = 0x00;
+#[allow(dead_code)] pub const WIFI_CONTINUOUS: u8 = 0x01;
+
+// ── Device on/off (siren, spotlight, laser) ─────────────────────────────────
+
+#[allow(dead_code)] pub const DEVICE_OFF:       u8 = 0x00;
+#[allow(dead_code)] pub const DEVICE_ON:        u8 = 0x01;
+#[allow(dead_code)] pub const SPOTLIGHT_STROBE: u8 = 0x02;
+
+// ── Speaker audio IDs ───────────────────────────────────────────────────────
+
+#[allow(dead_code)] pub const SPEAKER_STOP:     u8 = 0x00;
+#[allow(dead_code)] pub const SPEAKER_WARNING:  u8 = 0x01;
+#[allow(dead_code)] pub const SPEAKER_DOG_BARK: u8 = 0x02;
+#[allow(dead_code)] pub const SPEAKER_SIREN_FX: u8 = 0x03;
+
+// ── Digital sensor flags (u16 bit flags in sensor_flags field) ──────────────
+
+#[allow(dead_code)] pub const SENSOR_FLAG_PIR:   u16 = 0x0001;
+#[allow(dead_code)] pub const SENSOR_FLAG_SOUND: u16 = 0x0002;
+#[allow(dead_code)] pub const SENSOR_FLAG_IR:    u16 = 0x0004;
+
 // Payload sizes
-pub const SENSOR_PAYLOAD_SIZE: usize = 62;   // 34 header + 28 wheeled
+pub const SENSOR_PAYLOAD_SIZE: usize = 64;   // 34 header + 28 wheeled + 2 flags
 pub const STATUS_PAYLOAD_SIZE: usize = 8;
 // Frame overhead: MAGIC(2) + TYPE(1) + LEN(2) + CRC(1) = 6
 pub const FRAME_OVERHEAD: usize = 6;
 
-pub const SENSOR_FRAME_SIZE: usize = SENSOR_PAYLOAD_SIZE + FRAME_OVERHEAD;  // 68
+pub const SENSOR_FRAME_SIZE: usize = SENSOR_PAYLOAD_SIZE + FRAME_OVERHEAD;  // 70
 pub const STATUS_FRAME_SIZE: usize = STATUS_PAYLOAD_SIZE + FRAME_OVERHEAD;  // 14
 
 /// Maximum channels in an ActuatorCmd.
@@ -179,7 +270,7 @@ pub fn parse_packet(buf: &[u8]) -> Option<(u8, usize, usize, usize)> {
 
 // ── SensorPacket encoder ──────────────────────────────────────────────────────
 
-/// Encode a wheeled SensorPacket payload (62 bytes) into `buf`.
+/// Encode a wheeled SensorPacket payload (64 bytes) into `buf`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_sensor_packet(
     buf:            &mut [u8; SENSOR_PAYLOAD_SIZE],
@@ -193,6 +284,7 @@ pub fn encode_sensor_packet(
     encoder_r:      i64,
     range_front_mm: u16,
     range_right_mm: u16,
+    sensor_flags:   u16,
 ) {
     // ── Common header (34 bytes) ──────────────────────────────────────────────
     put_u64(buf, 0,  timestamp_ms);
@@ -210,6 +302,8 @@ pub fn encode_sensor_packet(
     put_i64(buf, 50, encoder_r);
     put_u16(buf, 58, range_front_mm);
     put_u16(buf, 60, range_right_mm);
+    // ── Digital sensor flags (2 bytes at offset 62) ───────────────────────────
+    put_u16(buf, 62, sensor_flags);
 }
 
 // ── StatusPacket encoder ──────────────────────────────────────────────────────
@@ -328,30 +422,22 @@ pub fn decode_waypoint_cmd(payload: &[u8]) -> Option<WaypointCmd> {
 
 // ── ConfigCmd ───────────────────────────────────────────────────────────────
 
-/// Key field size in CONFIG_CMD payload (null-padded).
-pub const CONFIG_KEY_SIZE:   usize = 24;
-/// Value field size in CONFIG_CMD payload (null-padded).
-pub const CONFIG_VALUE_SIZE: usize = 16;
-/// Total payload size for CONFIG_CMD: key(24) + value(16) = 40 bytes.
-pub const CONFIG_PAYLOAD_SIZE: usize = CONFIG_KEY_SIZE + CONFIG_VALUE_SIZE;
+/// Total payload size for CONFIG_CMD: key(1) + value(1) + reserved(2) = 4 bytes.
+pub const CONFIG_PAYLOAD_SIZE: usize = 4;
+
+// Field offsets within ConfigCmd payload
+const CFG_OFF_KEY:      usize = 0;
+const CFG_OFF_VALUE:    usize = 1;
+const CFG_OFF_RESERVED: usize = 2;
 
 /// Decoded config command from the Brain Server.
+///
+/// 4-byte format: config_key(u8) + value(u8) + reserved(u16 LE).
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigCmd {
-    pub key_buf:   [u8; CONFIG_KEY_SIZE],
-    pub value_buf: [u8; CONFIG_VALUE_SIZE],
-}
-
-impl ConfigCmd {
-    /// Return the key bytes trimmed of trailing null padding.
-    pub fn key(&self) -> &[u8] {
-        trim_null_padding(&self.key_buf)
-    }
-
-    /// Return the value bytes trimmed of trailing null padding.
-    pub fn value(&self) -> &[u8] {
-        trim_null_padding(&self.value_buf)
-    }
+    pub config_key: u8,
+    pub value:      u8,
+    pub reserved:   u16,
 }
 
 /// Decode a ConfigCmd from the payload bytes of a `PKT_CONFIG` packet.
@@ -359,17 +445,11 @@ impl ConfigCmd {
 /// Returns `None` if payload is too short.
 pub fn decode_config_cmd(payload: &[u8]) -> Option<ConfigCmd> {
     if payload.len() < CONFIG_PAYLOAD_SIZE { return None; }
-    let mut key_buf   = [0u8; CONFIG_KEY_SIZE];
-    let mut value_buf = [0u8; CONFIG_VALUE_SIZE];
-    key_buf.copy_from_slice(&payload[..CONFIG_KEY_SIZE]);
-    value_buf.copy_from_slice(&payload[CONFIG_KEY_SIZE..CONFIG_PAYLOAD_SIZE]);
-    Some(ConfigCmd { key_buf, value_buf })
-}
-
-/// Trim trailing null bytes from a slice.
-fn trim_null_padding(buf: &[u8]) -> &[u8] {
-    let end = buf.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    &buf[..end]
+    Some(ConfigCmd {
+        config_key: payload[CFG_OFF_KEY],
+        value:      payload[CFG_OFF_VALUE],
+        reserved:   get_u16(payload, CFG_OFF_RESERVED),
+    })
 }
 
 // ── Little-endian helpers ─────────────────────────────────────────────────────

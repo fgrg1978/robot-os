@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "userspace/brain_client",
+    "userspace/reflex",
+]
 members = [
     "kernel",
     "crates/common",

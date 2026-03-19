@@ -606,6 +606,7 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
         robot_os_drivers::i2c::I2C_BUS_COUNT);
 
     robot_os_robot::robot_init();
+    robot_os_drivers::motor_pid::motor_pid_init();
 
     // Phase H: additional drivers
     robot_os_drivers::spi::spi_init();
@@ -1258,6 +1259,7 @@ fn behavior_task(_: usize) {
                     state.enc_right,
                     range_front,
                     range_right,
+                    state.sensor_flags,
                 );
 
                 // Frame and send
@@ -1336,6 +1338,19 @@ fn behavior_task(_: usize) {
                                     state.remote_action = action;
                                 }
                             }
+                        } else if pkt_type == PKT_CONFIG {
+                            let payload = &recv_buf[pay_start..pay_start + pay_len];
+                            if let Some(cfg) = decode_config_cmd(payload) {
+                                match cfg.config_key {
+                                    CFG_KEY_BUZZER => match cfg.value {
+                                        BUZZER_BEEP  => robot_os_drivers::buzzer::buzzer_beep(),
+                                        BUZZER_SIREN => robot_os_drivers::buzzer::buzzer_alert(),
+                                        BUZZER_OFF   => robot_os_drivers::buzzer::buzzer_off(),
+                                        _ => {}
+                                    },
+                                    _ => {} // other config keys handled in future phases
+                                }
+                            }
                         }
                     }
                 }
@@ -1363,6 +1378,7 @@ fn behavior_task(_: usize) {
                 state.enc_right,
                 range_front,
                 range_right,
+                state.sensor_flags,
             );
             let mut sp_frame = [0u8; SENSOR_FRAME_SIZE];
             let sp_len = build_packet(PKT_SENSOR, &sp_payload, &mut sp_frame);
@@ -1395,6 +1411,19 @@ fn behavior_task(_: usize) {
                                 action.valid       = true;
                                 robot_os_behavior::set_last_action(action);
                                 state.remote_action = action;
+                            }
+                        }
+                    } else if pkt_type == PKT_CONFIG {
+                        let payload = &recv_buf[pay_start..pay_start + pay_len];
+                        if let Some(cfg) = decode_config_cmd(payload) {
+                            match cfg.config_key {
+                                CFG_KEY_BUZZER => match cfg.value {
+                                    BUZZER_BEEP  => robot_os_drivers::buzzer::buzzer_beep(),
+                                    BUZZER_SIREN => robot_os_drivers::buzzer::buzzer_alert(),
+                                    BUZZER_OFF   => robot_os_drivers::buzzer::buzzer_off(),
+                                    _ => {}
+                                },
+                                _ => {}
                             }
                         }
                     }
@@ -1751,16 +1780,22 @@ fn telemetry_task(_: usize) {
 /// Reads `motor_cmd_read()` each tick, checks the watchdog, and drives
 /// motors 0 and 1 according to the published command.  Runs forever.
 fn rt_motor_task(_: usize) {
-    kprintln!("[RT-MOTOR] Starting (watchdog timeout=500 ms)");
+    kprintln!("[RT-MOTOR] Starting (watchdog timeout=500 ms, PID velocity control)");
     let mut safe_mode = false;
+
+    /// Left motor hardware ID.
+    const MOTOR_ID_LEFT: u32 = 0;
+    /// Right motor hardware ID.
+    const MOTOR_ID_RIGHT: u32 = 1;
 
     loop {
         let fired = robot_os_robot::motor_watchdog_fired();
 
         if fired && !safe_mode {
             kprintln!("[RT-MOTOR] Watchdog! No command >500 ms → SAFE STOP");
-            robot_os_robot::motor_stop(0);
-            robot_os_robot::motor_stop(1);
+            robot_os_robot::motor_stop(MOTOR_ID_LEFT);
+            robot_os_robot::motor_stop(MOTOR_ID_RIGHT);
+            robot_os_drivers::motor_pid::motor_pid_reset();
             safe_mode = true;
         } else if !fired {
             if safe_mode {
@@ -1769,21 +1804,51 @@ fn rt_motor_task(_: usize) {
             }
             let cmd = robot_os_robot::motor_cmd_read();
             if robot_os_robot::CH_MOTOR_CMD.is_valid() {
-                let (dir_l, spd_l) = if cmd.speed_l >= 0 {
-                    (robot_os_robot::MotorDir::Forward,  cmd.speed_l as u32)
-                } else {
-                    (robot_os_robot::MotorDir::Backward, (-cmd.speed_l) as u32)
-                };
-                let (dir_r, spd_r) = if cmd.speed_r >= 0 {
-                    (robot_os_robot::MotorDir::Forward,  cmd.speed_r as u32)
-                } else {
-                    (robot_os_robot::MotorDir::Backward, (-cmd.speed_r) as u32)
-                };
-                robot_os_robot::motor_set(0, dir_l, spd_l);
-                robot_os_robot::motor_set(1, dir_r, spd_r);
-
                 // Phase 17: accumulate simulated encoder ticks.
                 robot_os_robot::encoder_tick(cmd.speed_l, cmd.speed_r);
+
+                if robot_os_drivers::motor_pid::motor_pid_enabled() {
+                    // Closed-loop PID velocity control.
+                    // Set target from the motor command (speed as ticks/s).
+                    robot_os_drivers::motor_pid::motor_pid_set_target(
+                        cmd.speed_l as i16,
+                        cmd.speed_r as i16,
+                    );
+
+                    // Read encoders and run PID tick.
+                    let (ticks_l, ticks_r) = robot_os_robot::encoder_read();
+                    let now = robot_os_drivers::clint::get_time();
+                    let (pwm_l, pwm_r) =
+                        robot_os_drivers::motor_pid::motor_pid_tick(ticks_l, ticks_r, now);
+
+                    // Apply PID output to motors.
+                    let (dir_l, spd_l) = if pwm_l >= 0 {
+                        (robot_os_robot::MotorDir::Forward,  pwm_l as u32)
+                    } else {
+                        (robot_os_robot::MotorDir::Backward, (-pwm_l) as u32)
+                    };
+                    let (dir_r, spd_r) = if pwm_r >= 0 {
+                        (robot_os_robot::MotorDir::Forward,  pwm_r as u32)
+                    } else {
+                        (robot_os_robot::MotorDir::Backward, (-pwm_r) as u32)
+                    };
+                    robot_os_robot::motor_set(MOTOR_ID_LEFT, dir_l, spd_l);
+                    robot_os_robot::motor_set(MOTOR_ID_RIGHT, dir_r, spd_r);
+                } else {
+                    // Open-loop: direct PWM from motor command (legacy behavior).
+                    let (dir_l, spd_l) = if cmd.speed_l >= 0 {
+                        (robot_os_robot::MotorDir::Forward,  cmd.speed_l as u32)
+                    } else {
+                        (robot_os_robot::MotorDir::Backward, (-cmd.speed_l) as u32)
+                    };
+                    let (dir_r, spd_r) = if cmd.speed_r >= 0 {
+                        (robot_os_robot::MotorDir::Forward,  cmd.speed_r as u32)
+                    } else {
+                        (robot_os_robot::MotorDir::Backward, (-cmd.speed_r) as u32)
+                    };
+                    robot_os_robot::motor_set(MOTOR_ID_LEFT, dir_l, spd_l);
+                    robot_os_robot::motor_set(MOTOR_ID_RIGHT, dir_r, spd_r);
+                }
             }
         }
 
