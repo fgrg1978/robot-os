@@ -126,7 +126,10 @@ dependencies = [
 name = "robot_os_ipc"
 version = "0.1.0"
 dependencies = [
+ "robot_os_arch",
  "robot_os_common",
+ "robot_os_drivers",
+ "robot_os_mm",
  "robot_os_sched",
  "robot_os_sync",
 ]
@@ -153,6 +156,7 @@ dependencies = [
  "robot_os_mm",
  "robot_os_nav",
  "robot_os_net",
+ "robot_os_ota",
  "robot_os_robot",
  "robot_os_sched",
  "robot_os_service",
@@ -200,6 +204,15 @@ dependencies = [
  "robot_os_common",
  "robot_os_drivers",
  "robot_os_sync",
+]
+
+[[package]]
+name = "robot_os_ota"
+version = "0.1.0"
+dependencies = [
+ "robot_os_config",
+ "robot_os_drivers",
+ "robot_os_fs",
 ]
 
 [[package]]
@@ -252,6 +265,7 @@ dependencies = [
  "robot_os_mm",
  "robot_os_nav",
  "robot_os_net",
+ "robot_os_ota",
  "robot_os_robot",
  "robot_os_sched",
  "robot_os_telemetry",

@@ -24,6 +24,7 @@ SECTIONS
 {
     . = 0x00200000;
 
+    _text_start = .;
     .text.boot : ALIGN(4K)
     {
         *(.text.boot)
@@ -33,17 +34,22 @@ SECTIONS
     {
         *(.text .text.*)
     } > RAM
+    _text_end = .;
 
+    _rodata_start = .;
     .rodata : ALIGN(4K)
     {
         *(.rodata .rodata.*)
     } > RAM
+    _rodata_end = .;
 
+    _data_start = .;
     .data : ALIGN(4K)
     {
         *(.data .data.*)
         *(.sdata .sdata.*)
     } > RAM
+    _data_end = .;
 
     .bss : ALIGN(4K)
     {

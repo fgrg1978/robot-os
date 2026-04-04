@@ -56,9 +56,14 @@ pub fn arbitrate(state: &SensorState, _mlp: &MlpResult) -> BehaviorOutput {
         }
     }
 
-    // L3: explore (default)
+    // L3: explore / offline patrol
+    // When offline mode is active, use waypoint patrol instead of default wander.
     if LAYER_ENABLED[3].load(Ordering::Relaxed) {
-        let out = layers::layer_explore(state);
+        let out = if crate::offline::offline_is_active() {
+            crate::offline::layer_offline_patrol(state)
+        } else {
+            layers::layer_explore(state)
+        };
         if out.cmd.valid {
             LAST_WINNER.store(3, Ordering::Relaxed);
             return out;

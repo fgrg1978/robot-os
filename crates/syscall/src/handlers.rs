@@ -2,6 +2,11 @@
 ///
 /// Each function corresponds to one syscall.  Handlers for subsystems that
 /// are not yet fully implemented return -1.
+///
+/// Security (AQ6): Hardware-access syscalls validate handles when the caller
+/// is a user-space process (user_pt != 0). Kernel tasks bypass handle checks
+/// (they have full access). This allows gradual migration: existing kernel
+/// tasks work unchanged, new userspace drivers must be granted handles.
 
 use robot_os_fs::{FdTable, vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek,
                   inode_alloc, dir_add_entry, dir_remove_entry,
@@ -20,6 +25,35 @@ use robot_os_net::{
     socket_send, socket_recv, socket_close,
     SockAddr, net_info, net_get_ip,
 };
+
+// ── AQ6: Handle-based capability check ────────────────────────────────────────
+//
+// Userspace processes must have a valid handle for hardware resources.
+// Kernel tasks (user_pt == 0) bypass this check — full access.
+// Returns true if the caller has permission, false to deny.
+
+/// Check if the current task is allowed to access a hardware resource.
+/// Kernel tasks always pass. Userspace tasks need a matching handle.
+fn cap_check(kind: robot_os_ipc::HandleKind, need_write: bool) -> bool {
+    // Kernel tasks have full access (no handle needed)
+    if robot_os_sched::current_user_pt() == 0 {
+        return true;
+    }
+    // Userspace: check handle table
+    let tid = robot_os_sched::current_task_tid();
+    // Search all handles for one matching this resource and owner
+    for h in 0..robot_os_ipc::MAX_HANDLES_GLOBAL as u32 {
+        if let Some(k) = robot_os_ipc::handle_check(h, tid, need_write) {
+            if k == kind {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Permission denied error code.
+const E_PERM: i64 = -99;
 
 // ── Global kernel FD table ────────────────────────────────────────────────────
 // Used until per-process FD tables are implemented in Phase 7+.
@@ -448,10 +482,12 @@ pub fn sys_service_stop_handler(name_ptr: u64) -> i64 {
 // ── GPIO ──────────────────────────────────────────────────────────────────────
 
 pub fn sys_gpio_read(pin: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Gpio(pin as u32), false) { return E_PERM; }
     gpio_read(pin as u32) as i64
 }
 
 pub fn sys_gpio_write(pin: u64, val: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Gpio(pin as u32), true) { return E_PERM; }
     gpio_write(pin as u32, val as u32) as i64
 }
 
@@ -468,20 +504,24 @@ pub fn sys_gpio_info() -> i64 {
 // ── PWM ───────────────────────────────────────────────────────────────────────
 
 pub fn sys_pwm_enable(ch: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Pwm(ch as u8), true) { return E_PERM; }
     pwm_enable(ch as u32) as i64
 }
 
 pub fn sys_pwm_disable(ch: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Pwm(ch as u8), true) { return E_PERM; }
     pwm_disable(ch as u32) as i64
 }
 
 /// SYS_PWM_SET_FREQ: a0=channel, a1=period_ns.
 pub fn sys_pwm_set_freq(ch: u64, period_ns: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Pwm(ch as u8), true) { return E_PERM; }
     pwm_set_period(ch as u32, period_ns as u32) as i64
 }
 
 /// SYS_PWM_SET_DUTY: a0=channel, a1=duty_ns.
 pub fn sys_pwm_set_duty(ch: u64, duty_ns: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Pwm(ch as u8), true) { return E_PERM; }
     pwm_set_duty(ch as u32, duty_ns as u32) as i64
 }
 
@@ -493,6 +533,7 @@ pub fn sys_pwm_info() -> i64 {
 
 /// SYS_I2C_READ: a0=bus, a1=addr, a2=reg, a3=buf_ptr, a4=len.
 pub fn sys_i2c_read(bus: u64, addr: u64, reg: u64, buf_ptr: u64, len: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::I2c(bus as u8, addr as u8), false) { return E_PERM; }
     if buf_ptr == 0 || len == 0 { return -1; }
     let buf = unsafe {
         core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize)
@@ -522,6 +563,7 @@ pub fn sys_i2c_info() -> i64 {
 
 /// SYS_MOTOR_CREATE: a0=id, a1=pwm_ch, a2=dir_pin_a, a3=dir_pin_b.
 pub fn sys_motor_create(id: u64, pwm_ch: u64, dir_a: u64, dir_b: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Motor(id as u32), true) { return E_PERM; }
     motor_init(id as u32, pwm_ch as u32, dir_a as u32, dir_b as u32) as i64
 }
 
@@ -538,6 +580,7 @@ pub fn sys_motor_enable(id: u64, dir: u64) -> i64 {
 
 /// SYS_MOTOR_SPEED: a0=id, a1=speed_pct (0-100).
 pub fn sys_motor_speed(id: u64, speed_pct: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Motor(id as u32), true) { return E_PERM; }
     if speed_pct == 0 {
         motor_stop(id as u32) as i64
     } else {
@@ -885,6 +928,8 @@ pub const SENSOR_TYPE_BATTERY:   u64 = 4;  //  2 bytes: mv(u16)
 pub const SENSOR_TYPE_GPS:       u64 = 5;  // 16 bytes: lat_deg7(i32) + lon_deg7(i32) + alt_cm(i32) + fix(u8) + sats(u8) + pad(u16)
 pub const SENSOR_TYPE_LIDAR:     u64 = 6;  // N×4 bytes: [angle_cdeg(u16) + distance_mm(u16)] per point
 pub const SENSOR_TYPE_GPIO_FLAGS: u64 = 7; // 2 bytes: u16 LE — PIR(0x0001) | SOUND(0x0002) | IR(0x0004)
+pub const SENSOR_TYPE_CAMERA:    u64 = 8; // Variable: JPEG bytes from csi_capture_jpeg()
+pub const SENSOR_TYPE_POWER:     u64 = 9; // 12 bytes: voltage_mv(u16) + current_ma(u16) + mah_used(u32) + pct(u8) + sag(u8) + failsafe(u8) + pad(u8)
 
 // GPIO pins for digital sensors (must match guard mode pin assignment)
 const GPIO_PIN_PIR: u32 = 13;
@@ -920,6 +965,7 @@ fn sensor_write_to_user(buf_ptr: u64, data: &[u8]) -> i64 {
 ///   a0 = sensor_type, a1 = user_buf_ptr, a2 = buf_len
 ///   Returns bytes written, or -1 on error.
 pub fn sys_sensor_read(sensor_type: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::Sensor(sensor_type as u8), false) { return E_PERM; }
     if buf_ptr == 0 { return -1; }
 
     match sensor_type {
@@ -1025,6 +1071,21 @@ pub fn sys_sensor_read(sensor_type: u64, buf_ptr: u64, buf_len: u64) -> i64 {
                 flags |= SENSOR_FLAG_IR;
             }
             sensor_write_to_user(buf_ptr, &flags.to_le_bytes())
+        }
+        SENSOR_TYPE_POWER => {
+            const PWR_SIZE: usize = robot_os_drivers::ina219::POWER_DATA_SIZE;
+            if (buf_len as usize) < PWR_SIZE { return -1; }
+            let mut tmp = [0u8; PWR_SIZE];
+            let n = robot_os_drivers::ina219::ina219_read_power(&mut tmp);
+            if n == 0 { return 0; }
+            sensor_write_to_user(buf_ptr, &tmp[..n])
+        }
+        SENSOR_TYPE_CAMERA => {
+            let mut jpeg_buf = [0u8; robot_os_drivers::csi::JPEG_MAX_SIZE];
+            let jpeg_len = robot_os_drivers::csi::csi_capture_jpeg(&mut jpeg_buf);
+            if jpeg_len == 0 { return 0; }
+            if (buf_len as usize) < jpeg_len { return -1; }
+            sensor_write_to_user(buf_ptr, &jpeg_buf[..jpeg_len])
         }
         _ => -1,
     }

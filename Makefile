@@ -65,7 +65,7 @@ ESP32C3_RUSTFLAGS := -C link-arg=-T$(ESP32C3_LINKER)
 
 .PHONY: all build build-rvv clean qemu qemu-smp qemu-full-smp \
         qemu-rvv qemu-full-smp-rvv userspace syscall-test make-mlp make-gguf \
-        vf2 flash-vf2 k1 flash-k1 k1-console esp32c3
+        vf2 flash-vf2 k1 flash-k1 k1-console esp32c3 ci
 
 all: build
 
@@ -155,6 +155,8 @@ build/disk.img: $(HELLO_ELF) $(SYSTEST_ELF) build/mlp.rmlp build/policy.gguf
 	@printf "Robot OS Phase 18 — Persistent configuration + dynamic model loading\n" > /tmp/_robtos_readme.txt
 	@printf "# Robot OS Configuration\nml_enabled=1\nlog_level=1\nmotor_max_speed=100\nwatchdog_ms=500\n" \
 		> /tmp/_robtos_config.ini
+	@printf "active_slot=a\nboot_count=0\nlast_good=a\nfw_version_a=0\nfw_version_b=0\n" \
+		> /tmp/_robtos_bootmeta
 	mcopy -i $@ /tmp/_robtos_hello.txt ::HELLO.TXT
 	mcopy -i $@ /tmp/_robtos_readme.txt ::README.TXT
 	mcopy -i $@ $(HELLO_ELF) ::HELLO.ELF
@@ -162,8 +164,9 @@ build/disk.img: $(HELLO_ELF) $(SYSTEST_ELF) build/mlp.rmlp build/policy.gguf
 	mcopy -i $@ build/mlp.rmlp ::MLP.RMLP
 	mcopy -i $@ build/policy.gguf ::POLICY.GGF
 	mcopy -i $@ /tmp/_robtos_config.ini ::CONFIG.INI
-	@rm -f /tmp/_robtos_hello.txt /tmp/_robtos_readme.txt /tmp/_robtos_config.ini
-	@echo "[DISK] FAT32 image: $@ (HELLO.TXT + README.TXT + HELLO.ELF + SYSTEST.ELF + MLP.RMLP + POLICY.GGF + CONFIG.INI)"
+	mcopy -i $@ /tmp/_robtos_bootmeta ::BOOTMETA
+	@rm -f /tmp/_robtos_hello.txt /tmp/_robtos_readme.txt /tmp/_robtos_config.ini /tmp/_robtos_bootmeta
+	@echo "[DISK] FAT32 image: $@ (HELLO.TXT + README.TXT + HELLO.ELF + SYSTEST.ELF + MLP.RMLP + POLICY.GGF + CONFIG.INI + BOOTMETA)"
 
 # ── VisionFive 2 targets ──────────────────────────────────────────────────────
 
@@ -244,6 +247,39 @@ ESP32C3_TARGET := riscv32imac-unknown-none-elf
 
 esp32c3:
 	$(CARGO) build --release --features esp32c3 --target $(ESP32C3_TARGET)
+
+# OTA: send firmware to robot over TCP.
+# Usage: make ota-send ROBOT=10.0.2.15 [PORT=8080] [PLATFORM=qemu] [FW_VER=1]
+ROBOT    ?= 10.0.2.15
+PORT     ?= 8080
+PLATFORM ?= qemu
+FW_VER   ?= 1
+
+# OTA needs raw binary, not ELF (ELF has debug info = too large).
+OTA_BIN := build/kernel-ota.bin
+
+$(OTA_BIN): build
+	@mkdir -p build
+	riscv64-unknown-elf-objcopy -O binary $(KERNEL_ELF) $@
+	@echo "[OTA] Raw binary: $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+ota-send: $(OTA_BIN)
+	python3 tools/ota_send.py $(OTA_BIN) $(ROBOT) \
+		--port $(PORT) --platform $(PLATFORM) --version $(FW_VER)
+
+# Generate U-Boot boot script for A/B OTA slot selection (VF2/K1).
+boot-scr: tools/boot.cmd
+	@mkdir -p build
+	mkimage -C none -A riscv -T script -d tools/boot.cmd build/boot.scr
+	@echo "[OTA] boot.scr generated"
+
+# CI: build all feature combinations (0 errors, 0 warnings).
+ci:
+	@bash tools/ci_check.sh
+
+# Full CI: robot-os builds + robot-brain tests + protocol sync.
+ci-full:
+	@bash tools/ci_full.sh
 
 help:
 	@echo "Robot OS (Rust) Build System"

@@ -22,6 +22,7 @@ SECTIONS
     . = 0x80200000;
 
     /* Boot code first */
+    _text_start = .;
     .text.boot : ALIGN(4K)
     {
         *(.text.boot)
@@ -32,19 +33,24 @@ SECTIONS
     {
         *(.text .text.*)
     } > RAM
+    _text_end = .;
 
     /* Read-only data */
+    _rodata_start = .;
     .rodata : ALIGN(4K)
     {
         *(.rodata .rodata.*)
     } > RAM
+    _rodata_end = .;
 
     /* Initialized data */
+    _data_start = .;
     .data : ALIGN(4K)
     {
         *(.data .data.*)
         *(.sdata .sdata.*)
     } > RAM
+    _data_end = .;
 
     /* Uninitialized data (BSS) */
     .bss : ALIGN(4K)

@@ -175,6 +175,10 @@ pub const SYS_ADC_READ: u64 = 410;
 pub const SYS_BUZZER_TONE: u64 = 420;
 pub const SYS_BUZZER_OFF:  u64 = 421;
 
+// Security (AQ11)
+/// Activate syscall filter for current task (one-way — cannot be disabled).
+pub const SYS_SECCOMP: u64 = 430;
+
 // Service manager
 pub const SYS_SERVICE_REGISTER:   u64 = 390;
 pub const SYS_SERVICE_UNREGISTER: u64 = 391;

@@ -1,0 +1,14 @@
+[package]
+name = "robot_os_ota"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+vf2     = []
+k1      = []
+esp32c3 = []
+
+[dependencies]
+robot_os_fs = { workspace = true }
+robot_os_config = { workspace = true }
+robot_os_drivers = { workspace = true }

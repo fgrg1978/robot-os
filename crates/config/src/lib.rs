@@ -98,6 +98,12 @@ pub static CFG_WATCHDOG_MS: AtomicU32 = AtomicU32::new(500);
 /// Runtime: motor max speed (0-100).
 pub static CFG_MOTOR_MAX_SPEED: AtomicU32 = AtomicU32::new(100);
 
+/// Runtime: auto-reboot delay after panic (ms). 0 = disabled (infinite WFI).
+pub static CFG_PANIC_REBOOT_DELAY_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Runtime: GPIO pin for hardware kill-switch (255 = disabled).
+pub static CFG_ESTOP_GPIO_PIN: AtomicU32 = AtomicU32::new(255);
+
 /// Unpack an IP from packed u32 to `[u8; 4]`.
 pub fn unpack_ip(packed: u32) -> [u8; 4] {
     [
@@ -163,6 +169,10 @@ pub fn cfg_apply() {
     // Watchdog + motor
     CFG_WATCHDOG_MS.store(cfg_get_u32(b"watchdog_ms", 500), Ordering::Release);
     CFG_MOTOR_MAX_SPEED.store(cfg_get_u32(b"motor_max_speed", 100), Ordering::Release);
+
+    // Panic + safety
+    CFG_PANIC_REBOOT_DELAY_MS.store(cfg_get_u32(b"panic_reboot_ms", 0), Ordering::Release);
+    CFG_ESTOP_GPIO_PIN.store(cfg_get_u32(b"estop_gpio_pin", 255), Ordering::Release);
 }
 
 /// Parse "a.b.c.d" into packed u32 `(a<<24)|(b<<16)|(c<<8)|d`.

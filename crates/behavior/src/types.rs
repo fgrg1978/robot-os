@@ -39,6 +39,7 @@ pub struct SensorState {
     // Misc
     pub battery_mv:     u16,
     pub velocity_mm_s:  i32,
+    pub temp_cdeg:      i32,
 
     // Digital sensor flags (PIR/sound/IR triggers)
     pub sensor_flags:   u16,
@@ -68,6 +69,7 @@ impl SensorState {
             enc_right: 0,
             battery_mv:    0,
             velocity_mm_s: 0,
+            temp_cdeg:     0,
             sensor_flags:  0,
             remote_action: VlaAction::new(),
             timestamp: 0,

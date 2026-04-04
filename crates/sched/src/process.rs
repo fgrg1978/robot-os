@@ -389,6 +389,10 @@ pub fn sys_fork_impl() -> i64 {
     let child_satp = make_satp(child_pt, crate::alloc_asid()) as u64;
     crate::scheduler::set_task_user_info(child_idx, child_satp, child_pt as u64, parent_brk);
 
+    // AQ11: Inherit parent's syscall filter — child cannot be less restricted.
+    let parent_filter = crate::scheduler::current_syscall_filter();
+    crate::scheduler::set_task_syscall_filter(child_idx, parent_filter);
+
     // Capture ecall context: sepc (ecall addr) + user SP.
     // The trap handler stores these before dispatching the syscall.
     let ecall_sepc = ECALL_SEPC.load(Ordering::Acquire);

@@ -1,13 +1,33 @@
 /// Syscall dispatch — called from trap handler on ecall.
 ///
 /// Registers: a7 = syscall number, a0..a5 = arguments, a0 = return value.
+///
+/// Security layers (AQ6 + AQ11):
+///   1. Syscall filter: per-task whitelist rejects unauthorized syscalls.
+///   2. Handle checks: (future) validate resource handles per-task.
 
 use crate::numbers::*;
 use crate::handlers::*;
 
+/// Error code for denied syscall (filter or capability violation).
+const E_PERM: i64 = -1;
+
 /// Main syscall dispatch.  Arguments are raw register values (u64).
 /// Returns the result that will be written back into a0.
 pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> i64 {
+    // AQ11: Syscall filter — reject if current task's whitelist doesn't include this syscall.
+    // Works on both RV64 and RV32 (ESP32-C3).
+    {
+        let filter = robot_os_sched::current_syscall_filter();
+        if filter.enabled && !filter.is_allowed(num as u16) {
+            robot_os_ipc::trace_event(
+                robot_os_ipc::TRACE_SYSCALL,
+                num as u32, 0xDEAD, 0, 0,  // 0xDEAD = denied marker
+            );
+            return E_PERM;
+        }
+    }
+
     match num {
         // Console
         SYS_TEST    => sys_test(),
@@ -151,6 +171,9 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         SYS_RECVFROM => sys_recv_syscall(a0, a1, a2, a3),
         SYS_SOCK_SHUTDOWN => sys_sock_close(a0),
         SYS_GETSOCKNAME | SYS_GETPEERNAME => sys_stub(),
+
+        // Security (AQ11): activate syscall filter (one-way)
+        SYS_SECCOMP => robot_os_sched::seccomp::activate_profile(a0),
 
         _ => -1,
     }

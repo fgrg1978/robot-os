@@ -3,16 +3,21 @@
 pub mod task;
 pub mod scheduler;
 pub mod smp;
+pub mod wait;
+pub mod seccomp;
 #[cfg(target_pointer_width = "64")]
 pub mod process;
 
 pub use scheduler::{
-    init, start, schedule, task_create, task_yield, task_exit,
+    init, start, schedule, task_create, task_create_affinity, task_yield, task_exit,
     current_task_name, current_task_tid,
     current_user_pt,
     stack_canary_check, MAX_CPUS, STACK_CANARY,
     pi_boost_task, pi_restore_task,
     alloc_asid,
+    wq_block_current, wq_wake_by_tid,
+    current_syscall_filter, set_current_syscall_filter,
+    set_task_syscall_filter, task_create_filtered,
 };
 
 #[cfg(not(any(feature = "no-mmu", feature = "esp32c3")))]
@@ -27,6 +32,14 @@ pub use task::{
     DEFAULT_PRIORITY, IDLE_PRIORITY, STACK_SIZE, MAX_TASKS,
     RT_MOTOR_PRIORITY, NET_POLL_PRIORITY, BEHAVIOR_PRIORITY,
     SENSOR_AHRS_PRIORITY, FLIGHT_CTRL_PRIORITY, WATCHDOG_PRIORITY,
+    RT_PRIORITY_THRESHOLD, RT_TIME_SLICE_TICKS,
+    WaitReason, DeadlineParams, SyscallFilter, SYSCALL_FILTER_MAX,
+};
+
+pub use wait::{
+    task_block,
+    wake_by_irq, wake_by_channel, wake_by_ring, wake_by_port,
+    wake_expired_timers,
 };
 
 #[cfg(target_pointer_width = "64")]

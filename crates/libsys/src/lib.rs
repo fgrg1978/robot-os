@@ -168,6 +168,24 @@ pub const SENSOR_TYPE_BATTERY: u64 = 4;
 pub const SENSOR_TYPE_GPS: u64 = 5;
 pub const SENSOR_TYPE_LIDAR: u64 = 6;
 pub const SENSOR_TYPE_GPIO_FLAGS: u64 = 7;
+pub const SENSOR_TYPE_CAMERA: u64 = 8;
+pub const SENSOR_TYPE_POWER: u64 = 9;
+
+// Security
+const SYS_SECCOMP: u64 = 430;
+
+/// Security profile IDs for seccomp().
+pub const PROFILE_UNRESTRICTED: u64 = 0;
+pub const PROFILE_SENSOR: u64 = 1;
+pub const PROFILE_MOTOR: u64 = 2;
+pub const PROFILE_NET: u64 = 3;
+pub const PROFILE_MINIMAL: u64 = 4;
+
+/// Activate a syscall filter profile (one-way — cannot be undone).
+/// After this call, only syscalls in the profile whitelist are allowed.
+pub fn seccomp(profile_id: u64) -> isize {
+    unsafe { syscall1(SYS_SECCOMP, profile_id) }
+}
 
 // Platform
 const SYS_PLATFORM_INFO: u64 = 340;

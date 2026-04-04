@@ -39,10 +39,18 @@ global_asm!(include_str!("asm/trap_entry_esp32c3.S"));
 
 // Include context switch assembly.
 // Phase 12: when rvv feature is active, use the RVV-aware variant.
+// TASK_SATP_OFFSET is injected at compile time via offset_of! — if someone
+// adds fields before task_satp, the offset updates automatically.
 #[cfg(all(not(feature = "rvv"), not(feature = "esp32c3")))]
-global_asm!(include_str!("asm/context_switch.S"));
+global_asm!(
+    include_str!("asm/context_switch.S"),
+    task_satp_off = const core::mem::offset_of!(robot_os_sched::task::Task, task_satp),
+);
 #[cfg(feature = "rvv")]
-global_asm!(include_str!("asm/context_switch_rvv.S"));
+global_asm!(
+    include_str!("asm/context_switch_rvv.S"),
+    task_satp_off = const core::mem::offset_of!(robot_os_sched::task::Task, task_satp),
+);
 #[cfg(feature = "esp32c3")]
 global_asm!(include_str!("asm/context_switch_esp32c3.S"));
 
@@ -71,8 +79,13 @@ global_asm!(
     max_harts = const MAX_HARTS,
 );
 
-// Linker script symbols
+// Linker script symbols — section boundaries for W^X enforcement
 unsafe extern "C" {
+    static _text_start: u8;
+    static _text_end: u8;
+    static _rodata_start: u8;
+    static _rodata_end: u8;
+    static _data_start: u8;
     static _kernel_end: u8;
 }
 
@@ -235,6 +248,32 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
         robot_os_mm::vmm::enable_paging();
         kprintln!("[MM] Sv39 paging ENABLED");
 
+        // W^X enforcement: remap kernel sections with correct permissions.
+        // Must split megapages that cover the kernel image into 4K pages
+        // first, because different sections need different permissions.
+        unsafe {
+            let text_start = &_text_start as *const u8 as usize;
+            let text_end   = &_text_end as *const u8 as usize;
+            let ro_start   = &_rodata_start as *const u8 as usize;
+            let ro_end     = &_rodata_end as *const u8 as usize;
+            let data_start = &_data_start as *const u8 as usize;
+
+            // Split megapages covering the kernel into 4K pages.
+            robot_os_mm::vmm::split_mega_range(text_start, kernel_end_aligned);
+
+            // Now remap with per-section permissions.
+            robot_os_mm::vmm::enforce_wx(
+                text_start, text_end,
+                ro_start, ro_end,
+                data_start, kernel_end_aligned,
+            );
+        }
+        kprintln!("[MM] W^X enforced: .text=RX .rodata=RO .data=RW");
+
+        // Null pointer guard: unmap page 0 so null derefs fault immediately.
+        robot_os_mm::vmm::null_guard();
+        kprintln!("[MM] Null pointer guard active (page 0 unmapped)");
+
         // Guard pages: unmap bottom 4 KiB of each task stack so overflow
         // triggers an immediate page fault instead of silent corruption.
         robot_os_sched::setup_stack_guard_pages();
@@ -258,6 +297,11 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
         v.push(6);
         kprintln!("[MM] Heap test: Vec = {:?}", v);
     }
+    kprintln!();
+
+    // AQ8: Enable kernel tracing (ring buffer of last 512 events).
+    robot_os_ipc::trace_start();
+    kprintln!("[TRACE] Kernel tracing enabled ({} event buffer)", robot_os_ipc::TRACE_BUF_SIZE);
     kprintln!();
 
     // ---- Phase 3: Traps + Interrupts ----
@@ -367,6 +411,26 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
         kprintln!("[CFG] {} entries, ml_enabled={}",
             robot_os_config::cfg_count(),
             ML_ENABLED.load(Ordering::Relaxed) as u8);
+
+        // ── OTA boot validation (A/B slot + boot loop detection) ──────
+        let boot_meta = robot_os_ota::ota_boot_validate();
+
+        // ── Verify CRC-32 of active firmware slot ─────────────────────
+        let active_slot = boot_meta.active_slot;
+        let slot_size = boot_meta.slot_size(active_slot);
+        if slot_size > 0 {
+            if robot_os_ota::ota_verify_slot(active_slot) {
+                kprintln!("[OTA] Slot {} CRC OK (fw={}, size={})",
+                    if active_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' },
+                    boot_meta.slot_version(active_slot), slot_size);
+            } else {
+                kprintln!("[OTA] WARNING: Slot {} CRC MISMATCH",
+                    if active_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
+            }
+        } else {
+            kprintln!("[OTA] Slot {} — no firmware recorded",
+                if active_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
+        }
 
         // ── Apply config to all subsystems ─────────────────────────────
 
@@ -587,7 +651,7 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     kprintln!("[ROBOT] Odometry:    dead reckoning (dist_mm, heading_cdeg)");
     kprintln!("[ROBOT] Trajectory:  ring buffer ({} pts) + FAT32 CSV flush",
         robot_os_robot::TRAJ_CAP);
-    kprintln!("[ROBOT] OTA:         TCP model hot-swap (shell: ota recv <port>)");
+    kprintln!("[ROBOT] OTA:         A/B firmware slots (shell: ota recv/status/verify)");
     kprintln!();
 
     // ---- Phase 10: Drivers + Robot Framework ----
@@ -713,6 +777,13 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
         robot_os_sched::pi_restore_task,
     );
 
+    // Wire WaitQueue block/wake callbacks so Completion/WaitQueue can
+    // sleep and wake tasks through the scheduler.
+    robot_os_sync::waitqueue::wq_set_callbacks(
+        robot_os_sched::wq_block_current,
+        robot_os_sched::wq_wake_by_tid,
+    );
+
     // Tell the scheduler how many CPUs will be online so tasks are
     // distributed evenly before secondary CPUs start.
     robot_os_sched::smp::NUM_ONLINE_CPUS.store(NUM_CPUS, Ordering::SeqCst);
@@ -746,20 +817,33 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     // Phase G1: behavior engine (runs without ML too — L0, L2, L3 work).
     robot_os_sched::task_create("behavior", behavior_task, 0, robot_os_sched::BEHAVIOR_PRIORITY);
     kprintln!("[SCHED] Created behavior task (subsumption L0-L3)");
-    robot_os_sched::task_create("rt-motor", rt_motor_task, 0, robot_os_sched::RT_MOTOR_PRIORITY);
-    kprintln!("[SCHED] Created rt-motor task (MotorCmd→PID→PWM + watchdog)");
+    // Hart 0: dedicated real-time control — PID loop pinned to avoid jitter.
+    robot_os_sched::task_create_affinity("rt-motor", rt_motor_task, 0,
+        robot_os_sched::RT_MOTOR_PRIORITY, 0);
+    kprintln!("[SCHED] Created rt-motor task (MotorCmd→PID→PWM + watchdog) [hart 0]");
+
+    // Dedicated sensor tasks (AQ0: IO-wait, priority-separated)
+    robot_os_sched::task_create_affinity("imu", imu_task, 0,
+        robot_os_sched::RT_MOTOR_PRIORITY, 1); // RT priority, hart 1
+    robot_os_sched::task_create("odom", odom_task, 0, robot_os_sched::BEHAVIOR_PRIORITY);
+    robot_os_sched::task_create("sensor-slow", sensor_slow_task, 0, robot_os_sched::DEFAULT_PRIORITY);
+    kprintln!("[SCHED] Sensor tasks: imu(RT,100Hz) odom(50Hz) sensor-slow(10Hz)");
 
     // Phase U1: dedicated network polling task — decouples net I/O from behavior loop.
     robot_os_sched::task_create("net-poll", net_poll_task, 0, robot_os_sched::NET_POLL_PRIORITY);
-    kprintln!("[SCHED] Created net-poll task (Phase U1: dedicated net polling)");
+    kprintln!("[SCHED] Created net-poll task (IO-wait, 100Hz)");
 
     // Phase I1: sensor + AHRS fusion task (~100 Hz).
-    robot_os_sched::task_create("sensor-ahrs", sensor_ahrs_task, 0, robot_os_sched::SENSOR_AHRS_PRIORITY);
-    kprintln!("[SCHED] Created sensor-ahrs task (IMU+baro+GPS→AHRS→channels)");
+    // Hart 1: sensor fusion — dedicated to avoid contention with motor PID on hart 0.
+    robot_os_sched::task_create_affinity("sensor-ahrs", sensor_ahrs_task, 0,
+        robot_os_sched::SENSOR_AHRS_PRIORITY, 1);
+    kprintln!("[SCHED] Created sensor-ahrs task (IMU+baro+GPS→AHRS→channels) [hart 1]");
 
     // Phase J+K: flight controller task (mixer + PID + failsafe).
-    robot_os_sched::task_create("flight-ctrl", flight_control_task, 0, robot_os_sched::FLIGHT_CTRL_PRIORITY);
-    kprintln!("[SCHED] Created flight-ctrl task (PID→mixer→ESC + failsafe)");
+    // Hart 0: flight controller — same hart as rt-motor for cache locality.
+    robot_os_sched::task_create_affinity("flight-ctrl", flight_control_task, 0,
+        robot_os_sched::FLIGHT_CTRL_PRIORITY, 0);
+    kprintln!("[SCHED] Created flight-ctrl task (PID→mixer→ESC + failsafe) [hart 0]");
 
     // Phase L: telemetry task (attitude + GPS → UDP).
     robot_os_sched::task_create("telemetry", telemetry_task, 0, robot_os_sched::DEFAULT_PRIORITY);
@@ -1086,6 +1170,62 @@ fn net_poll_task(_: usize) {
 
 /// Phase U4: autorun task — loads and exec's an ELF from the filesystem.
 ///
+/// IMU sensor task — reads IMU at 100 Hz, writes to sensor bus.
+/// RT priority: IMU data must be fresh for safety layer L0.
+fn imu_task(_: usize) {
+    kprintln!("[IMU-TASK] Started (100 Hz, RT priority)");
+    const IMU_INTERVAL: u64 = robot_os_drivers::clint::TIMER_FREQ / 100;
+    loop {
+        if let Some(d) = robot_os_imu::imu_read_scaled() {
+            robot_os_behavior::sensor_bus::SENSOR_BUS.update_imu(d.accel_mg, d.gyro_mdps);
+            robot_os_behavior::sensor_bus::SENSOR_BUS.update_temp(d.temp_cdeg);
+        }
+        let dl = robot_os_drivers::clint::get_time() + IMU_INTERVAL;
+        robot_os_sched::task_block(robot_os_sched::WaitReason::Timer(dl));
+    }
+}
+
+/// Odometry + encoder task at 50 Hz.
+fn odom_task(_: usize) {
+    kprintln!("[ODOM-TASK] Started (50 Hz)");
+    const ODOM_INTERVAL: u64 = robot_os_drivers::clint::TIMER_FREQ / 50;
+    loop {
+        let (el, er) = robot_os_robot::encoder_read();
+        robot_os_robot::odom_update(el, er);
+        let (d, h) = robot_os_robot::odom_get();
+        robot_os_behavior::sensor_bus::SENSOR_BUS.update_odom(d, h, el, er);
+        let dl = robot_os_drivers::clint::get_time() + ODOM_INTERVAL;
+        robot_os_sched::task_block(robot_os_sched::WaitReason::Timer(dl));
+    }
+}
+
+/// Slow sensor task: rangefinder + battery + GPIO flags at 10 Hz.
+fn sensor_slow_task(_: usize) {
+    kprintln!("[SENSOR-SLOW] Started (10 Hz)");
+    const SLOW_INTERVAL: u64 = robot_os_drivers::clint::TIMER_FREQ / 10;
+    use robot_os_behavior::sensor_bus::SENSOR_BUS;
+    loop {
+        let f = robot_os_drivers::rangefinder::us_read_mm(0).unwrap_or(0) as u16;
+        let r = robot_os_drivers::rangefinder::us_read_mm(1).unwrap_or(0) as u16;
+        SENSOR_BUS.update_range(f, r);
+        let mv: u16 = if robot_os_drivers::ads1115::ads1115_is_initialized() {
+            robot_os_drivers::ads1115::ads1115_read_battery_mv(0, 2).unwrap_or(3700) as u16
+        } else { 3700 };
+        SENSOR_BUS.update_battery(mv);
+        let mut flags: u16 = 0;
+        if robot_os_drivers::gpio::gpio_read(13) == 1 { flags |= 0x0001; }
+        if robot_os_drivers::gpio::gpio_read(15) == 1 { flags |= 0x0002; }
+        if robot_os_drivers::gpio::gpio_read(14) == 1 { flags |= 0x0004; }
+        SENSOR_BUS.update_flags(flags);
+        SENSOR_BUS.update_timestamp(robot_os_drivers::clint::get_time());
+        if robot_os_behavior::offline::offline_is_active() && flags != 0 {
+            robot_os_drivers::buzzer::buzzer_beep();
+        }
+        let dl = robot_os_drivers::clint::get_time() + SLOW_INTERVAL;
+        robot_os_sched::task_block(robot_os_sched::WaitReason::Timer(dl));
+    }
+}
+
 /// The ELF path is stored in the static `AUTORUN_PATH` buffer (set during boot).
 /// `arg` contains the path length.
 #[cfg(target_pointer_width = "64")]
@@ -1170,43 +1310,26 @@ fn behavior_task(_: usize) {
     let mut camera_cycle: u32 = 0;
 
     loop {
-        // ── 1. Collect sensor state ──────────────────────────────────────
+        // ── 1. Read sensor state from SENSOR_BUS ─────────────────────────
+        // Sensor tasks (imu_task, odom_task, sensor_slow_task) write to
+        // the bus at their own rates. We just take a snapshot here.
         let now = robot_os_drivers::clint::get_time();
         let mut state = SensorState::new();
+        robot_os_behavior::sensor_bus::SENSOR_BUS.snapshot(&mut state);
         state.timestamp = now;
 
-        // Camera capture (cycle through patterns based on tick count)
+        // Camera capture (still inline — camera task is future AQ3)
         #[cfg(not(feature = "no-ml"))]
         {
             let tick = TICK_COUNT.load(Ordering::Relaxed);
             let pattern = (tick % 3) as u8;
             let frame = robot_os_camera::cam_capture(pattern);
-            let feat  = robot_os_camera::cam_extract_features(&frame);
+            let _feat = robot_os_camera::cam_extract_features(&frame);
             state.cam_pixels[..32].copy_from_slice(&frame.pixels);
             state.cam_w = 8;
             state.cam_h = 4;
             state.cam_valid = true;
-            state.cam_dist_front = (feat.dist_front * 1000.0) as u16;
-            state.cam_dist_right = (feat.dist_right * 1000.0) as u16;
         }
-
-        // IMU
-        if let Some(imu_data) = robot_os_imu::imu_read_scaled() {
-            state.accel_mg  = imu_data.accel_mg;
-            state.gyro_mdps = imu_data.gyro_mdps;
-            state.imu_valid = true;
-        }
-
-        // Odometry + encoders
-        let (enc_l, enc_r) = robot_os_robot::encoder_read();
-        robot_os_robot::odom_update(enc_l, enc_r);
-        let (dist_mm, heading_cdeg) = robot_os_robot::odom_get();
-        state.enc_left           = enc_l;
-        state.enc_right          = enc_r;
-        state.odom_dist_mm       = dist_mm;
-        state.odom_heading_cdeg  = heading_cdeg;
-        state.battery_mv         = 3700; // simulated
-        state.velocity_mm_s      = 0;    // placeholder
 
         // ── 2. Brain Protocol: TCP send/recv ─────────────────────────────
         if robot_os_behavior::remote_is_enabled() {
@@ -1222,6 +1345,8 @@ fn behavior_task(_: usize) {
                         tcp_connected = true;
                         robot_os_behavior::remote_set_connected(true);
                         robot_os_behavior::remote_set_socket(tcp_fd);
+                        // Deactivate offline mode — brain is back
+                        robot_os_behavior::offline::offline_deactivate();
 
                         // Send StatusPacket immediately on connect
                         let uptime_s = (now / robot_os_drivers::clint::TIMER_FREQ) as u32;
@@ -1307,6 +1432,8 @@ fn behavior_task(_: usize) {
                     tcp_connected = false;
                     tcp_fd = -1;
                     robot_os_behavior::remote_set_connected(false);
+                    // Activate offline mode — patrol without brain
+                    robot_os_behavior::offline::offline_activate();
                 }
 
                 // Receive ActuatorCmd (framed: up to 6 + 3 + 2*8 = 25 bytes)
@@ -1348,7 +1475,30 @@ fn behavior_task(_: usize) {
                                         BUZZER_OFF   => robot_os_drivers::buzzer::buzzer_off(),
                                         _ => {}
                                     },
+                                    CFG_KEY_CAMERA => {
+                                        if cfg.value == CAMERA_PWR_ON {
+                                            robot_os_drivers::csi::csi_power_on();
+                                        } else if cfg.value == CAMERA_PWR_OFF {
+                                            robot_os_drivers::csi::csi_power_off();
+                                        }
+                                    },
                                     _ => {} // other config keys handled in future phases
+                                }
+                            }
+                        } else if pkt_type == PKT_ESTOP {
+                            // Remote emergency stop — highest priority
+                            robot_os_behavior::safety::estop_activate();
+                            robot_os_robot::motor_stop(0);
+                            robot_os_robot::motor_stop(1);
+                            robot_os_drivers::esc::esc_disarm();
+                            kprintln!("[BRAIN] ESTOP received — motors stopped");
+                        } else if pkt_type == PKT_MODE {
+                            let payload = &recv_buf[pay_start..pay_start + pay_len];
+                            if let Some(_mode) = decode_mode_cmd(payload) {
+                                // Clear ESTOP on any MODE command (operator reset)
+                                if robot_os_behavior::safety::estop_is_active() {
+                                    robot_os_behavior::safety::estop_deactivate();
+                                    kprintln!("[BRAIN] ESTOP cleared by MODE command");
                                 }
                             }
                         }
@@ -1387,6 +1537,37 @@ fn behavior_task(_: usize) {
                 robot_os_behavior::remote_inc_sent();
             }
 
+            // Send camera frame via UART (JPEG for bandwidth)
+            camera_cycle += 1;
+            if camera_cycle >= CAMERA_SEND_INTERVAL
+                && robot_os_drivers::csi::csi_is_ready()
+                && robot_os_drivers::csi::csi_is_powered()
+            {
+                camera_cycle = 0;
+                let (cam_w, cam_h) = robot_os_drivers::csi::csi_resolution();
+                let mut jpeg_buf = [0u8; robot_os_drivers::csi::JPEG_MAX_SIZE];
+                let jpeg_len = robot_os_drivers::csi::csi_capture_jpeg(&mut jpeg_buf);
+                if jpeg_len > 0 {
+                    let mut cam_hdr = [0u8; CAMERA_HDR_SIZE];
+                    encode_camera_header(&mut cam_hdr, cam_w, cam_h, CAMERA_FMT_JPEG);
+                    let payload_len = CAMERA_HDR_SIZE + jpeg_len;
+                    let total_len = payload_len + FRAME_OVERHEAD;
+                    const UART_CAM_BUF_SIZE: usize =
+                        robot_os_drivers::csi::JPEG_MAX_SIZE + CAMERA_HDR_SIZE + FRAME_OVERHEAD;
+                    let mut cam_payload = [0u8; UART_CAM_BUF_SIZE];
+                    cam_payload[..CAMERA_HDR_SIZE].copy_from_slice(&cam_hdr);
+                    cam_payload[CAMERA_HDR_SIZE..CAMERA_HDR_SIZE + jpeg_len]
+                        .copy_from_slice(&jpeg_buf[..jpeg_len]);
+                    let mut cam_frame = [0u8; UART_CAM_BUF_SIZE];
+                    let cam_len = build_packet(
+                        PKT_CAMERA,
+                        &cam_payload[..payload_len],
+                        &mut cam_frame[..total_len],
+                    );
+                    robot_os_drivers::uart_bridge::bridge_send(&cam_frame[..cam_len]);
+                }
+            }
+
             // Receive ActuatorCmd from UART1
             let mut recv_buf = [0u8; 32];
             let n = robot_os_drivers::uart_bridge::bridge_recv(&mut recv_buf);
@@ -1423,7 +1604,28 @@ fn behavior_task(_: usize) {
                                     BUZZER_OFF   => robot_os_drivers::buzzer::buzzer_off(),
                                     _ => {}
                                 },
+                                CFG_KEY_CAMERA => {
+                                    if cfg.value == CAMERA_PWR_ON {
+                                        robot_os_drivers::csi::csi_power_on();
+                                    } else if cfg.value == CAMERA_PWR_OFF {
+                                        robot_os_drivers::csi::csi_power_off();
+                                    }
+                                },
                                 _ => {}
+                            }
+                        }
+                    } else if pkt_type == PKT_ESTOP {
+                        robot_os_behavior::safety::estop_activate();
+                        robot_os_robot::motor_stop(0);
+                        robot_os_robot::motor_stop(1);
+                        robot_os_drivers::esc::esc_disarm();
+                        kprintln!("[BRAIN] ESTOP received (UART) — motors stopped");
+                    } else if pkt_type == PKT_MODE {
+                        let payload = &recv_buf[pay_start..pay_start + pay_len];
+                        if let Some(_mode) = decode_mode_cmd(payload) {
+                            if robot_os_behavior::safety::estop_is_active() {
+                                robot_os_behavior::safety::estop_deactivate();
+                                kprintln!("[BRAIN] ESTOP cleared by MODE command (UART)");
                             }
                         }
                     }
@@ -1466,11 +1668,13 @@ fn behavior_task(_: usize) {
             let ts_ms = now / 10_000;
             let class_byte = if mlp_result.valid { mlp_result.class } else { 0xFF };
             robot_os_robot::traj_record(ts_ms, sl, sr, class_byte,
-                                        dist_mm, heading_cdeg);
+                                        state.odom_dist_mm, state.odom_heading_cdeg);
         }
 
-        // ── Yield ~100 ms (10 scheduler ticks) ──────────────────────────
-        for _ in 0..10 { robot_os_sched::task_yield(); }
+        // ── Sleep 100ms using IO-wait (not busy yield) ─────────────────
+        let sleep_deadline = robot_os_drivers::clint::get_time()
+            + robot_os_drivers::clint::TIMER_FREQ / 10;
+        robot_os_sched::task_block(robot_os_sched::WaitReason::Timer(sleep_deadline));
     }
 }
 
@@ -1871,6 +2075,8 @@ fn system_wdt_task(_: usize) {
     kprintln!("[WDT] Phase 16 system watchdog running");
     let mut last_tick    = TICK_COUNT.load(Ordering::Relaxed);
     let mut frozen_count = 0u32;
+    let mut boot_good_marked = false;
+    let boot_start_tick = TICK_COUNT.load(Ordering::Relaxed);
 
     loop {
         // Yield ~500 ms worth of ticks (adapts to sched_hz).
@@ -1905,6 +2111,28 @@ fn system_wdt_task(_: usize) {
             }
             last_tick = now_tick;
         }
+
+        // ── 3. GPIO kill-switch poll ───────────────────────────────────────
+        let estop_pin = robot_os_config::CFG_ESTOP_GPIO_PIN.load(Ordering::Relaxed);
+        if estop_pin < 64 && robot_os_drivers::gpio::gpio_read(estop_pin) == 0 {
+            // Active-low: pin grounded = ESTOP triggered
+            kprintln!("[WDT] GPIO ESTOP (pin {}) — motors stopped", estop_pin);
+            robot_os_robot::motor_stop(0);
+            robot_os_robot::motor_stop(1);
+            robot_os_drivers::esc::esc_disarm();
+        }
+
+        // ── 4. OTA boot-good mark ────────────────────────────────────────
+        // After OTA_BOOT_GOOD_DELAY_S of successful uptime, mark boot as good.
+        if !boot_good_marked {
+            let elapsed_ticks = now_tick.wrapping_sub(boot_start_tick) as u64;
+            let sched_hz = robot_os_drivers::clint::sched_hz_get();
+            let elapsed_s = if sched_hz > 0 { elapsed_ticks / sched_hz } else { 0 };
+            if elapsed_s >= robot_os_ota::OTA_BOOT_GOOD_DELAY_S as u64 {
+                robot_os_ota::ota_mark_boot_good();
+                boot_good_marked = true;
+            }
+        }
     }
 }
 
@@ -1933,10 +2161,18 @@ fn handle_interrupt(_frame: &mut TrapFrame, cause: usize) {
             // Kick hardware WDT every tick (no-op on QEMU; prevents reset on VF2/K1).
             robot_os_drivers::wdt::wdt_kick();
 
+            // AQ0: Wake tasks whose timer deadline has expired.
+            let now = robot_os_drivers::clint::get_time();
+            robot_os_sched::wake_expired_timers(now);
+
             // Schedule next timer tick BEFORE calling the scheduler
             // (context_switch may not return to this frame).
             let hart = robot_os_arch::cpu::hart_id();
             robot_os_drivers::clint::set_next_tick(hart as u32);
+
+            // AQ8: Trace timer tick.
+            robot_os_ipc::trace_event(robot_os_ipc::TRACE_IRQ,
+                cause as u32, hart as u32, 0, 0);
 
             // Let the scheduler preempt if the current task's time slice expired.
             robot_os_sched::schedule();
@@ -1947,9 +2183,17 @@ fn handle_interrupt(_frame: &mut TrapFrame, cause: usize) {
                 let hart = robot_os_arch::cpu::hart_id();
                 let irq = robot_os_drivers::plic::claim(hart as u32);
                 if irq != 0 {
+                    // AQ8: Trace external IRQ.
+                    robot_os_ipc::trace_event(robot_os_ipc::TRACE_IRQ,
+                        irq, hart as u32, 0, 0);
+
                     if irq == robot_os_drivers::uart::UART_IRQ {
                         robot_os_drivers::uart::irq_handler();
                     }
+
+                    // AQ0: Wake tasks blocked on this IRQ.
+                    robot_os_sched::wake_by_irq(irq);
+
                     robot_os_drivers::plic::complete(hart as u32, irq);
                 }
             }
@@ -1978,6 +2222,10 @@ fn handle_exception(frame: &mut TrapFrame, cause: usize) -> usize {
             robot_os_sched::set_ecall_context(frame.sepc, frame.regs[2]);
 
             let num = frame.regs[17]; // a7 = syscall number
+
+            // AQ8: Trace syscall entry.
+            robot_os_ipc::trace_syscall(num as u32, 0);
+
             let result = robot_os_syscall::syscall_dispatch(
                 num as u64,
                 frame.regs[10] as u64, frame.regs[11] as u64, frame.regs[12] as u64,
@@ -2003,6 +2251,12 @@ fn handle_exception(frame: &mut TrapFrame, cause: usize) -> usize {
             // SPP bit: 0 = came from U-mode, 1 = came from S-mode.
             let from_user = (frame.sstatus as usize) & csr::SSTATUS_SPP == 0;
 
+            // AQ8: Trace page fault (critical for post-mortem debugging).
+            robot_os_ipc::trace_fault(
+                frame.stval as u32, cause as u32,
+                robot_os_sched::current_task_tid(),
+            );
+
             kprintln!();
             kprintln!("[PAGE FAULT] CPU {} — {} at {:#x}",
                 hart, trap::cause_str(cause), frame.stval);
@@ -2021,6 +2275,8 @@ fn handle_exception(frame: &mut TrapFrame, cause: usize) -> usize {
                 kprintln!("  regs[1] (ra):  {:#x}", frame.regs[1]);
                 kprintln!("  regs[2] (sp):  {:#x}", frame.regs[2]);
                 kprintln!("  regs[8] (s0):  {:#x}", frame.regs[8]);
+                // AQ8: Dump trace buffer before dying — last chance for debugging.
+                robot_os_ipc::trace_dump(20);
                 // Emergency motor stop to prevent runaway
                 robot_os_robot::motor_cmd_publish(0, 0);
                 robot_os_arch::sbi::shutdown();

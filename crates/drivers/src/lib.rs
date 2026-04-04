@@ -95,3 +95,6 @@ pub mod buzzer;
 
 // LD19 (LD-06) 2D LiDAR UART driver — 360° scan, 12m range.
 pub mod lidar;
+
+// INA219 I2C current/voltage sensor — battery monitoring, sag detection.
+pub mod ina219;

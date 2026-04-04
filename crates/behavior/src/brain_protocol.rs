@@ -54,11 +54,18 @@ pub const PKT_SENSOR:  u8 = 0x01;
 pub const PKT_CAMERA:  u8 = 0x02;
 pub const PKT_STATUS:  u8 = 0x03;
 
+// Packet types — Robot → Server (OTA)
+pub const PKT_OTA_ACK:  u8 = 0x04;
+
 // Packet types — Server → Robot
-pub const PKT_ACTUATOR: u8 = 0x80;
-pub const PKT_MODE:     u8 = 0x81;
-pub const PKT_WAYPOINT: u8 = 0x82;
-pub const PKT_CONFIG:   u8 = 0x83;
+pub const PKT_ACTUATOR:  u8 = 0x80;
+pub const PKT_MODE:      u8 = 0x81;
+pub const PKT_WAYPOINT:  u8 = 0x82;
+pub const PKT_CONFIG:    u8 = 0x83;
+pub const PKT_OTA_BEGIN: u8 = 0x84;
+pub const PKT_OTA_CHUNK: u8 = 0x85;
+pub const PKT_OTA_END:   u8 = 0x86;
+pub const PKT_ESTOP:     u8 = 0x88;
 
 // Robot types
 pub const ROBOT_WHEELED:   u8 = 0;
@@ -69,6 +76,15 @@ pub const ROBOT_ACKERMANN: u8 = 3;
 // ActuatorCmd flags
 pub const FLAG_EMERGENCY: u8 = 0x01;
 pub const FLAG_ALERT:     u8 = 0x02;
+
+// ESTOP reason codes (PKT_ESTOP payload byte 0)
+pub const ESTOP_REASON_OPERATOR:  u8 = 0;
+pub const ESTOP_REASON_SAFETY:    u8 = 1;
+pub const ESTOP_REASON_GEOFENCE:  u8 = 2;
+
+// OTA ACK status codes (PKT_OTA_ACK payload byte 0)
+pub const OTA_ACK_OK:    u8 = 0;
+pub const OTA_ACK_ERROR: u8 = 1;
 
 // Actuator types
 pub const ACT_DIFF_DRIVE: u8 = 0;
@@ -133,8 +149,8 @@ pub const BUZZER_SIREN: u8 = 0x02;
 
 // ── Camera power ────────────────────────────────────────────────────────────
 
-#[allow(dead_code)] pub const CAMERA_PWR_OFF: u8 = 0x00;
-#[allow(dead_code)] pub const CAMERA_PWR_ON:  u8 = 0x01;
+pub const CAMERA_PWR_OFF: u8 = 0x00;
+pub const CAMERA_PWR_ON:  u8 = 0x01;
 
 // ── WiFi modes ──────────────────────────────────────────────────────────────
 

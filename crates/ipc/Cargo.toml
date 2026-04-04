@@ -7,3 +7,6 @@ edition = "2021"
 robot_os_sched = { workspace = true }
 robot_os_sync = { workspace = true }
 robot_os_common = { workspace = true }
+robot_os_mm = { workspace = true }
+robot_os_drivers = { workspace = true }
+robot_os_arch = { workspace = true }

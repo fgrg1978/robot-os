@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""
+Robot OS — OTA firmware sender.
+
+Reads a kernel binary, wraps it in an OTA header (24 bytes), and sends
+it to the robot over TCP.
+
+Usage:
+    python3 tools/ota_send.py <kernel.bin> <robot-ip> [--port 8080] [--platform qemu] [--version 1]
+
+The robot must be running `ota recv <port>` in the shell.
+"""
+
+import argparse
+import socket
+import struct
+import sys
+
+# Must match crates/ota/src/lib.rs
+OTA_MAGIC = b"ROTA"
+OTA_HEADER_VERSION = 1
+OTA_HEADER_SIZE = 24
+OTA_MAX_IMAGE_SIZE = 2 * 1024 * 1024
+
+PLATFORMS = {
+    "qemu":    0,
+    "vf2":     1,
+    "k1":      2,
+    "esp32c3": 3,
+}
+
+
+def crc32(data: bytes) -> int:
+    """IEEE 802.3 CRC-32 (same as zlib.crc32 but we compute manually for clarity)."""
+    import zlib
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def build_header(image_size: int, image_crc32: int, fw_version: int,
+                 platform_id: int) -> bytes:
+    """Build a 24-byte OTA header."""
+    return struct.pack(
+        "<4sIIIIBBH",
+        OTA_MAGIC,
+        OTA_HEADER_VERSION,
+        image_size,
+        image_crc32,
+        fw_version,
+        platform_id,
+        0,  # flags
+        0,  # reserved
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Robot OS OTA firmware sender")
+    parser.add_argument("kernel", help="Path to kernel binary")
+    parser.add_argument("host", help="Robot IP address")
+    parser.add_argument("--port", type=int, default=8080, help="TCP port (default: 8080)")
+    parser.add_argument("--platform", default="qemu",
+                        choices=PLATFORMS.keys(), help="Target platform")
+    parser.add_argument("--version", type=int, default=1,
+                        help="Firmware version number (default: 1)")
+    args = parser.parse_args()
+
+    # Read kernel binary
+    with open(args.kernel, "rb") as f:
+        payload = f.read()
+
+    if len(payload) > OTA_MAX_IMAGE_SIZE:
+        print(f"ERROR: Kernel too large ({len(payload)} > {OTA_MAX_IMAGE_SIZE})")
+        sys.exit(1)
+
+    image_crc = crc32(payload)
+    platform_id = PLATFORMS[args.platform]
+
+    header = build_header(len(payload), image_crc, args.version, platform_id)
+    assert len(header) == OTA_HEADER_SIZE
+
+    print(f"[OTA] Kernel: {args.kernel}")
+    print(f"[OTA] Size:   {len(payload)} bytes")
+    print(f"[OTA] CRC-32: {image_crc:#010x}")
+    print(f"[OTA] FW ver: {args.version}")
+    print(f"[OTA] Target: {args.platform} (id={platform_id})")
+    print(f"[OTA] Connecting to {args.host}:{args.port}...")
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect((args.host, args.port))
+        print("[OTA] Connected — sending header + payload...")
+
+        sock.sendall(header)
+        sock.sendall(payload)
+        print(f"[OTA] Sent {OTA_HEADER_SIZE + len(payload)} bytes total")
+
+        sock.close()
+        print("[OTA] Done. Run 'ota status' on the robot to verify.")
+    except Exception as e:
+        print(f"[OTA] ERROR: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

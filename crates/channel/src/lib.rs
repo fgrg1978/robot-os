@@ -2,14 +2,16 @@
 
 //! Generic typed channel — Phase H.
 //!
-//! A `Channel<T>` is a single-slot, multi-producer / multi-consumer IPC
+//! A `Channel<T>` is a single-slot, single-producer / multi-reader IPC
 //! primitive for bare-metal systems.  It stores one value of type `T: Copy`,
 //! a monotonic sequence number, and a timestamp (caller-provided).
 //!
 //! # Design
 //!
 //! - **Zero-alloc**: no heap, no `Vec`, no `Box`.  `T` must be `Copy`.
-//! - **Lock**: uses `SpinLock` for exclusive access (minimal critical section).
+//! - **SeqLock**: writer never blocks readers.  Readers detect concurrent
+//!   writes via sequence counter and retry.  Perfect for sensor data
+//!   published at high frequency and consumed by many tasks.
 //! - **Sequence**: monotonic `u64` incremented on every `publish()`.
 //!   Readers compare seq to detect new data without inspecting the payload.
 //! - **Timestamp**: caller-provided `u64` (typically `clint::get_time()`).
@@ -25,10 +27,10 @@
 //!
 //! static CH: Channel<Cmd> = Channel::new(Cmd { speed: 0 });
 //!
-//! // Publisher
+//! // Publisher (single writer)
 //! CH.publish(Cmd { speed: 50 }, clint::get_time());
 //!
-//! // Reader
+//! // Reader (any number of concurrent readers)
 //! let snap = CH.read();
 //! if snap.seq > 0 {
 //!     use_cmd(snap.val);
@@ -36,7 +38,7 @@
 //! ```
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use robot_os_sync::SpinLock;
+use robot_os_sync::SeqLock;
 
 /// A snapshot returned by [`Channel::read`].
 #[derive(Clone, Copy)]
@@ -49,23 +51,25 @@ pub struct Snapshot<T: Copy> {
     pub timestamp: u64,
 }
 
-/// A single-slot typed channel.
-///
-/// Stores one `T`, a sequence counter, and a timestamp.
-/// All operations are O(1) with bounded spin time.
-pub struct Channel<T: Copy> {
-    inner: SpinLock<Inner<T>>,
-    /// Sequence counter — readable without locking for fast "has new data?" check.
-    seq: AtomicU64,
-}
-
+/// Inner state protected by the SeqLock.
+#[derive(Clone, Copy)]
 struct Inner<T: Copy> {
     val: T,
     seq: u64,
     timestamp: u64,
 }
 
-// Safety: Channel provides exclusive access via SpinLock.
+/// A single-slot typed channel.
+///
+/// Stores one `T`, a sequence counter, and a timestamp.
+/// Writer never blocks (SeqLock). Readers retry on contention.
+pub struct Channel<T: Copy> {
+    inner: SeqLock<Inner<T>>,
+    /// Sequence counter — readable without locking for fast "has new data?" check.
+    seq: AtomicU64,
+}
+
+// Safety: Channel provides synchronization via SeqLock.
 unsafe impl<T: Copy + Send> Send for Channel<T> {}
 unsafe impl<T: Copy + Send> Sync for Channel<T> {}
 
@@ -75,7 +79,7 @@ impl<T: Copy> Channel<T> {
     /// `seq` starts at 0 (never published).
     pub const fn new(default: T) -> Self {
         Channel {
-            inner: SpinLock::new(Inner {
+            inner: SeqLock::new(Inner {
                 val: default,
                 seq: 0,
                 timestamp: 0,
@@ -88,27 +92,32 @@ impl<T: Copy> Channel<T> {
     ///
     /// Increments the sequence number and stores the caller-provided timestamp.
     /// `timestamp` should be `clint::get_time()` or equivalent monotonic clock.
+    ///
+    /// # Single-writer contract
+    /// Only one task should call `publish()` on a given channel.  If multiple
+    /// writers are possible, serialize externally with a SpinLock.
     pub fn publish(&self, val: T, timestamp: u64) {
-        let mut g = self.inner.lock();
+        let mut g = self.inner.write();
         g.seq += 1;
         g.val = val;
         g.timestamp = timestamp;
         let s = g.seq;
         drop(g);
-        // Update the lock-free seq counter AFTER releasing the lock,
+        // Update the lock-free seq counter AFTER completing the write,
         // so readers that see a new seq will get consistent data.
         self.seq.store(s, Ordering::Release);
     }
 
     /// Read the current value, sequence number, and timestamp.
     ///
-    /// Returns a `Snapshot<T>` (copy-out, no blocking beyond the spin).
+    /// Returns a `Snapshot<T>` (copy-out, lock-free — retries on contention).
+    /// The reader never blocks the writer.
     pub fn read(&self) -> Snapshot<T> {
-        let g = self.inner.lock();
+        let snap = self.inner.read();
         Snapshot {
-            val: g.val,
-            seq: g.seq,
-            timestamp: g.timestamp,
+            val: snap.val,
+            seq: snap.seq,
+            timestamp: snap.timestamp,
         }
     }
 
@@ -126,11 +135,11 @@ impl<T: Copy> Channel<T> {
     ///
     /// Returns `u64::MAX` if the channel has never been published to (seq == 0).
     pub fn age(&self, now: u64) -> u64 {
-        let g = self.inner.lock();
-        if g.seq == 0 {
+        let snap = self.inner.read();
+        if snap.seq == 0 {
             u64::MAX
         } else {
-            now.saturating_sub(g.timestamp)
+            now.saturating_sub(snap.timestamp)
         }
     }
 

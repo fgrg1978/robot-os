@@ -8,26 +8,29 @@ use crate::types::*;
 
 // ── L0: Emergency stop (always active, cannot be disabled) ───────────────────
 
-/// Emergency stop: triggers if the robot is falling (accel_z < 500 mg)
-/// or spinning too fast (any gyro axis > 90000 mdps = 90 deg/s).
+/// Emergency stop: runs full safety profile for the current robot type.
+/// Checks: fall, spin, battery, tilt, obstacle, GPS (drone), comms timeout.
+/// Uses `crate::safety::safety_check()` for type-aware checks.
 pub fn layer_emergency_stop(state: &SensorState) -> BehaviorOutput {
-    if !state.imu_valid {
-        return BehaviorOutput { cmd: MotorOutput::none(), layer: 0 };
-    }
+    use crate::safety::{safety_check, SafetyAction};
 
-    // Falling detection: accel_z should be ~1000 mg (1g) when upright.
-    // If it drops below 500 mg the robot is likely falling or tipped.
-    let falling = state.accel_mg[2] < 500;
+    let result = safety_check(state);
 
-    // Spin detection: any axis > 90 deg/s.
-    let spinning = state.gyro_mdps[0].unsigned_abs() > 90_000
-                || state.gyro_mdps[1].unsigned_abs() > 90_000
-                || state.gyro_mdps[2].unsigned_abs() > 90_000;
-
-    if falling || spinning {
-        BehaviorOutput { cmd: MotorOutput::some(0, 0), layer: 0 }
-    } else {
-        BehaviorOutput { cmd: MotorOutput::none(), layer: 0 }
+    match result.action {
+        SafetyAction::None => {
+            BehaviorOutput { cmd: MotorOutput::none(), layer: 0 }
+        }
+        SafetyAction::EmergencyStop | SafetyAction::LandNow => {
+            BehaviorOutput { cmd: MotorOutput::some(0, 0), layer: 0 }
+        }
+        SafetyAction::ReturnToLaunch => {
+            // For RTL: stop motors here, behavior_task handles RTL navigation
+            BehaviorOutput { cmd: MotorOutput::some(0, 0), layer: 0 }
+        }
+        SafetyAction::SpeedLimit(max_speed) => {
+            // Clamp current command speed — let higher layers run but limited
+            BehaviorOutput { cmd: MotorOutput::some(max_speed, max_speed), layer: 0 }
+        }
     }
 }
 

@@ -194,8 +194,54 @@ pub fn map_mega(pt_phys: usize, vaddr: usize, paddr: usize, flags: PteFlags) -> 
     Ok(())
 }
 
-/// Unmap a virtual address.
+/// Unmap a single 4 KiB virtual page.
+///
+/// If `vaddr` falls inside a 2 MiB megapage, the megapage is split into
+/// 512 individual 4 KiB pages first, then the target page is unmapped.
+/// This avoids accidentally invalidating the entire 2 MiB region.
 pub fn unmap(pt_phys: usize, vaddr: usize) {
+    // Walk L2 → L1 to detect megapage before reaching walk().
+    let vpn2 = mmu::vpn2(vaddr);
+    let l2_pte = unsafe { core::ptr::read_volatile((pt_phys + vpn2 * 8) as *const Pte) };
+    if !l2_pte.is_valid() || l2_pte.is_leaf() {
+        // Not mapped, or gigapage (1 GiB) — cannot split, just return.
+        return;
+    }
+    let l1_pt = l2_pte.phys_addr();
+    let vpn1 = mmu::vpn1(vaddr);
+    let l1_pte_ptr = (l1_pt + vpn1 * 8) as *mut Pte;
+    let l1_pte = unsafe { core::ptr::read_volatile(l1_pte_ptr) };
+
+    if !l1_pte.is_valid() {
+        return; // Not mapped.
+    }
+
+    if l1_pte.is_leaf() {
+        // Megapage at L1 — must split into 512 × 4 KiB pages before unmapping.
+        let mega_base = l1_pte.phys_addr();
+        let flags = l1_pte.flags();
+
+        let l0_pt = match pmm::alloc_page() {
+            Ok(p) => p.as_usize(),
+            Err(_) => return, // OOM — cannot split, bail out.
+        };
+
+        // Populate L0 table: 512 PTEs mapping each 4 KiB page of the megapage.
+        for i in 0..PT_ENTRIES {
+            let paddr = mega_base + i * PAGE_SIZE;
+            let pte = Pte::new(paddr, flags);
+            unsafe { core::ptr::write_volatile((l0_pt + i * 8) as *mut Pte, pte) };
+        }
+
+        // Replace the L1 leaf PTE with a pointer to the new L0 table.
+        let new_l1_pte = Pte::new(l0_pt, PteFlags::VALID);
+        unsafe { core::ptr::write_volatile(l1_pte_ptr, new_l1_pte) };
+
+        // Full TLB flush — the megapage TLB entry must be invalidated.
+        csr::sfence_vma();
+    }
+
+    // Now walk normally to the L0 PTE and unmap the single 4 KiB page.
     if let Ok(pte_ptr) = walk(pt_phys, vaddr, false) {
         unsafe { core::ptr::write_volatile(pte_ptr, Pte::empty()) };
         csr::sfence_vma_addr(vaddr);
@@ -266,6 +312,82 @@ pub fn destroy_pagetable(pt_phys: usize) {
     let _ = pmm::free_page(PhysAddr::new(pt_phys));
 }
 
+/// Split megapages covering a range into 4K pages.
+///
+/// This is necessary before enforce_wx(), because different kernel sections
+/// (text, rodata, data) within the same 2 MiB megapage need different
+/// permissions. A megapage is one PTE covering 2 MiB — we can't set
+/// text=RX and data=RW within the same PTE.
+///
+/// For each megapage that overlaps [start, end): allocate an L0 table,
+/// create 512 individual 4K PTEs with the same physical addresses,
+/// and replace the megapage L1 entry with a pointer to the L0 table.
+pub fn split_mega_range(start: usize, end: usize) {
+    let kpt = *KERNEL_PT.lock();
+
+    // Align to megapage boundaries
+    let mega_start = start & !(MEGA_SIZE - 1);
+    let mega_end = (end + MEGA_SIZE - 1) & !(MEGA_SIZE - 1);
+
+    let mut addr = mega_start;
+    while addr < mega_end {
+        // Check if this address is mapped as a megapage
+        let vpn2 = mmu::vpn2(addr);
+        let vpn1 = mmu::vpn1(addr);
+
+        let l2_pte_ptr = (kpt + vpn2 * 8) as *const Pte;
+        let l2_pte = unsafe { core::ptr::read_volatile(l2_pte_ptr) };
+        if !l2_pte.is_valid() || l2_pte.is_leaf() {
+            addr += MEGA_SIZE;
+            continue;
+        }
+
+        let l1_pt = l2_pte.phys_addr();
+        let l1_pte_ptr = (l1_pt + vpn1 * 8) as *mut Pte;
+        let l1_pte = unsafe { core::ptr::read_volatile(l1_pte_ptr) };
+
+        if !l1_pte.is_valid() || !l1_pte.is_leaf() {
+            // Not a megapage (already 4K or invalid) — skip
+            addr += MEGA_SIZE;
+            continue;
+        }
+
+        // This is a megapage at L1. Split it into 512 × 4K pages.
+        let mega_phys = l1_pte.phys_addr();
+        let mega_flags = PteFlags::KERNEL_RWX; // preserve original flags
+
+        // Allocate a new L0 page table
+        let l0_page = match pmm::alloc_page() {
+            Ok(p) => p,
+            Err(_) => {
+                addr += MEGA_SIZE;
+                continue; // OOM — skip this megapage
+            }
+        };
+        let l0_pt = l0_page.as_usize();
+
+        // Fill L0 with 512 entries pointing to consecutive 4K pages
+        for i in 0..512 {
+            let pa = mega_phys + i * PAGE_SIZE;
+            let pte = Pte::new(pa, mega_flags);
+            unsafe {
+                core::ptr::write_volatile((l0_pt + i * 8) as *mut Pte, pte);
+            }
+        }
+
+        // Replace the L1 megapage entry with a pointer to the L0 table
+        let new_l1 = Pte::new(l0_pt, PteFlags::VALID);
+        unsafe { core::ptr::write_volatile(l1_pte_ptr, new_l1) };
+
+        // Flush TLB for this range
+        for i in 0..512 {
+            csr::sfence_vma_addr(addr + i * PAGE_SIZE);
+        }
+
+        addr += MEGA_SIZE;
+    }
+}
+
 /// Initialize the VMM: create kernel page table with identity mapping.
 ///
 /// `mem_start`: physical RAM start (e.g., 0x8000_0000)
@@ -322,6 +444,86 @@ pub fn map_mmio_region(base: usize, size: usize) -> KResult<()> {
         addr += PAGE_SIZE;
     }
     Ok(())
+}
+
+/// Enforce W^X policy: remap kernel sections with correct permissions.
+///
+/// After init(), everything is KERNEL_RWX (needed during boot before paging).
+/// This function tightens permissions per section:
+///   .text      → RX (no write — prevent code injection)
+///   .rodata    → RO (no write, no execute)
+///   .data/.bss → RW (no execute — prevent data execution)
+///
+/// Page-boundary handling: if .text and .rodata share a 4K page (the
+/// boundary falls mid-page), that page stays RX (text wins, since
+/// removing X would crash any code in that page).
+///
+/// Must be called AFTER split_mega_range() and enable_paging().
+pub fn enforce_wx(
+    text_start: usize, text_end: usize,
+    rodata_start: usize, rodata_end: usize,
+    data_start: usize, kernel_end: usize,
+) {
+    let kpt = *KERNEL_PT.lock();
+
+    // Page-align boundaries (round .text UP, .rodata/.data DOWN)
+    // This ensures shared boundary pages keep the more permissive flags.
+    let text_page_end = (text_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let rodata_page_start = rodata_start & !(PAGE_SIZE - 1);
+    let rodata_page_end = (rodata_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let data_page_start = data_start & !(PAGE_SIZE - 1);
+
+    // .text → Read + Execute (no Write)
+    remap_range(kpt, text_start, text_page_end, PteFlags::KERNEL_RX);
+
+    // .rodata → Read only — but skip pages already covered by .text
+    let ro_flags = PteFlags::VALID | PteFlags::READ | PteFlags::ACCESSED;
+    let ro_start = if rodata_page_start < text_page_end {
+        text_page_end  // boundary page stays RX (text wins)
+    } else {
+        rodata_page_start
+    };
+    if ro_start < rodata_page_end {
+        remap_range(kpt, ro_start, rodata_page_end, ro_flags);
+    }
+
+    // .data + .bss → Read + Write (no Execute) — skip rodata overlap
+    let data_start_safe = if data_page_start < rodata_page_end {
+        rodata_page_end
+    } else {
+        data_page_start
+    };
+    if data_start_safe < kernel_end {
+        remap_range(kpt, data_start_safe, kernel_end, PteFlags::KERNEL_RW);
+    }
+
+    // Flush TLB on ALL harts to apply new permissions
+    csr::sfence_vma();
+}
+
+/// Unmap page 0 (null pointer guard).
+///
+/// Dereferencing a null pointer (address 0x0) will cause a page fault
+/// instead of silently reading/writing address 0.
+pub fn null_guard() {
+    let kpt = *KERNEL_PT.lock();
+    unmap(kpt, 0);
+}
+
+/// Remap a range of 4K pages with new flags (for W^X enforcement).
+/// Only modifies leaf PTEs that are already valid.
+fn remap_range(pt_phys: usize, start: usize, end: usize, flags: PteFlags) {
+    let mut addr = start & !(PAGE_SIZE - 1);
+    while addr < end {
+        if let Ok(pte_ptr) = walk(pt_phys, addr, false) {
+            let old = unsafe { core::ptr::read_volatile(pte_ptr) };
+            if old.is_valid() && old.is_leaf() {
+                let new_pte = Pte::new(old.phys_addr(), flags);
+                unsafe { core::ptr::write_volatile(pte_ptr, new_pte) };
+            }
+        }
+        addr += PAGE_SIZE;
+    }
 }
 
 /// Activate the kernel page table (write SATP, enable Sv39 paging).

@@ -913,35 +913,113 @@ fn cmd_traj_flush() {
         written, pos);
 }
 
-#[cfg(not(feature = "no-ml"))]
-/// Phase 17: OTA model update via TCP.
+/// OTA firmware update — A/B slot management over TCP.
 ///
-/// Usage: ota recv <port>
-///
-/// Listens on <port>, accepts one TCP connection, reads bytes into a 512-byte
-/// static buffer, and calls `model_load_bytes` to hot-swap the ML model.
-/// On success, reports the demo inference result.
+/// Subcommands:
+///   ota recv <port>    — receive firmware image over TCP, write to inactive slot
+///   ota status         — show current slot, boot count, versions
+///   ota verify         — CRC-32 check both firmware slots
+///   ota rollback       — switch active slot to last known good
 fn cmd_ota(args: &[&[u8]; MAX_ARGS], argc: usize) {
-    if argc < 2 || args[1] != b"recv" {
-        robot_os_drivers::kprintln!("Usage: ota recv <port>");
-        robot_os_drivers::kprintln!("  Receives an RMLP ({} B) file over TCP and hot-swaps ML model.",
-            robot_os_ml::RMLP_FILE_SIZE);
-        return;
-    }
-    if argc < 3 {
-        robot_os_drivers::kprintln!("Usage: ota recv <port>");
-        return;
-    }
-
-    let port = parse_u16(args[2]);
-    if port == 0 {
-        robot_os_drivers::kprintln!("[OTA] Invalid port");
+    if argc < 2 {
+        robot_os_drivers::kprintln!("Usage: ota <recv|status|verify|rollback>");
+        robot_os_drivers::kprintln!("  recv <port>  — receive firmware over TCP");
+        robot_os_drivers::kprintln!("  status       — show OTA slot info");
+        robot_os_drivers::kprintln!("  verify       — CRC-32 check firmware slots");
+        robot_os_drivers::kprintln!("  rollback     — revert to last good slot");
         return;
     }
 
-    robot_os_drivers::kprintln!("[OTA] Listening on port {} for RMLP ({} bytes expected)...",
-        port, robot_os_ml::RMLP_FILE_SIZE);
+    if args[1] == b"status" {
+        cmd_ota_status();
+    } else if args[1] == b"verify" {
+        cmd_ota_verify();
+    } else if args[1] == b"rollback" {
+        cmd_ota_rollback();
+    } else if args[1] == b"recv" {
+        if argc < 3 {
+            robot_os_drivers::kprintln!("Usage: ota recv <port>");
+            return;
+        }
+        let port = parse_u16(args[2]);
+        if port == 0 {
+            robot_os_drivers::kprintln!("[OTA] Invalid port");
+            return;
+        }
+        cmd_ota_recv(port);
+    } else {
+        robot_os_drivers::kprintln!("[OTA] Unknown subcommand. Use: recv, status, verify, rollback");
+    }
+}
 
+fn cmd_ota_status() {
+    let meta = robot_os_ota::ota_read_boot_meta();
+    let slot_char = |s: u8| if s == robot_os_ota::SLOT_A { 'A' } else { 'B' };
+    robot_os_drivers::kprintln!("[OTA] Active slot:  {}", slot_char(meta.active_slot));
+    robot_os_drivers::kprintln!("[OTA] Boot count:   {}/{}", meta.boot_count,
+        robot_os_ota::CFG_OTA_MAX_BOOT_ATTEMPTS.load(core::sync::atomic::Ordering::Relaxed));
+    robot_os_drivers::kprintln!("[OTA] Last good:    {}", slot_char(meta.last_good));
+    robot_os_drivers::kprintln!("[OTA] Slot A: fw={} size={} crc={:#010x}",
+        meta.fw_version_a, meta.image_size_a, meta.image_crc_a);
+    robot_os_drivers::kprintln!("[OTA] Slot B: fw={} size={} crc={:#010x}",
+        meta.fw_version_b, meta.image_size_b, meta.image_crc_b);
+    robot_os_drivers::kprintln!("[OTA] Platform:     {}", match robot_os_ota::ota_current_platform() {
+        robot_os_ota::OTA_PLATFORM_QEMU => "QEMU",
+        robot_os_ota::OTA_PLATFORM_VF2  => "VisionFive 2",
+        robot_os_ota::OTA_PLATFORM_K1   => "SpacemiT K1",
+        _ => "ESP32-C3",
+    });
+}
+
+fn cmd_ota_verify() {
+    for (label, slot) in [
+        ("A", robot_os_ota::SLOT_A),
+        ("B", robot_os_ota::SLOT_B),
+    ] {
+        let (ver, size, crc) = robot_os_ota::ota_slot_info(slot);
+        if size == 0 {
+            robot_os_drivers::kprintln!("[OTA] Slot {} — empty (no firmware)", label);
+            continue;
+        }
+        if robot_os_ota::ota_verify_slot(slot) {
+            robot_os_drivers::kprintln!(
+                "[OTA] Slot {} — OK  (fw={}, size={}, crc={:#010x})",
+                label, ver, size, crc);
+        } else {
+            robot_os_drivers::kprintln!(
+                "[OTA] Slot {} — CRC FAIL or missing file (expected size={}, crc={:#010x})",
+                label, size, crc);
+        }
+    }
+}
+
+fn cmd_ota_rollback() {
+    let mut meta = robot_os_ota::ota_read_boot_meta();
+    if meta.active_slot == meta.last_good {
+        robot_os_drivers::kprintln!("[OTA] Already on last good slot ({})",
+            if meta.active_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
+        return;
+    }
+    let old = meta.active_slot;
+    meta.active_slot = meta.last_good;
+    meta.boot_count = 0;
+    robot_os_ota::ota_write_boot_meta(&meta);
+    robot_os_ota::ota_apply_meta(&meta);
+    robot_os_drivers::kprintln!("[OTA] Rolled back: {} → {} (reboot to apply)",
+        if old == robot_os_ota::SLOT_A { 'A' } else { 'B' },
+        if meta.active_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
+}
+
+/// Receive firmware over TCP, write to inactive slot, validate CRC-32.
+fn cmd_ota_recv(port: u16) {
+    let target_slot = robot_os_ota::ota_inactive_slot();
+    let target_path = robot_os_ota::ota_slot_path(target_slot);
+    let platform = robot_os_ota::ota_current_platform();
+
+    robot_os_drivers::kprintln!("[OTA] Listening on port {} — target slot {}",
+        port, if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
+
+    // Create TCP listener
     let listen_fd = robot_os_net::socket_create(
         robot_os_net::AF_INET, robot_os_net::SOCK_STREAM, 0);
     if listen_fd < 0 {
@@ -960,46 +1038,137 @@ fn cmd_ota(args: &[&[u8]; MAX_ARGS], argc: usize) {
         return;
     }
 
-    // Wait for a client to connect.
+    // Accept connection
     let client_fd = loop {
         robot_os_net::net_poll();
         let r = robot_os_net::socket_accept(listen_fd);
         if r >= 0 { break r; }
         robot_os_sched::task_yield();
     };
-    robot_os_drivers::kprintln!("[OTA] Client connected — receiving model bytes...");
+    robot_os_drivers::kprintln!("[OTA] Client connected — receiving header...");
 
-    // Receive into static buffer (512 B is enough for the 292-byte RMLP).
-    static mut OTA_BUF: [u8; 512] = [0u8; 512];
-    let buf = unsafe { &mut *(&raw mut OTA_BUF) };
-    let mut total = 0usize;
+    // Receive OTA header (24 bytes)
+    static mut OTA_HDR_BUF: [u8; 24] = [0u8; 24];
+    let hdr_buf = unsafe { &mut *(&raw mut OTA_HDR_BUF) };
+    let mut hdr_got = 0usize;
 
-    loop {
+    while hdr_got < robot_os_ota::OTA_HEADER_SIZE {
         robot_os_net::net_poll();
-        let n = robot_os_net::socket_recv(client_fd, &mut buf[total..]);
+        let n = robot_os_net::socket_recv(client_fd, &mut hdr_buf[hdr_got..]);
         if n > 0 {
-            total += n as usize;
-            if total >= robot_os_ml::RMLP_FILE_SIZE { break; }
+            hdr_got += n as usize;
         } else if n < 0 {
-            break; // connection closed
+            robot_os_drivers::kprintln!("[OTA] Connection lost during header");
+            robot_os_net::socket_close(client_fd);
+            robot_os_net::socket_close(listen_fd);
+            return;
         }
         robot_os_sched::task_yield();
     }
 
+    // Parse and validate header
+    let header = match robot_os_ota::ota_parse_header(hdr_buf) {
+        Some(h) => h,
+        None => {
+            robot_os_drivers::kprintln!("[OTA] Invalid header (bad magic or version)");
+            robot_os_net::socket_close(client_fd);
+            robot_os_net::socket_close(listen_fd);
+            return;
+        }
+    };
+
+    if !robot_os_ota::ota_validate_header(&header, platform) {
+        robot_os_drivers::kprintln!("[OTA] Header validation failed (platform={}, size={})",
+            header.platform_id, header.image_size);
+        robot_os_net::socket_close(client_fd);
+        robot_os_net::socket_close(listen_fd);
+        return;
+    }
+
+    robot_os_drivers::kprintln!("[OTA] Header OK — fw={} size={} crc={:#010x}",
+        header.fw_version, header.image_size, header.image_crc32);
+
+    // Open target file
+    let mut fd_table = robot_os_fs::FdTable::new();
+    let file_fd = robot_os_fs::vfs_open(&mut fd_table, target_path,
+        robot_os_fs::O_WRONLY | robot_os_fs::O_CREAT | robot_os_fs::O_TRUNC);
+    if file_fd < 0 {
+        robot_os_drivers::kprintln!("[OTA] Cannot create target file");
+        robot_os_net::socket_close(client_fd);
+        robot_os_net::socket_close(listen_fd);
+        return;
+    }
+
+    // Stream payload from TCP to FAT32 as raw binary (no header on disk).
+    // The .BIN file is directly bootable by U-Boot.
+    static mut OTA_CHUNK: [u8; 4096] = [0u8; 4096];
+    let chunk = unsafe { &mut *(&raw mut OTA_CHUNK) };
+    let mut crc_state = robot_os_ota::Crc32State::new();
+    let mut remaining = header.image_size as usize;
+    let mut total_written = 0usize;
+
+    robot_os_drivers::kprintln!("[OTA] Receiving {} bytes...", header.image_size);
+
+    while remaining > 0 {
+        robot_os_net::net_poll();
+        let max_recv = remaining.min(chunk.len());
+        let n = robot_os_net::socket_recv(client_fd, &mut chunk[..max_recv]);
+        if n > 0 {
+            let got = n as usize;
+            crc_state.update(&chunk[..got]);
+            robot_os_fs::vfs_write(&mut fd_table, file_fd, chunk.as_ptr(), got);
+            remaining -= got;
+            total_written += got;
+        } else if n < 0 {
+            robot_os_drivers::kprintln!("[OTA] Connection lost ({}/{} bytes received)",
+                total_written, header.image_size);
+            break;
+        }
+        robot_os_sched::task_yield();
+    }
+
+    robot_os_fs::vfs_close(&mut fd_table, file_fd);
     robot_os_net::socket_close(client_fd);
     robot_os_net::socket_close(listen_fd);
 
-    robot_os_drivers::kprintln!("[OTA] Received {} bytes", total);
-
-    if robot_os_ml::model_load_bytes(&buf[..total]) {
-        let logits = robot_os_ml::mlp_infer(&robot_os_ml::DEMO_INPUT);
-        let class  = robot_os_ml::argmax3(&logits);
-        robot_os_drivers::kprintln!("[OTA] Model hot-swapped — demo → {} (class {})",
-            robot_os_ml::CLASS_NAMES[class], class);
-    } else {
-        robot_os_drivers::kprintln!("[OTA] Load FAILED — bad RMLP magic/dims ({} bytes)",
-            total);
+    if remaining > 0 {
+        robot_os_drivers::kprintln!("[OTA] INCOMPLETE — deleting partial image");
+        let _ = robot_os_fs::fat32_unlink_path(target_path);
+        return;
     }
+
+    // Verify CRC-32
+    let computed_crc = crc_state.finalize();
+    if computed_crc != header.image_crc32 {
+        robot_os_drivers::kprintln!("[OTA] CRC MISMATCH: computed={:#010x} expected={:#010x}",
+            computed_crc, header.image_crc32);
+        robot_os_drivers::kprintln!("[OTA] Deleting corrupt image");
+        let _ = robot_os_fs::fat32_unlink_path(target_path);
+        return;
+    }
+
+    robot_os_drivers::kprintln!("[OTA] CRC OK — {} bytes written to slot {}",
+        total_written, if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
+
+    // Update boot metadata: switch to new slot, record CRC + size for verify
+    let mut meta = robot_os_ota::ota_read_boot_meta();
+    meta.active_slot = target_slot;
+    meta.boot_count = 0;
+    if target_slot == robot_os_ota::SLOT_A {
+        meta.fw_version_a = header.fw_version;
+        meta.image_size_a = header.image_size;
+        meta.image_crc_a  = header.image_crc32;
+    } else {
+        meta.fw_version_b = header.fw_version;
+        meta.image_size_b = header.image_size;
+        meta.image_crc_b  = header.image_crc32;
+    }
+    robot_os_ota::ota_write_boot_meta(&meta);
+    robot_os_ota::ota_apply_meta(&meta);
+
+    robot_os_drivers::kprintln!("[OTA] Active slot → {} (fw={}). Reboot to apply.",
+        if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' },
+        header.fw_version);
 }
 
 /// Phase 16: print a summary of all active security layers.
@@ -1044,6 +1213,39 @@ fn cmd_security() {
     robot_os_drivers::kprintln!("[SEC]  RMLP model:      DISABLED (no-ml)");
 
     robot_os_drivers::kprintln!("[SEC] ========================================");
+}
+
+/// Crash log management: `crash log` / `crash clear`.
+fn cmd_crash(args: &[&[u8]; MAX_ARGS], argc: usize) {
+    let sub: &[u8] = if argc >= 2 { args[1] } else { b"log" };
+
+    if sub == b"log" {
+        let mut fd_table = robot_os_fs::FdTable::new();
+        let fd = robot_os_fs::vfs_open(&mut fd_table, b"/fat/CRASH.LOG",
+                                        robot_os_fs::O_RDONLY);
+        if fd < 0 {
+            robot_os_drivers::kprintln!("[CRASH] No crash log found");
+            return;
+        }
+        static mut CRASH_READ_BUF: [u8; 2048] = [0u8; 2048];
+        let buf = unsafe { &mut *(&raw mut CRASH_READ_BUF) };
+        let n = robot_os_fs::vfs_read(&mut fd_table, fd, buf.as_mut_ptr(), buf.len());
+        robot_os_fs::vfs_close(&mut fd_table, fd);
+        if n <= 0 {
+            robot_os_drivers::kprintln!("[CRASH] Crash log empty");
+            return;
+        }
+        robot_os_drivers::kprintln!("[CRASH] === /fat/CRASH.LOG ({} bytes) ===", n);
+        for &b in &buf[..n as usize] {
+            robot_os_drivers::uart::putc(b);
+        }
+        robot_os_drivers::kprintln!("[CRASH] === end ===");
+    } else if sub == b"clear" {
+        let _ = robot_os_fs::fat32_unlink_path(b"/fat/CRASH.LOG");
+        robot_os_drivers::kprintln!("[CRASH] Crash log cleared");
+    } else {
+        robot_os_drivers::kprintln!("Usage: crash [log|clear]");
+    }
 }
 
 fn cmd_shutdown() -> ! {
@@ -1927,18 +2129,18 @@ pub fn shell_run() -> ! {
                 else if cmd == b"motor"    { cmd_motor(&args, argc); }
                 else if cmd == b"rvv"      { cmd_rvv(); }
                 else if cmd == b"ml" || cmd == b"pipeline" || cmd == b"cam"
-                     || cmd == b"model" || cmd == b"ota" {
+                     || cmd == b"model" {
                     #[cfg(not(feature = "no-ml"))]
                     {
                         if      cmd == b"ml"       { cmd_ml(); }
                         else if cmd == b"pipeline" { cmd_pipeline(); }
                         else if cmd == b"cam"      { cmd_cam(&args, argc); }
                         else if cmd == b"model"    { cmd_model(&args, argc); }
-                        else if cmd == b"ota"      { cmd_ota(&args, argc); }
                     }
                     #[cfg(feature = "no-ml")]
                     robot_os_drivers::kprintln!("[SHELL] ML disabled (compiled with --features no-ml)");
                 }
+                else if cmd == b"ota" { cmd_ota(&args, argc); }
                 else if cmd == b"security" { cmd_security(); }
                 else if cmd == b"odom"     { cmd_odom(); }
                 else if cmd == b"traj"     { cmd_traj(&args, argc); }
@@ -1973,6 +2175,7 @@ pub fn shell_run() -> ! {
                     #[cfg(feature = "no-mmu")]
                     robot_os_drivers::kprintln!("[SHELL] fork disabled (compiled with --features no-mmu)");
                 }
+                else if cmd == b"crash"    { cmd_crash(&args, argc); }
                 else if cmd == b"shutdown" { cmd_shutdown(); }
                 else if cmd == b"reboot"   { cmd_reboot(); }
                 else {

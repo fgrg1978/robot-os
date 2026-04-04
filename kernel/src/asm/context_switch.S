@@ -31,8 +31,8 @@
 .equ CTX_S11, 104
 .equ CTX_PC,  112
 
-# Task struct offset (must match offset_of!(Task, task_satp))
-.equ TASK_SATP_OFFSET, 200
+# Task struct offset — auto-generated from offset_of!(Task, task_satp)
+.equ TASK_SATP_OFFSET, {task_satp_off}
 
 .section .text
 .align 4

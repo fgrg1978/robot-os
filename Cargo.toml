@@ -33,6 +33,7 @@ members = [
     "crates/telemetry",
     "crates/nav",
     "crates/libsys",
+    "crates/ota",
 ]
 
 [workspace.dependencies]
@@ -69,12 +70,14 @@ robot_os_flight    = { path = "crates/flight" }
 robot_os_telemetry = { path = "crates/telemetry" }
 robot_os_nav       = { path = "crates/nav" }
 robot_os_libsys    = { path = "crates/libsys" }
+robot_os_ota       = { path = "crates/ota" }
 
 [profile.release]
 opt-level = 2
 debug = true       # Keep debug info for GDB
 lto = false        # LTO breaks global_asm sometimes
 panic = "abort"
+overflow-checks = true   # Detect integer overflow at runtime (safety > speed)
 
 [profile.dev]
 opt-level = 1      # Some optimization even in debug (kernel needs it)

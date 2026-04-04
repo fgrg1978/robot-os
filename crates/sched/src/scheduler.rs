@@ -1,9 +1,11 @@
-/// Scheduler for Robot OS — Phase 5: SMP round-robin (up to 4 CPUs).
+/// Scheduler for Robot OS — Priority-based with RT support and hart affinity.
 ///
 /// Design:
 /// - Global task pool: `TASKS[MAX_TASKS]` protected by `POOL_LOCK`
-/// - Per-CPU ready queues: `PER_CPU[cpu].ready[]` (circular buffer)
-/// - Task assignment: least-loaded CPU at creation time (no migration)
+/// - Per-CPU multi-level priority queues: 32 FIFOs + bitmap for O(1) dequeue
+/// - Hard real-time: priorities 0..RT_PRIORITY_THRESHOLD are never preempted by timer
+/// - Hart affinity: tasks can be pinned to a specific CPU
+/// - Task assignment: least-loaded CPU at creation time (unless pinned)
 /// - Context switch: saves/restores callee-saved registers only (ra, sp, s0-s11, pc)
 ///
 /// Invariants:
@@ -12,7 +14,11 @@
 /// - `POOL_LOCK` protects `TASKS[]`, `TASK_VALID[]`, `NEXT_TID` during task creation
 
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use crate::task::{Task, TaskContext, TaskState, CtxReg, MAX_TASKS, STACK_SIZE, TIME_SLICE_TICKS};
+use crate::task::{
+    Task, TaskContext, TaskState, CtxReg, MAX_TASKS, STACK_SIZE,
+    TIME_SLICE_TICKS, RT_TIME_SLICE_TICKS, NUM_PRIORITIES, is_rt_priority,
+    WaitReason, DeadlineParams, SyscallFilter,
+};
 use crate::smp::{current_cpu_id, NUM_ONLINE_CPUS};
 
 pub const MAX_CPUS: usize = 4;
@@ -48,7 +54,9 @@ static mut TASKS: [Task; MAX_TASKS] = unsafe { core::mem::zeroed() };
 static mut TASK_VALID: [bool; MAX_TASKS] = [false; MAX_TASKS];
 
 /// Stack storage — each stack[i] is exclusively owned by TASKS[i].
-#[repr(align(16))]
+/// Aligned to PAGE_SIZE (4 KiB) so that guard pages can unmap exact page
+/// boundaries without affecting adjacent BSS data.
+#[repr(align(4096))]
 struct StackStorage([[u8; STACK_SIZE]; MAX_TASKS]);
 static mut TASK_STACKS: StackStorage = StackStorage([[0u8; STACK_SIZE]; MAX_TASKS]);
 
@@ -58,27 +66,41 @@ static mut NEXT_TID: u32 = 1;
 /// Spinlock protecting TASKS[], TASK_VALID[], and NEXT_TID.
 static POOL_LOCK: AtomicBool = AtomicBool::new(false);
 
-// ---- Per-CPU scheduler state ----
+// ---- Per-CPU scheduler state (multi-level priority queue) ----
 
-/// Per-CPU scheduling state: current task and ready queue.
-///
-/// `current_idx = usize::MAX` means "no task running" (initial state, also after task_exit).
+/// Per-priority-level FIFO queue (circular buffer of task indices).
 #[derive(Copy, Clone)]
-struct PerCpuSched {
-    current_idx: usize,
-    ready:       [usize; MAX_TASKS],
-    ready_head:  usize,
-    ready_tail:  usize,
-    ready_count: usize,
+struct PrioQueue {
+    buf:   [usize; MAX_TASKS],
+    head:  usize,
+    tail:  usize,
+    count: usize,
 }
 
-/// Const initializer for PerCpuSched — sets current_idx to usize::MAX (not 0).
+const EMPTY_PRIO_QUEUE: PrioQueue = PrioQueue {
+    buf:   [0; MAX_TASKS],
+    head:  0,
+    tail:  0,
+    count: 0,
+};
+
+/// Per-CPU scheduling state with 32-level priority queue.
+///
+/// `current_idx = usize::MAX` means "no task running" (initial state, also after task_exit).
+/// `ready_bitmap` bit `i` is set when `ready_queues[i]` is non-empty.
+/// `trailing_zeros()` on the bitmap gives the highest-priority non-empty level in O(1).
+#[derive(Copy, Clone)]
+struct PerCpuSched {
+    current_idx:  usize,
+    ready_bitmap: u32,
+    ready_queues: [PrioQueue; NUM_PRIORITIES],
+}
+
+/// Const initializer for PerCpuSched.
 const EMPTY_CPU: PerCpuSched = PerCpuSched {
-    current_idx: usize::MAX,
-    ready:       [0; MAX_TASKS],
-    ready_head:  0,
-    ready_tail:  0,
-    ready_count: 0,
+    current_idx:  usize::MAX,
+    ready_bitmap: 0,
+    ready_queues: [EMPTY_PRIO_QUEUE; NUM_PRIORITIES],
 };
 
 /// Per-CPU ready queues and current task index.
@@ -145,27 +167,40 @@ impl Drop for CpuLockGuard {
 
 // ---- Internal helpers ----
 
-/// Enqueue task `idx` onto CPU `cpu`'s ready queue.
+/// Enqueue task `idx` at its priority level on CPU `cpu`.
 /// Caller must hold `CPU_LOCKS[cpu]` or guarantee single-CPU access.
 unsafe fn cpu_enqueue(cpu: usize, idx: usize) {
-    let q = &mut PER_CPU[cpu];
-    debug_assert!(q.ready_count < MAX_TASKS, "sched: ready queue full");
-    q.ready[q.ready_tail] = idx;
-    q.ready_tail = (q.ready_tail + 1) % MAX_TASKS;
-    q.ready_count += 1;
+    let prio = task_mut(idx).priority as usize;
+    let q = &mut PER_CPU[cpu].ready_queues[prio];
+    debug_assert!(q.count < MAX_TASKS, "sched: priority queue full");
+    q.buf[q.tail] = idx;
+    q.tail = (q.tail + 1) % MAX_TASKS;
+    q.count += 1;
+    PER_CPU[cpu].ready_bitmap |= 1 << prio;
 }
 
-/// Dequeue the next task index from CPU `cpu`'s ready queue.
+/// Dequeue the highest-priority ready task from CPU `cpu`.
 /// Caller must hold `CPU_LOCKS[cpu]` or guarantee single-CPU access.
 unsafe fn cpu_dequeue(cpu: usize) -> Option<usize> {
-    let q = &mut PER_CPU[cpu];
-    if q.ready_count == 0 {
+    let bitmap = PER_CPU[cpu].ready_bitmap;
+    if bitmap == 0 {
         return None;
     }
-    let idx = q.ready[q.ready_head];
-    q.ready_head = (q.ready_head + 1) % MAX_TASKS;
-    q.ready_count -= 1;
+    let prio = bitmap.trailing_zeros() as usize;
+    let q = &mut PER_CPU[cpu].ready_queues[prio];
+    let idx = q.buf[q.head];
+    q.head = (q.head + 1) % MAX_TASKS;
+    q.count -= 1;
+    if q.count == 0 {
+        PER_CPU[cpu].ready_bitmap &= !(1 << prio);
+    }
     Some(idx)
+}
+
+/// Return the priority of the highest-priority ready task on `cpu`, or None.
+unsafe fn cpu_peek_highest_prio(cpu: usize) -> Option<u32> {
+    let bitmap = PER_CPU[cpu].ready_bitmap;
+    if bitmap == 0 { None } else { Some(bitmap.trailing_zeros()) }
 }
 
 /// Allocate a free slot in TASKS[].
@@ -192,13 +227,23 @@ unsafe fn find_least_loaded_cpu() -> usize {
     let mut min_count = usize::MAX;
     let mut min_cpu = 0;
     for i in 0..num_online {
-        let count = PER_CPU[i].ready_count;
+        let count = PER_CPU[i].ready_bitmap.count_ones() as usize;
         if count < min_count {
             min_count = count;
             min_cpu = i;
         }
     }
     min_cpu
+}
+
+/// Pick target CPU respecting affinity.
+/// If affinity >= 0, returns that hart directly; otherwise least-loaded.
+unsafe fn pick_target_cpu(affinity: i8) -> usize {
+    if affinity >= 0 {
+        affinity as usize
+    } else {
+        find_least_loaded_cpu()
+    }
 }
 
 // ---- Task entry wrapper ----
@@ -240,10 +285,17 @@ pub fn init() {
     // Nothing else to do.
 }
 
-/// Create a new kernel task and assign it to the least-loaded CPU.
+/// Create a new kernel task with CPU affinity.
 ///
-/// Returns the task pool index (for debugging; rarely needed by callers).
-pub fn task_create(name: &str, entry_fn: fn(usize), arg: usize, priority: u32) -> usize {
+/// `affinity`: -1 = auto-assign to least-loaded CPU, 0..3 = pin to that hart.
+/// Returns the task pool index.
+pub fn task_create_affinity(
+    name: &str,
+    entry_fn: fn(usize),
+    arg: usize,
+    priority: u32,
+    affinity: i8,
+) -> usize {
     // Disable interrupts during task creation to prevent races on NEXT_TID.
     let sstatus = robot_os_arch::csr::read_sstatus();
     robot_os_arch::csr::write_sstatus(sstatus & !robot_os_arch::csr::SSTATUS_SIE);
@@ -264,12 +316,21 @@ pub fn task_create(name: &str, entry_fn: fn(usize), arg: usize, priority: u32) -
             task.name[..len].copy_from_slice(&name_bytes[..len]);
             task.name[len] = 0;
 
-            task.priority   = priority;
-            task.time_slice = TIME_SLICE_TICKS;
-            task.state      = TaskState::Ready;
-            task.stack_idx  = idx;
-            task.entry_fn   = entry_fn as usize;
-            task.entry_arg  = arg;
+            task.priority      = priority;
+            task.base_priority = priority;
+            task.time_slice    = if is_rt_priority(priority) {
+                RT_TIME_SLICE_TICKS
+            } else {
+                TIME_SLICE_TICKS
+            };
+            task.cpu_affinity  = affinity;
+            task.state          = TaskState::Ready;
+            task.wait_reason    = WaitReason::None;
+            task.deadline       = DeadlineParams::default();
+            task.syscall_filter = SyscallFilter::disabled();
+            task.stack_idx      = idx;
+            task.entry_fn       = entry_fn as usize;
+            task.entry_arg      = arg;
 
             // Stack grows down; top is at the end of the stack storage slice.
             let stack_top = TASK_STACKS.0[idx].as_mut_ptr() as usize + STACK_SIZE;
@@ -294,9 +355,13 @@ pub fn task_create(name: &str, entry_fn: fn(usize), arg: usize, priority: u32) -
             // Phase 16: write stack canary at the bottom of the stack (lowest
             // address).  Stack grows downward, so this is the first location
             // overwritten on overflow.  Checked by `stack_canary_check()`.
-            (TASK_STACKS.0[idx].as_mut_ptr() as *mut u64).write_volatile(STACK_CANARY);
+            // Skip when guard pages are active — the bottom page is unmapped
+            // and writing the canary would page fault.
+            if !GUARD_PAGES_ACTIVE.load(Ordering::Acquire) {
+                (TASK_STACKS.0[idx].as_mut_ptr() as *mut u64).write_volatile(STACK_CANARY);
+            }
 
-            let target_cpu = find_least_loaded_cpu();
+            let target_cpu = pick_target_cpu(affinity);
             (idx, target_cpu)
         }; // pool lock released here
 
@@ -311,6 +376,32 @@ pub fn task_create(name: &str, entry_fn: fn(usize), arg: usize, priority: u32) -
 
     // Restore interrupts.
     robot_os_arch::csr::write_sstatus(sstatus);
+    idx
+}
+
+/// Create a new kernel task, auto-assigned to the least-loaded CPU.
+///
+/// Returns the task pool index (for debugging; rarely needed by callers).
+pub fn task_create(name: &str, entry_fn: fn(usize), arg: usize, priority: u32) -> usize {
+    task_create_affinity(name, entry_fn, arg, priority, -1)
+}
+
+/// Create a task with a security profile pre-applied.
+///
+/// The filter is set before the task ever runs — it cannot call any
+/// unauthorized syscall, not even during initialization.
+pub fn task_create_filtered(
+    name: &str, entry_fn: fn(usize), arg: usize,
+    priority: u32, profile_id: u64,
+) -> usize {
+    let idx = task_create(name, entry_fn, arg, priority);
+    // Apply the filter to the newly created task.
+    let filter = crate::seccomp::profile_to_filter(profile_id);
+    unsafe {
+        if idx < MAX_TASKS && TASK_VALID[idx] {
+            task_mut(idx).syscall_filter = filter;
+        }
+    }
     idx
 }
 
@@ -369,17 +460,31 @@ pub fn task_yield() {
 
 /// Called from the timer interrupt handler (interrupts already disabled by hardware).
 ///
-/// Decrements the current task's time slice; preempts if expired.
+/// RT tasks: never preempted by timer — only by a strictly higher-priority ready task.
+/// Normal tasks: preempted when time slice expires (standard round-robin).
 pub fn schedule() {
     let cpu = current_cpu_id();
     unsafe {
         let current_idx = PER_CPU[cpu].current_idx;
         if current_idx != usize::MAX {
             let task = task_mut(current_idx);
-            if task.time_slice > 0 {
-                task.time_slice -= 1;
+            task.total_runtime += 1;
+
+            if is_rt_priority(task.priority) {
+                // RT task: only preempt if a higher-priority task is waiting.
+                match cpu_peek_highest_prio(cpu) {
+                    Some(ready_prio) if ready_prio < task.priority => {
+                        // Higher-priority task ready — preempt.
+                    }
+                    _ => return, // No higher-priority task — keep running.
+                }
+            } else {
+                // Normal task: standard time-slice expiry.
                 if task.time_slice > 0 {
-                    return; // Still has remaining time — don't preempt.
+                    task.time_slice -= 1;
+                    if task.time_slice > 0 {
+                        return; // Still has remaining time — don't preempt.
+                    }
                 }
             }
         }
@@ -400,7 +505,11 @@ pub fn start() -> ! {
         };
         let next = task_mut(next_idx);
         next.state      = TaskState::Running;
-        next.time_slice = TIME_SLICE_TICKS;
+        next.time_slice = if is_rt_priority(next.priority) {
+            RT_TIME_SLICE_TICKS
+        } else {
+            TIME_SLICE_TICKS
+        };
         PER_CPU[cpu].current_idx = next_idx;
 
         // Switch to first task (no current task to save).
@@ -426,16 +535,19 @@ unsafe fn do_schedule(cpu: usize) {
     if old_idx != usize::MAX {
         let old = task_mut(old_idx);
         if old.state == TaskState::Running {
-            old.state      = TaskState::Ready;
-            old.time_slice = TIME_SLICE_TICKS;
-            cpu_enqueue(cpu, old_idx);
+            old.state = TaskState::Ready;
+            cpu_enqueue(cpu, old_idx); // enqueues at old.priority level
         }
     }
 
     // Activate next task.
     let next = task_mut(next_idx);
     next.state      = TaskState::Running;
-    next.time_slice = TIME_SLICE_TICKS;
+    next.time_slice = if is_rt_priority(next.priority) {
+        RT_TIME_SLICE_TICKS
+    } else {
+        TIME_SLICE_TICKS
+    };
     PER_CPU[cpu].current_idx = next_idx;
 
     let old_ptr = if old_idx != usize::MAX {
@@ -560,11 +672,12 @@ pub fn pi_boost_task(tid: u32, new_prio: u32) {
 }
 
 /// Restore a task's original priority by TID (after PI mutex release).
-pub fn pi_restore_task(tid: u32, orig_prio: u32) {
+/// Uses `base_priority` from the task struct instead of the parameter for robustness.
+pub fn pi_restore_task(tid: u32, _orig_prio: u32) {
     unsafe {
         for i in 0..MAX_TASKS {
             if TASK_VALID[i] && TASKS[i].tid == tid {
-                TASKS[i].priority = orig_prio;
+                TASKS[i].priority = TASKS[i].base_priority;
                 break;
             }
         }
@@ -627,4 +740,108 @@ pub fn stack_canary_check() -> (usize, usize) {
         }
     }
     (ok, total)
+}
+
+// ---- AQ11: Syscall filter accessor ----
+
+/// Get the syscall filter of the current task.
+pub fn current_syscall_filter() -> SyscallFilter {
+    let cpu = current_cpu_id();
+    unsafe {
+        let idx = PER_CPU[cpu].current_idx;
+        if idx == usize::MAX { return SyscallFilter::disabled(); }
+        TASKS[idx].syscall_filter
+    }
+}
+
+/// Set the syscall filter for the current task.
+pub fn set_current_syscall_filter(filter: SyscallFilter) {
+    let cpu = current_cpu_id();
+    unsafe {
+        let idx = PER_CPU[cpu].current_idx;
+        if idx != usize::MAX {
+            TASKS[idx].syscall_filter = filter;
+        }
+    }
+}
+
+/// Set the syscall filter for a specific task by pool index (fork inheritance).
+pub fn set_task_syscall_filter(idx: usize, filter: SyscallFilter) {
+    unsafe {
+        if idx < MAX_TASKS && TASK_VALID[idx] {
+            TASKS[idx].syscall_filter = filter;
+        }
+    }
+}
+
+// ---- AQ0: Block / Wake API (used by wait.rs) ----
+
+/// Block the current task on `cpu` with the given reason.
+/// Moves it from Running → Blocked, then reschedules.
+pub fn block_current(cpu: usize, reason: WaitReason) {
+    if cpu >= MAX_CPUS { return; }
+    unsafe {
+        let idx = PER_CPU[cpu].current_idx;
+        if idx == usize::MAX { return; }
+        let task = task_mut(idx);
+        task.state = TaskState::Blocked;
+        task.wait_reason = reason;
+        // Don't re-enqueue — blocked tasks leave the ready queue.
+        do_schedule(cpu);
+        // Returns here when woken and rescheduled.
+    }
+}
+
+/// Try to wake task `idx` if it matches the predicate.
+/// Called from wait.rs wake_matching().
+pub fn try_wake_task(idx: usize, pred: &dyn Fn(&WaitReason) -> bool) {
+    if idx >= MAX_TASKS { return; }
+    unsafe {
+        if !TASK_VALID[idx] { return; }
+        let task = task_mut(idx);
+        if task.state != TaskState::Blocked { return; }
+        if !pred(&task.wait_reason) { return; }
+
+        task.state = TaskState::Ready;
+        task.wait_reason = WaitReason::None;
+        let target_cpu = if task.cpu_affinity >= 0 {
+            task.cpu_affinity as usize
+        } else {
+            0
+        };
+        cpu_enqueue(target_cpu.min(MAX_CPUS - 1), idx);
+    }
+}
+
+// ── WaitQueue support ───────────────────────────────────────────────────────
+
+/// Block the current task on a WaitQueue.
+/// Called via function pointer from `robot_os_sync::waitqueue`.
+pub fn wq_block_current() {
+    let cpu = current_cpu_id();
+    block_current(cpu, WaitReason::WaitQueue);
+}
+
+/// Wake a blocked task by TID (used by WaitQueue/Completion).
+/// Scans the task pool for a matching TID in WaitQueue-blocked state.
+pub fn wq_wake_by_tid(tid: u32) {
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if !TASK_VALID[i] { continue; }
+            let task = task_mut(i);
+            if task.tid != tid { continue; }
+            if task.state != TaskState::Blocked { break; }
+            if task.wait_reason != WaitReason::WaitQueue { break; }
+
+            task.state = TaskState::Ready;
+            task.wait_reason = WaitReason::None;
+            let target_cpu = if task.cpu_affinity >= 0 {
+                task.cpu_affinity as usize
+            } else {
+                0
+            };
+            cpu_enqueue(target_cpu.min(MAX_CPUS - 1), i);
+            break;
+        }
+    }
 }
