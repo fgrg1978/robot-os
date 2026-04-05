@@ -47,3 +47,4 @@ robot_os_flight    = { workspace = true }
 robot_os_telemetry = { workspace = true }
 robot_os_nav       = { workspace = true }
 robot_os_ota       = { workspace = true }
+robot_os_pubsub    = { workspace = true }

@@ -44,10 +44,12 @@ _start:
 
     # ── Test 4: SYS_BRK (extend by 4096) ─────────────────────────────
     li   a7, 400             # SYS_BRK
-    add  a0, s1, 4096        # request brk + 4096
+    li   t0, 4096
+    add  a0, s1, t0           # request brk + 4096
     ecall
     # new brk should be >= s1 + 4096
-    add  t0, s1, 4096
+    li   t0, 4096
+    add  t0, s1, t0
     blt  a0, t0, fail
 
     # ── Test 5: SYS_WRITE (write to allocated page) ───────────────────

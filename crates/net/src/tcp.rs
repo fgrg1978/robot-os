@@ -1,10 +1,20 @@
-/// TCP layer — port of net/tcp.c
+/// TCP layer — hardened TCP stack (RFC 793 + RFC 6298 + RFC 6528 + Reno)
 ///
 /// Simplified TCP state machine with 8 connections.
-/// Supports listen/connect/send/recv/close.
+/// Supports listen/connect/send/recv/close with:
+///   - ISN randomization (RFC 6528)
+///   - Retransmission timer (RFC 6298)
+///   - Keep-alive probes
+///   - Sequence number validation
+///   - Congestion control (Reno)
+///   - MSS negotiation
 
 use robot_os_sync::SpinLock;
 use super::ip;
+
+// ---------------------------------------------------------------------------
+// Connection limits
+// ---------------------------------------------------------------------------
 
 pub const TCP_MAX_CONNS: usize = 8;
 
@@ -12,35 +22,150 @@ pub const TCP_MAX_CONNS: usize = 8;
 /// Must be a power of two for efficient modular arithmetic.
 const TCP_BUF_SIZE: usize = 4096;
 
+/// Ring buffer index mask — used instead of modulo for power-of-two buffers.
+const TCP_BUF_MASK: usize = TCP_BUF_SIZE - 1;
+
 /// TCP Maximum Segment Size — max payload bytes per segment.
 /// Standard Ethernet MTU (1500) minus IP header (20) minus TCP header (20).
 const TCP_MSS: usize = 1460;
 
-/// Maximum TCP segment buffer size (MSS + TCP header).
-const TCP_SEGMENT_BUF_SIZE: usize = TCP_MSS + TCP_HDR_MIN;
+/// Maximum TCP segment buffer size (MSS + max TCP header with options).
+const TCP_SEGMENT_BUF_SIZE: usize = TCP_MSS + TCP_HDR_MAX;
 
 /// TCP advertised receive window size (bytes).
 /// Matches TCP_BUF_SIZE so the peer doesn't overrun our ring buffer.
 const TCP_WINDOW_SIZE: u16 = TCP_BUF_SIZE as u16;
 
+// ---------------------------------------------------------------------------
+// TCP header constants
+// ---------------------------------------------------------------------------
+
+/// Minimum TCP header length in bytes (5 × 4-byte words).
+const TCP_HDR_MIN: usize = 20;
+
+/// Maximum TCP header length with MSS option (6 × 4-byte words = 24 bytes).
+const TCP_HDR_MAX: usize = 24;
+
 /// TCP data offset for a minimal 20-byte header (5 × 4-byte words),
 /// encoded in the upper 4 bits of the data_off field.
 const TCP_DATA_OFF_MIN: u8 = 0x50;
 
-/// Initial Sequence Number for outgoing connections.
-/// TODO: replace with a proper ISN generator (RFC 6528).
-const TCP_INITIAL_SEQ_OUT: u32 = 0x1234_5678;
+/// TCP data offset for a 24-byte header with MSS option (6 × 4-byte words).
+const TCP_DATA_OFF_MSS: u8 = 0x60;
 
-/// Initial Sequence Number for accepted (incoming) connections.
-/// TODO: replace with a proper ISN generator (RFC 6528).
-const TCP_INITIAL_SEQ_IN: u32 = 0xDEAD_BEEF;
-
+// ---------------------------------------------------------------------------
 // TCP flags
+// ---------------------------------------------------------------------------
+
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
 #[allow(dead_code)]
 const TCP_RST: u8 = 0x04;
 const TCP_ACK: u8 = 0x10;
+
+// ---------------------------------------------------------------------------
+// MSS option
+// ---------------------------------------------------------------------------
+
+/// TCP option kind for Maximum Segment Size.
+const TCP_OPT_MSS: u8 = 2;
+
+/// TCP option length for MSS (kind + len + 2-byte value).
+const TCP_OPT_MSS_LEN: u8 = 4;
+
+/// TCP option kind: End of Options List.
+const TCP_OPT_EOL: u8 = 0;
+
+/// TCP option kind: No-Operation (padding).
+const TCP_OPT_NOP: u8 = 1;
+
+/// Default remote MSS when peer does not advertise one (RFC 879).
+const TCP_DEFAULT_REMOTE_MSS: u16 = 536;
+
+// ---------------------------------------------------------------------------
+// ISN generation (RFC 6528)
+// ---------------------------------------------------------------------------
+
+/// Compile-time secret seed for ISN generation.
+const ISN_SECRET: u32 = 0xA5F0_3C7B;
+
+/// FNV-1a offset basis (32-bit).
+const FNV_OFFSET_BASIS: u32 = 0x811C_9DC5;
+
+/// FNV-1a prime (32-bit).
+const FNV_PRIME: u32 = 0x0100_0193;
+
+// ---------------------------------------------------------------------------
+// Retransmission timer (RFC 6298)
+// ---------------------------------------------------------------------------
+
+/// Initial retransmission timeout in milliseconds.
+const RTO_INITIAL_MS: u64 = 1000;
+
+/// Minimum retransmission timeout in milliseconds.
+const RTO_MIN_MS: u64 = 200;
+
+/// Maximum retransmission timeout in milliseconds (60 seconds).
+const RTO_MAX_MS: u64 = 60_000;
+
+/// Maximum retransmission attempts before connection is considered dead.
+const RETX_MAX_ATTEMPTS: u8 = 8;
+
+/// Timer ticks per millisecond (10 MHz clock).
+const TICKS_PER_MS: u64 = 10_000;
+
+// ---------------------------------------------------------------------------
+// Keep-alive
+// ---------------------------------------------------------------------------
+
+/// Keep-alive interval: 30 seconds in ticks (30 × 10,000,000).
+const KEEPALIVE_INTERVAL_TICKS: u64 = 30 * 10_000_000;
+
+/// Maximum keep-alive probes before declaring connection dead.
+const KEEPALIVE_MAX_PROBES: u8 = 3;
+
+// ---------------------------------------------------------------------------
+// Congestion control (Reno)
+// ---------------------------------------------------------------------------
+
+/// Initial congestion window: 2 segments.
+const CWND_INITIAL: u32 = TCP_MSS as u32 * 2;
+
+/// Initial slow-start threshold: equals receive buffer size.
+const SSTHRESH_INITIAL: u32 = TCP_BUF_SIZE as u32;
+
+/// Fast retransmit threshold: 3 duplicate ACKs.
+const DUP_ACK_THRESHOLD: u8 = 3;
+
+// ---------------------------------------------------------------------------
+// RTT fixed-point scaling
+// ---------------------------------------------------------------------------
+
+/// Fixed-point multiplier for SRTT/RTTVAR (×1000).
+const RTT_SCALE: u64 = 1000;
+
+/// SRTT smoothing factor: alpha = 1/8, so (1 - alpha) = 7/8.
+const SRTT_ALPHA_INV: u64 = 8;
+
+/// RTTVAR smoothing factor: beta = 1/4, so (1 - beta) = 3/4.
+const RTTVAR_BETA_INV: u64 = 4;
+
+/// Clock granularity for RTO lower bound (1 ms in ticks).
+const CLOCK_GRANULARITY_TICKS: u64 = TICKS_PER_MS;
+
+// ---------------------------------------------------------------------------
+// TCP checksum field offset in header
+// ---------------------------------------------------------------------------
+
+/// Byte offset of the checksum field within the TCP header.
+const TCP_CHECKSUM_OFFSET: usize = 16;
+
+/// Byte offset + 1 of the checksum field (second byte).
+const TCP_CHECKSUM_OFFSET_HI: usize = 17;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum TcpState {
@@ -69,7 +194,9 @@ struct TcpHdr {
     urgent:   [u8; 2],
 }
 
-const TCP_HDR_MIN: usize = 20;
+// ---------------------------------------------------------------------------
+// TcpConn
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 pub struct TcpConn {
@@ -84,6 +211,30 @@ pub struct TcpConn {
     pub rx_buf:       [u8; TCP_BUF_SIZE],
     pub rx_head:      usize,
     pub rx_tail:      usize,
+
+    // --- Retransmission (RFC 6298) ---
+    retx_buf:         [u8; TCP_MSS],  // last sent segment data
+    retx_len:         usize,          // bytes in retx_buf
+    retx_seq:         u32,            // sequence number of retx data
+    retx_time:        u64,            // tick when segment was sent
+    rto_ticks:        u64,            // current RTO in ticks
+    srtt:             u64,            // smoothed RTT (×1000 fixed-point)
+    rttvar:           u64,            // RTT variance (×1000 fixed-point)
+    retx_count:       u8,             // retransmission attempts
+    unacked:          bool,           // has un-ACKed data in retx_buf
+
+    // --- Keep-alive ---
+    last_activity:    u64,            // last rx/tx timestamp (ticks)
+    keepalive_probes: u8,             // probes sent without reply
+
+    // --- Congestion control (Reno) ---
+    cwnd:             u32,            // congestion window (bytes)
+    ssthresh:         u32,            // slow-start threshold
+    dup_ack_count:    u8,             // duplicate ACK counter
+    last_ack_recv:    u32,            // last ACK value received (for dup detection)
+
+    // --- MSS negotiation ---
+    remote_mss:       u16,            // MSS advertised by remote peer
 }
 
 impl TcpConn {
@@ -100,6 +251,26 @@ impl TcpConn {
             rx_buf:       [0u8; TCP_BUF_SIZE],
             rx_head:      0,
             rx_tail:      0,
+
+            retx_buf:     [0u8; TCP_MSS],
+            retx_len:     0,
+            retx_seq:     0,
+            retx_time:    0,
+            rto_ticks:    RTO_INITIAL_MS * TICKS_PER_MS,
+            srtt:         0,
+            rttvar:       0,
+            retx_count:   0,
+            unacked:      false,
+
+            last_activity:    0,
+            keepalive_probes: 0,
+
+            cwnd:          CWND_INITIAL,
+            ssthresh:      SSTHRESH_INITIAL,
+            dup_ack_count: 0,
+            last_ack_recv: 0,
+
+            remote_mss:    TCP_DEFAULT_REMOTE_MSS,
         }
     }
 
@@ -110,7 +281,32 @@ impl TcpConn {
             TCP_BUF_SIZE - self.rx_head + self.rx_tail
         }
     }
+
+    /// Reset congestion and retransmission state for a fresh connection.
+    fn reset_conn_state(&mut self) {
+        self.retx_len         = 0;
+        self.retx_seq         = 0;
+        self.retx_time        = 0;
+        self.rto_ticks        = RTO_INITIAL_MS * TICKS_PER_MS;
+        self.srtt             = 0;
+        self.rttvar           = 0;
+        self.retx_count       = 0;
+        self.unacked          = false;
+        self.last_activity    = robot_os_drivers::clint::get_time();
+        self.keepalive_probes = 0;
+        self.cwnd             = CWND_INITIAL;
+        self.ssthresh         = SSTHRESH_INITIAL;
+        self.dup_ack_count    = 0;
+        self.last_ack_recv    = 0;
+        self.remote_mss       = TCP_DEFAULT_REMOTE_MSS;
+        self.rx_head          = 0;
+        self.rx_tail          = 0;
+    }
 }
+
+// ---------------------------------------------------------------------------
+// TcpLayer
+// ---------------------------------------------------------------------------
 
 struct TcpLayer {
     conns:        [TcpConn; TCP_MAX_CONNS],
@@ -160,6 +356,151 @@ impl TcpLayer {
 
 static TCP: SpinLock<TcpLayer> = SpinLock::new(TcpLayer::new());
 
+// ---------------------------------------------------------------------------
+// ISN generation (RFC 6528)
+// ---------------------------------------------------------------------------
+
+/// Simple ISN generator using connection 4-tuple and a static secret.
+/// ISN = FNV-1a(src_ip, dst_ip, src_port, dst_port, secret) + time_ticks
+fn generate_isn(src_ip: &[u8; 4], dst_ip: &[u8; 4], src_port: u16, dst_port: u16) -> u32 {
+    let mut h: u32 = FNV_OFFSET_BASIS;
+
+    // Hash source IP
+    let mut i = 0;
+    while i < 4 {
+        h ^= src_ip[i] as u32;
+        h = h.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+
+    // Hash destination IP
+    i = 0;
+    while i < 4 {
+        h ^= dst_ip[i] as u32;
+        h = h.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+
+    // Hash source port (2 bytes, big-endian)
+    let sp = src_port.to_be_bytes();
+    h ^= sp[0] as u32;
+    h = h.wrapping_mul(FNV_PRIME);
+    h ^= sp[1] as u32;
+    h = h.wrapping_mul(FNV_PRIME);
+
+    // Hash destination port (2 bytes, big-endian)
+    let dp = dst_port.to_be_bytes();
+    h ^= dp[0] as u32;
+    h = h.wrapping_mul(FNV_PRIME);
+    h ^= dp[1] as u32;
+    h = h.wrapping_mul(FNV_PRIME);
+
+    // Hash secret seed (4 bytes)
+    let secret = ISN_SECRET.to_le_bytes();
+    i = 0;
+    while i < 4 {
+        h ^= secret[i] as u32;
+        h = h.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+
+    // Add time component for uniqueness across reboots
+    let ticks = robot_os_drivers::clint::get_time();
+    h.wrapping_add(ticks as u32)
+}
+
+// ---------------------------------------------------------------------------
+// MSS option parsing
+// ---------------------------------------------------------------------------
+
+/// Parse TCP options from the header to extract the remote MSS.
+/// Returns the advertised MSS, or TCP_DEFAULT_REMOTE_MSS if not present.
+fn parse_mss_option(data: &[u8], hdr_len: usize) -> u16 {
+    if hdr_len <= TCP_HDR_MIN || data.len() < hdr_len {
+        return TCP_DEFAULT_REMOTE_MSS;
+    }
+    let opts = &data[TCP_HDR_MIN..hdr_len];
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            TCP_OPT_EOL => break,
+            TCP_OPT_NOP => { i += 1; }
+            TCP_OPT_MSS => {
+                if i + (TCP_OPT_MSS_LEN as usize) <= opts.len()
+                    && opts[i + 1] == TCP_OPT_MSS_LEN
+                {
+                    return u16::from_be_bytes([opts[i + 2], opts[i + 3]]);
+                }
+                break;
+            }
+            _ => {
+                // Unknown option — skip using length byte
+                if i + 1 >= opts.len() { break; }
+                let opt_len = opts[i + 1] as usize;
+                if opt_len < 2 { break; } // malformed
+                i += opt_len;
+                continue;
+            }
+        }
+    }
+    TCP_DEFAULT_REMOTE_MSS
+}
+
+// ---------------------------------------------------------------------------
+// Sequence number validation
+// ---------------------------------------------------------------------------
+
+/// Check if a sequence number falls within the receive window.
+/// Window is [win_start, win_start + win_size) using wrapping arithmetic.
+fn seq_in_window(seq_num: u32, win_start: u32, win_size: u32) -> bool {
+    // seq_num - win_start (wrapping) should be < win_size
+    let offset = seq_num.wrapping_sub(win_start);
+    offset < win_size
+}
+
+// ---------------------------------------------------------------------------
+// RTT / RTO update (RFC 6298)
+// ---------------------------------------------------------------------------
+
+/// Update SRTT, RTTVAR, and RTO from a measured RTT sample.
+fn update_rtt(conn: &mut TcpConn, measured_ticks: u64) {
+    let r = measured_ticks * RTT_SCALE; // scale to fixed-point
+
+    if conn.srtt == 0 {
+        // First measurement
+        conn.srtt   = r;
+        conn.rttvar = r / 2;
+    } else {
+        // RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - R|
+        let diff = if conn.srtt > r { conn.srtt - r } else { r - conn.srtt };
+        conn.rttvar = (conn.rttvar * (RTTVAR_BETA_INV - 1) + diff) / RTTVAR_BETA_INV;
+
+        // SRTT = (1 - alpha) * SRTT + alpha * R
+        conn.srtt = (conn.srtt * (SRTT_ALPHA_INV - 1) + r) / SRTT_ALPHA_INV;
+    }
+
+    // RTO = SRTT + max(G, 4 * RTTVAR)
+    let rttvar_component = conn.rttvar * 4 / RTT_SCALE;
+    let g = CLOCK_GRANULARITY_TICKS;
+    let k_rttvar = if rttvar_component > g { rttvar_component } else { g };
+    let rto = conn.srtt / RTT_SCALE + k_rttvar;
+
+    // Clamp to [RTO_MIN, RTO_MAX]
+    let rto_min = RTO_MIN_MS * TICKS_PER_MS;
+    let rto_max = RTO_MAX_MS * TICKS_PER_MS;
+    conn.rto_ticks = if rto < rto_min {
+        rto_min
+    } else if rto > rto_max {
+        rto_max
+    } else {
+        rto
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 /// Configure the TCP layer with our network addresses.
 pub fn init(mac: [u8; 6], ip: [u8; 4]) {
     let mut t = TCP.lock();
@@ -194,7 +535,7 @@ pub fn connect(dst_ip: [u8; 4], dst_port: u16, src_port: u16) -> i32 {
         Some(i) => i,
         None    => return -1,
     };
-    let seq = TCP_INITIAL_SEQ_OUT;
+    let seq = generate_isn(&ip, &dst_ip, src_port, dst_port);
     t.conns[idx].state       = TcpState::SynSent;
     t.conns[idx].local_ip    = ip;
     t.conns[idx].local_port  = src_port;
@@ -202,30 +543,49 @@ pub fn connect(dst_ip: [u8; 4], dst_port: u16, src_port: u16) -> i32 {
     t.conns[idx].remote_port = dst_port;
     t.conns[idx].seq         = seq;
     t.conns[idx].ack         = 0;
+    t.conns[idx].reset_conn_state();
+    t.conns[idx].seq         = seq; // restore after reset_conn_state clears it
 
-    // Send SYN
-    send_segment(&mac, &ip, &dst_ip, src_port, dst_port, TCP_SYN, seq, 0, &[]);
+    // Send SYN with MSS option
+    send_syn_segment(&mac, &ip, &dst_ip, src_port, dst_port, TCP_SYN, seq, 0);
     idx as i32
 }
 
 /// Send data on an established connection.
 pub fn send_data(idx: usize, data: &[u8]) -> i32 {
     if idx >= TCP_MAX_CONNS { return -1; }
-    let (mac, ip, seq, dst_ip, src_port, dst_port, state) = {
+    let (mac, ip, seq, ack_val, dst_ip, src_port, dst_port, state, cwnd, remote_mss) = {
         let t = TCP.lock();
         let c = &t.conns[idx];
-        (t.our_mac, t.our_ip, c.seq, c.remote_ip, c.local_port, c.remote_port, c.state)
+        (t.our_mac, t.our_ip, c.seq, c.ack, c.remote_ip, c.local_port, c.remote_port,
+         c.state, c.cwnd, c.remote_mss)
     };
     if state != TcpState::Established { return -1; }
 
-    // Split into segments if needed (simplification: send all in one shot)
+    // Limit send size by congestion window and remote MSS
+    let max_send = (cwnd as usize).min(remote_mss as usize).min(data.len());
+    let send_data_slice = &data[..max_send];
+
     let result = send_segment(&mac, &ip, &dst_ip, src_port, dst_port,
-                              TCP_ACK, seq, 0, data);
+                              TCP_ACK, seq, ack_val, send_data_slice);
 
     if result == 0 {
+        let now = robot_os_drivers::clint::get_time();
         let mut t = TCP.lock();
-        t.conns[idx].seq = t.conns[idx].seq.wrapping_add(data.len() as u32);
-        data.len() as i32
+        let c = &mut t.conns[idx];
+        c.seq = c.seq.wrapping_add(max_send as u32);
+
+        // Capture for retransmission
+        let copy_len = max_send.min(TCP_MSS);
+        c.retx_buf[..copy_len].copy_from_slice(&send_data_slice[..copy_len]);
+        c.retx_len  = copy_len;
+        c.retx_seq  = seq;
+        c.retx_time = now;
+        c.retx_count = 0;
+        c.unacked    = true;
+        c.last_activity = now;
+
+        max_send as i32
     } else {
         -1
     }
@@ -240,8 +600,8 @@ pub fn recv(idx: usize, buf: &mut [u8]) -> i32 {
     if avail == 0 { return 0; }
     let n = avail.min(buf.len());
     for i in 0..n {
-        buf[i] = c.rx_buf[c.rx_head % TCP_BUF_SIZE];
-        c.rx_head = (c.rx_head + 1) % TCP_BUF_SIZE;
+        buf[i] = c.rx_buf[c.rx_head & TCP_BUF_MASK];
+        c.rx_head = (c.rx_head + 1) & TCP_BUF_MASK;
     }
     n as i32
 }
@@ -249,14 +609,15 @@ pub fn recv(idx: usize, buf: &mut [u8]) -> i32 {
 /// Close a connection.
 pub fn close(idx: usize) {
     if idx >= TCP_MAX_CONNS { return; }
-    let (mac, ip, seq, ack, dst_ip, src_port, dst_port) = {
+    let (mac, ip, seq, ack_val, dst_ip, src_port, dst_port) = {
         let t = TCP.lock();
         let c = &t.conns[idx];
         (t.our_mac, t.our_ip, c.seq, c.ack, c.remote_ip, c.local_port, c.remote_port)
     };
-    send_segment(&mac, &ip, &dst_ip, src_port, dst_port, TCP_FIN | TCP_ACK, seq, ack, &[]);
+    send_segment(&mac, &ip, &dst_ip, src_port, dst_port, TCP_FIN | TCP_ACK, seq, ack_val, &[]);
     let mut t = TCP.lock();
-    t.conns[idx].state = TcpState::Closed;
+    t.conns[idx].state   = TcpState::Closed;
+    t.conns[idx].unacked = false;
 }
 
 /// Accept an established TCP connection on `local_port`.
@@ -284,7 +645,7 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
     let dst_port  = u16::from_be_bytes(hdr.dst_port);
     let src_port  = u16::from_be_bytes(hdr.src_port);
     let seq       = u32::from_be_bytes(hdr.seq);
-    let _ack_num  = u32::from_be_bytes(hdr.ack);
+    let ack_num   = u32::from_be_bytes(hdr.ack);
     let flags     = hdr.flags;
     let off       = ((hdr.data_off >> 4) as usize) * 4;
     // TCP header is at least 20 bytes (data_off >= 5); reject malformed segments.
@@ -292,6 +653,7 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
     let payload   = if off <= data.len() { &data[off..] } else { &[] };
 
     let (mac, ip) = { let t = TCP.lock(); (t.our_mac, t.our_ip) };
+    let now = robot_os_drivers::clint::get_time();
 
     // Find an existing connection
     let idx_opt = { TCP.lock().find_conn(dst_port, src_ip, src_port) };
@@ -300,11 +662,16 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
         let state = { TCP.lock().conns[idx].state };
         match state {
             TcpState::SynSent if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 => {
-                // SYN-ACK received → send ACK, move to Established
+                // SYN-ACK received → parse MSS, send ACK, move to Established
+                let remote_mss = parse_mss_option(data, off);
                 {
                     let mut t = TCP.lock();
-                    t.conns[idx].ack   = seq.wrapping_add(1);
-                    t.conns[idx].state = TcpState::Established;
+                    let c = &mut t.conns[idx];
+                    c.ack   = seq.wrapping_add(1);
+                    c.state = TcpState::Established;
+                    c.remote_mss    = remote_mss;
+                    c.last_activity = now;
+                    c.keepalive_probes = 0;
                 }
                 let (seq_n, ack_n) = { let t = TCP.lock(); (t.conns[idx].seq, t.conns[idx].ack) };
                 send_segment(&mac, &ip, src_ip, dst_port, src_port, TCP_ACK, seq_n, ack_n, &[]);
@@ -312,26 +679,116 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
             TcpState::SynRcvd if flags & TCP_ACK != 0 && flags & TCP_SYN == 0 => {
                 // Client's ACK completing the 3-way handshake → Established
                 let mut t = TCP.lock();
-                t.conns[idx].seq   = t.conns[idx].seq.wrapping_add(1);
-                t.conns[idx].state = TcpState::Established;
+                let c = &mut t.conns[idx];
+                c.seq   = c.seq.wrapping_add(1);
+                c.state = TcpState::Established;
+                c.last_activity = now;
+                c.keepalive_probes = 0;
             }
             TcpState::Established => {
+                // --- Sequence number validation ---
                 if !payload.is_empty() {
-                    // Enqueue received data
+                    let expected_ack = { TCP.lock().conns[idx].ack };
+                    if !seq_in_window(seq, expected_ack, TCP_WINDOW_SIZE as u32) {
+                        // Out-of-window segment — drop silently
+                        return;
+                    }
+                }
+
+                // --- ACK processing ---
+                if flags & TCP_ACK != 0 {
+                    let mut t = TCP.lock();
+                    let c = &mut t.conns[idx];
+                    c.last_activity = now;
+                    c.keepalive_probes = 0;
+
+                    if c.unacked && is_ack_advancing(ack_num, c.retx_seq, c.retx_len) {
+                        // New ACK — data acknowledged
+                        let rtt_sample = now.saturating_sub(c.retx_time);
+                        // Only update RTT if this is not a retransmission (Karn's algorithm)
+                        if c.retx_count == 0 {
+                            update_rtt(c, rtt_sample);
+                        }
+                        c.unacked       = false;
+                        c.retx_len      = 0;
+                        c.retx_count    = 0;
+                        c.dup_ack_count = 0;
+                        c.last_ack_recv = ack_num;
+
+                        // Congestion control: increase cwnd
+                        if c.cwnd < c.ssthresh {
+                            // Slow start: increase by one MSS per ACK
+                            c.cwnd = c.cwnd.saturating_add(TCP_MSS as u32);
+                        } else {
+                            // Congestion avoidance: increase by MSS*MSS/cwnd per ACK
+                            let increment = (TCP_MSS as u32)
+                                .saturating_mul(TCP_MSS as u32)
+                                / c.cwnd.max(1);
+                            c.cwnd = c.cwnd.saturating_add(increment.max(1));
+                        }
+                    } else if ack_num == c.last_ack_recv && c.unacked {
+                        // Duplicate ACK
+                        c.dup_ack_count = c.dup_ack_count.saturating_add(1);
+
+                        if c.dup_ack_count == DUP_ACK_THRESHOLD {
+                            // Fast retransmit
+                            c.ssthresh = (c.cwnd / 2).max(CWND_INITIAL);
+                            c.cwnd = c.ssthresh
+                                .saturating_add(DUP_ACK_THRESHOLD as u32 * TCP_MSS as u32);
+
+                            // Retransmit the lost segment
+                            let retx_seq  = c.retx_seq;
+                            let retx_len  = c.retx_len;
+                            let ack_val   = c.ack;
+                            let lp        = c.local_port;
+                            let rp        = c.remote_port;
+                            let rip       = c.remote_ip;
+                            // Copy retx data to local buffer before drop
+                            let mut retx_copy = [0u8; TCP_MSS];
+                            retx_copy[..retx_len].copy_from_slice(&c.retx_buf[..retx_len]);
+                            c.retx_time  = now;
+                            c.retx_count = c.retx_count.saturating_add(1);
+                            drop(t);
+                            send_segment(&mac, &ip, &rip, lp, rp,
+                                         TCP_ACK, retx_seq, ack_val,
+                                         &retx_copy[..retx_len]);
+                            // Re-lock not needed; we return below or continue
+                            let mut t2 = TCP.lock();
+                            t2.conns[idx].last_activity = now;
+                            // Skip payload processing after fast retransmit
+                            if payload.is_empty() && flags & TCP_FIN == 0 {
+                                return;
+                            }
+                            // Fall through for payload/FIN handling below
+                            drop(t2);
+                        } else {
+                            drop(t);
+                        }
+                    } else {
+                        c.last_ack_recv = ack_num;
+                        drop(t);
+                    }
+                }
+
+                // --- Payload processing ---
+                if !payload.is_empty() {
                     let mut t = TCP.lock();
                     let c = &mut t.conns[idx];
                     for &b in payload {
-                        let next = (c.rx_tail + 1) % TCP_BUF_SIZE;
+                        let next = (c.rx_tail + 1) & TCP_BUF_MASK;
                         if next != c.rx_head {
                             c.rx_buf[c.rx_tail] = b;
                             c.rx_tail = next;
                         }
                     }
                     c.ack = seq.wrapping_add(payload.len() as u32);
+                    c.last_activity = now;
                     let (seq_n, ack_n) = (c.seq, c.ack);
                     drop(t);
                     send_segment(&mac, &ip, src_ip, dst_port, src_port, TCP_ACK, seq_n, ack_n, &[]);
                 }
+
+                // --- FIN handling ---
                 if flags & TCP_FIN != 0 {
                     let mut t = TCP.lock();
                     t.conns[idx].state = TcpState::CloseWait;
@@ -349,25 +806,182 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
             // Accept: create new connection for this peer
             let new_idx_opt = { TCP.lock().alloc() };
             if let Some(new_idx) = new_idx_opt {
-                let our_seq = TCP_INITIAL_SEQ_IN;
+                let our_seq = generate_isn(&ip, src_ip, dst_port, src_port);
+                let remote_mss = parse_mss_option(data, off);
                 {
                     let mut t = TCP.lock();
-                    t.conns[new_idx].state       = TcpState::SynRcvd;
-                    t.conns[new_idx].local_ip    = ip;
-                    t.conns[new_idx].local_port  = dst_port;
-                    t.conns[new_idx].remote_ip   = *src_ip;
-                    t.conns[new_idx].remote_port = src_port;
-                    t.conns[new_idx].seq         = our_seq;
-                    t.conns[new_idx].ack         = seq.wrapping_add(1);
+                    let c = &mut t.conns[new_idx];
+                    c.state       = TcpState::SynRcvd;
+                    c.local_ip    = ip;
+                    c.local_port  = dst_port;
+                    c.remote_ip   = *src_ip;
+                    c.remote_port = src_port;
+                    c.seq         = our_seq;
+                    c.ack         = seq.wrapping_add(1);
+                    c.remote_mss  = remote_mss;
+                    c.reset_conn_state();
+                    // Restore values that reset_conn_state cleared
+                    c.seq = our_seq;
+                    c.ack = seq.wrapping_add(1);
+                    c.remote_mss = remote_mss;
                     let _ = listen_idx; // keep listener alive
                 }
-                // Send SYN-ACK
+                // Send SYN-ACK with MSS option
                 let ack_n = { TCP.lock().conns[new_idx].ack };
-                send_segment(&mac, &ip, src_ip, dst_port, src_port,
-                             TCP_SYN | TCP_ACK, our_seq, ack_n, &[]);
+                send_syn_segment(&mac, &ip, src_ip, dst_port, src_port,
+                             TCP_SYN | TCP_ACK, our_seq, ack_n);
             }
         }
     }
+}
+
+/// Periodic tick — call from timer interrupt to drive retransmissions and keep-alive.
+pub fn tcp_tick() {
+    let now = robot_os_drivers::clint::get_time();
+    let (mac, ip) = { let t = TCP.lock(); (t.our_mac, t.our_ip) };
+
+    for idx in 0..TCP_MAX_CONNS {
+        let (state, unacked, retx_time, rto, retx_count, last_act, ka_probes,
+             retx_seq, retx_len, ack_val, lp, rp, rip) = {
+            let t = TCP.lock();
+            let c = &t.conns[idx];
+            (c.state, c.unacked, c.retx_time, c.rto_ticks, c.retx_count,
+             c.last_activity, c.keepalive_probes,
+             c.retx_seq, c.retx_len, c.ack, c.local_port, c.remote_port, c.remote_ip)
+        };
+
+        if state == TcpState::Closed || state == TcpState::Listen {
+            continue;
+        }
+
+        // --- Retransmission timer ---
+        if unacked && now.saturating_sub(retx_time) >= rto {
+            if retx_count >= RETX_MAX_ATTEMPTS {
+                // Connection is dead — close it
+                let mut t = TCP.lock();
+                t.conns[idx].state   = TcpState::Closed;
+                t.conns[idx].unacked = false;
+                continue;
+            }
+
+            // Copy retransmission data
+            let mut retx_copy = [0u8; TCP_MSS];
+            {
+                let t = TCP.lock();
+                let c = &t.conns[idx];
+                retx_copy[..retx_len].copy_from_slice(&c.retx_buf[..retx_len]);
+            }
+
+            // Retransmit
+            send_segment(&mac, &ip, &rip, lp, rp,
+                         TCP_ACK, retx_seq, ack_val, &retx_copy[..retx_len]);
+
+            // Exponential backoff (RFC 6298 §5.5)
+            let mut t = TCP.lock();
+            let c = &mut t.conns[idx];
+            c.retx_count = c.retx_count.saturating_add(1);
+            c.retx_time  = now;
+            let rto_max  = RTO_MAX_MS * TICKS_PER_MS;
+            c.rto_ticks  = if c.rto_ticks.saturating_mul(2) > rto_max {
+                rto_max
+            } else {
+                c.rto_ticks.saturating_mul(2)
+            };
+
+            // Congestion response: set ssthresh, reset cwnd
+            c.ssthresh = (c.cwnd / 2).max(CWND_INITIAL);
+            c.cwnd     = TCP_MSS as u32; // collapse to 1 segment
+            continue;
+        }
+
+        // --- Keep-alive (Established only) ---
+        if state == TcpState::Established && !unacked {
+            if now.saturating_sub(last_act) >= KEEPALIVE_INTERVAL_TICKS {
+                if ka_probes >= KEEPALIVE_MAX_PROBES {
+                    // No response — close connection
+                    let mut t = TCP.lock();
+                    t.conns[idx].state   = TcpState::Closed;
+                    t.conns[idx].unacked = false;
+                    continue;
+                }
+
+                // Send keep-alive probe: ACK with seq = snd.nxt - 1
+                let seq_val = {
+                    let t = TCP.lock();
+                    t.conns[idx].seq.wrapping_sub(1)
+                };
+                send_segment(&mac, &ip, &rip, lp, rp, TCP_ACK, seq_val, ack_val, &[]);
+
+                let mut t = TCP.lock();
+                t.conns[idx].keepalive_probes = t.conns[idx].keepalive_probes.saturating_add(1);
+                t.conns[idx].last_activity    = now;
+            }
+        }
+    }
+}
+
+/// Return connection state for a given index.
+pub fn conn_state(idx: usize) -> TcpState {
+    if idx >= TCP_MAX_CONNS { return TcpState::Closed; }
+    TCP.lock().conns[idx].state
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Check if an incoming ACK advances past our retransmission buffer.
+/// Returns true if ack_num acknowledges data at [retx_seq, retx_seq + retx_len).
+fn is_ack_advancing(ack_num: u32, retx_seq: u32, retx_len: usize) -> bool {
+    if retx_len == 0 { return false; }
+    let end = retx_seq.wrapping_add(retx_len as u32);
+    // ack_num should be > retx_seq (wrapping) and <= end (wrapping)
+    let past_start = ack_num.wrapping_sub(retx_seq) > 0
+        && ack_num.wrapping_sub(retx_seq) <= retx_len as u32;
+    // Or exactly at end
+    past_start || ack_num == end
+}
+
+/// Build and send a TCP segment with MSS option (for SYN and SYN-ACK).
+fn send_syn_segment(
+    our_mac:  &[u8; 6],
+    our_ip:   &[u8; 4],
+    dst_ip:   &[u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    flags:    u8,
+    seq:      u32,
+    ack:      u32,
+) -> i32 {
+    let tcp_len = TCP_HDR_MAX; // 24 bytes: 20-byte header + 4-byte MSS option
+
+    let mut buf = [0u8; TCP_SEGMENT_BUF_SIZE];
+    let hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut TcpHdr) };
+    hdr.src_port = src_port.to_be_bytes();
+    hdr.dst_port = dst_port.to_be_bytes();
+    hdr.seq      = seq.to_be_bytes();
+    hdr.ack      = ack.to_be_bytes();
+    hdr.data_off = TCP_DATA_OFF_MSS;
+    hdr.flags    = flags;
+    hdr.window   = TCP_WINDOW_SIZE.to_be_bytes();
+    hdr.checksum = [0, 0];
+    hdr.urgent   = [0, 0];
+
+    // Write MSS option after the 20-byte header
+    buf[TCP_HDR_MIN]     = TCP_OPT_MSS;
+    buf[TCP_HDR_MIN + 1] = TCP_OPT_MSS_LEN;
+    let mss_bytes = (TCP_MSS as u16).to_be_bytes();
+    buf[TCP_HDR_MIN + 2] = mss_bytes[0];
+    buf[TCP_HDR_MIN + 3] = mss_bytes[1];
+
+    // TCP checksum over pseudo-header
+    let pseudo = ip::pseudo_checksum(our_ip, dst_ip, ip::IP_PROTO_TCP, tcp_len as u16);
+    let cs = tcp_checksum(pseudo, &buf[..tcp_len]);
+    let cb = cs.to_be_bytes();
+    buf[TCP_CHECKSUM_OFFSET]    = cb[0];
+    buf[TCP_CHECKSUM_OFFSET_HI] = cb[1];
+
+    ip::send(our_mac, our_ip, dst_ip, ip::IP_PROTO_TCP, &buf[..tcp_len])
 }
 
 /// Build and send a TCP segment.  Returns 0 on success.
@@ -402,8 +1016,8 @@ fn send_segment(
     let pseudo = ip::pseudo_checksum(our_ip, dst_ip, ip::IP_PROTO_TCP, tcp_len as u16);
     let cs = tcp_checksum(pseudo, &buf[..tcp_len]);
     let cb = cs.to_be_bytes();
-    buf[16] = cb[0];
-    buf[17] = cb[1];
+    buf[TCP_CHECKSUM_OFFSET]    = cb[0];
+    buf[TCP_CHECKSUM_OFFSET_HI] = cb[1];
 
     ip::send(our_mac, our_ip, dst_ip, ip::IP_PROTO_TCP, &buf[..tcp_len])
 }
@@ -422,10 +1036,4 @@ fn tcp_checksum(pseudo_sum: u32, data: &[u8]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
-}
-
-/// Return connection state for a given index.
-pub fn conn_state(idx: usize) -> TcpState {
-    if idx >= TCP_MAX_CONNS { return TcpState::Closed; }
-    TCP.lock().conns[idx].state
 }

@@ -339,42 +339,15 @@ pub fn sys_fork_impl() -> i64 {
     let parent_pt = crate::scheduler::current_user_pt();
     if parent_pt == 0 { return -1; } // kernel task can't fork
 
-    // Duplicate the page table: walk all valid PTEs, allocate new pages, copy contents.
-    let child_pt = match vmm::create_pagetable() {
+    // AQ9: Copy-on-Write fork — share all user pages read-only instead of
+    // copying them eagerly.  The COW fault handler allocates new pages on write.
+    let child_pt = match vmm::fork_cow(parent_pt) {
         Ok(pt) => pt,
         Err(_) => return -1,
     };
 
     // Copy kernel entries so traps work in the child.
     vmm::copy_kernel_entries_to_user(child_pt);
-
-    // Walk the parent's user page table and copy all user pages.
-    // We iterate over the L2 (mega-page) and L1 (page) levels.
-    // For simplicity, we copy the address range 0x10000..USER_STACK_TOP.
-    let copy_start = 0x10000usize; // typical user VA start
-    let copy_end   = USER_STACK_TOP;
-    let mut va = copy_start;
-    while va < copy_end {
-        if let Some(pa) = vmm::translate(parent_pt, va) {
-            // This VA is mapped in the parent — allocate a page and copy.
-            match pmm::alloc_page() {
-                Ok(page) => {
-                    let new_pa = page.as_usize();
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            pa as *const u8,
-                            new_pa as *mut u8,
-                            PAGE_SIZE,
-                        );
-                    }
-                    let flags = PteFlags::USER_RW | PteFlags::ACCESSED | PteFlags::DIRTY;
-                    let _ = vmm::map(child_pt, va, new_pa, flags);
-                }
-                Err(_) => return -1, // OOM
-            }
-        }
-        va += PAGE_SIZE;
-    }
 
     // Get parent's brk to set in child.
     let parent_brk = crate::scheduler::update_user_brk(0);

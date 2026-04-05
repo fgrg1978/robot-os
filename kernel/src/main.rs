@@ -861,6 +861,28 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     }
     kprintln!();
 
+    // ── AT: Pub/sub initialization ───────────────────────────────────────────
+    // Wire the wake callback so topic subscribers are woken when data arrives.
+    robot_os_pubsub::set_wake_callback(|task_idx| {
+        robot_os_sched::wake_by_channel(task_idx as u32);
+    });
+
+    // Create default topics for inter-task communication.
+    /// Message size for IMU topic (accel[3] + gyro[3] = 24 bytes, padded to 64).
+    const TOPIC_IMU_MSG_SIZE: u16 = 64;
+    /// Message size for battery topic (voltage, current, etc).
+    const TOPIC_BATTERY_MSG_SIZE: u16 = 16;
+    /// Message size for motor command topic.
+    const TOPIC_MOTOR_CMD_MSG_SIZE: u16 = 16;
+    /// Message size for status topic.
+    const TOPIC_STATUS_MSG_SIZE: u16 = 32;
+
+    robot_os_pubsub::topic_create(b"/sensors/imu", TOPIC_IMU_MSG_SIZE);
+    robot_os_pubsub::topic_create(b"/sensors/battery", TOPIC_BATTERY_MSG_SIZE);
+    robot_os_pubsub::topic_create(b"/cmd/motor", TOPIC_MOTOR_CMD_MSG_SIZE);
+    robot_os_pubsub::topic_create(b"/status", TOPIC_STATUS_MSG_SIZE);
+    kprintln!("[PUBSUB] Initialized 4 default topics");
+
     // Phase U4: autorun ELF — if CONFIG.INI has `autorun=<path>`, spawn a
     // task that loads and exec's that ELF at boot (e.g. brain client).
     #[cfg(target_pointer_width = "64")]
@@ -1164,6 +1186,8 @@ fn net_poll_task(_: usize) {
 
     loop {
         robot_os_net::net_poll();
+        // AR: TCP tick — drive retransmissions, TIME-WAIT, keep-alive timers.
+        robot_os_net::tcp::tcp_tick();
         robot_os_sched::task_yield();
     }
 }
@@ -2122,7 +2146,12 @@ fn system_wdt_task(_: usize) {
             robot_os_drivers::esc::esc_disarm();
         }
 
-        // ── 4. OTA boot-good mark ────────────────────────────────────────
+        // ── 4. Driver health check (AQ2) ────────────────────────────────
+        // Detect stalled drivers (no heartbeat) and trigger auto-restart.
+        let now_time = robot_os_drivers::clint::get_time();
+        robot_os_sched::driver_check_health(now_time);
+
+        // ── 5. OTA boot-good mark ────────────────────────────────────────
         // After OTA_BOOT_GOOD_DELAY_S of successful uptime, mark boot as good.
         if !boot_good_marked {
             let elapsed_ticks = now_tick.wrapping_sub(boot_start_tick) as u64;
@@ -2264,7 +2293,29 @@ fn handle_exception(frame: &mut TrapFrame, cause: usize) -> usize {
                 robot_os_sched::current_task_name());
 
             if from_user {
-                // U-mode fault: kill the offending task, scheduler picks next.
+                // AQ9: Try COW fault resolution first (store page fault only).
+                #[cfg(not(feature = "no-mmu"))]
+                if cause == TRAP_STORE_PAGE_FAULT {
+                    let user_pt = robot_os_sched::current_user_pt();
+                    if user_pt != 0 {
+                        if robot_os_mm::vmm::handle_cow_fault(user_pt, frame.stval as usize).is_ok() {
+                            return 0; // COW resolved, resume task
+                        }
+                    }
+                }
+
+                // AQ10: Try demand paging (load/store/instr fault on a demand-mapped page).
+                #[cfg(not(feature = "no-mmu"))]
+                {
+                    let user_pt = robot_os_sched::current_user_pt();
+                    if user_pt != 0 {
+                        if robot_os_mm::vmm::handle_demand_fault(user_pt, frame.stval as usize).is_ok() {
+                            return 0; // Page allocated on demand, resume task
+                        }
+                    }
+                }
+
+                // Neither COW nor demand paging — kill the offending task.
                 kprintln!("[PAGE FAULT] Killing user task");
                 robot_os_sched::task_exit();
                 // task_exit() never returns — context_switch abandons this frame.

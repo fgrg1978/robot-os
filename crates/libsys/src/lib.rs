@@ -171,6 +171,33 @@ pub const SENSOR_TYPE_GPIO_FLAGS: u64 = 7;
 pub const SENSOR_TYPE_CAMERA: u64 = 8;
 pub const SENSOR_TYPE_POWER: u64 = 9;
 
+// Driver server (AQ4)
+const SYS_DRV_REGISTER: u64 = 300;
+const SYS_DRV_MMAP: u64 = 302;
+const SYS_DRV_MUNMAP: u64 = 303;
+const SYS_DRV_IRQ_WAIT: u64 = 304;
+const SYS_DRV_IRQ_ACK: u64 = 305;
+const SYS_DRV_HEARTBEAT: u64 = 309;
+
+// IO Ring (AQ4)
+const SYS_IO_SETUP: u64 = 503;
+const SYS_IO_SUBMIT: u64 = 504;
+const SYS_IO_WAIT: u64 = 505;
+
+// Channel (AQ4)
+const SYS_CHAN_CREATE: u64 = 506;
+const SYS_CHAN_WRITE: u64 = 507;
+const SYS_CHAN_READ: u64 = 508;
+
+// Port (AQ5)
+const SYS_PORT_CREATE: u64 = 511;
+const SYS_PORT_BIND: u64 = 512;
+const SYS_PORT_WAIT: u64 = 513;
+const SYS_PORT_UNBIND: u64 = 514;
+
+// Trace (AQ8)
+const SYS_TRACE_DUMP: u64 = 518;
+
 // Security
 const SYS_SECCOMP: u64 = 430;
 
@@ -955,4 +982,120 @@ pub fn print(s: &[u8]) {
 pub fn println(s: &[u8]) {
     write(STDOUT, s);
     putchar(b'\n');
+}
+
+// ===========================================================================
+//  Driver server API (AQ4) — userspace driver registration and MMIO/IRQ
+// ===========================================================================
+
+/// Register the calling process as a driver with the given name.
+/// Returns a driver ID or negative on error.
+pub fn drv_register(name: &[u8]) -> isize {
+    unsafe { syscall2(SYS_DRV_REGISTER, name.as_ptr() as u64, name.len() as u64) }
+}
+
+/// Map a physical MMIO region into the driver's address space.
+/// Returns the virtual address or negative on error.
+pub fn drv_mmap(phys: u64, size: u64) -> isize {
+    unsafe { syscall2(SYS_DRV_MMAP, phys, size) }
+}
+
+/// Unmap a previously mapped MMIO region.
+pub fn drv_munmap(addr: u64, size: u64) -> isize {
+    unsafe { syscall2(SYS_DRV_MUNMAP, addr, size) }
+}
+
+/// Block until the specified IRQ fires. Returns 0 on success or negative.
+pub fn drv_irq_wait(irq: u64) -> isize {
+    unsafe { syscall1(SYS_DRV_IRQ_WAIT, irq) }
+}
+
+/// Acknowledge an IRQ after handling it.
+pub fn drv_irq_ack(irq: u64) -> isize {
+    unsafe { syscall1(SYS_DRV_IRQ_ACK, irq) }
+}
+
+/// Send a heartbeat to the driver manager indicating this driver is alive.
+pub fn drv_heartbeat() -> isize {
+    unsafe { syscall0(SYS_DRV_HEARTBEAT) }
+}
+
+// ===========================================================================
+//  IO Ring API (AQ4) — asynchronous I/O submission and completion
+// ===========================================================================
+
+/// Create a new IO ring. `flags` controls ring behaviour.
+/// Returns the ring ID or negative on error.
+pub fn io_setup(flags: u64) -> isize {
+    unsafe { syscall1(SYS_IO_SETUP, flags) }
+}
+
+/// Submit entries to an IO ring for asynchronous processing.
+/// `entries_ptr` points to an array of submission entries, `count` is the
+/// number of entries. Returns the number accepted or negative on error.
+pub fn io_submit(ring_id: u64, entries_ptr: u64, count: u64) -> isize {
+    unsafe { syscall3(SYS_IO_SUBMIT, ring_id, entries_ptr, count) }
+}
+
+/// Wait for at least `min_completions` completions on an IO ring.
+/// Returns the number of completions available or negative on error.
+pub fn io_wait(ring_id: u64, min_completions: u64) -> isize {
+    unsafe { syscall2(SYS_IO_WAIT, ring_id, min_completions) }
+}
+
+// ===========================================================================
+//  Channel API (AQ4) — kernel-mediated message passing
+// ===========================================================================
+
+/// Create a new kernel channel. Returns the channel handle or negative.
+pub fn chan_create() -> isize {
+    unsafe { syscall0(SYS_CHAN_CREATE) }
+}
+
+/// Write data to a channel.
+pub fn chan_write(handle: u64, buf: &[u8]) -> isize {
+    unsafe { syscall3(SYS_CHAN_WRITE, handle, buf.as_ptr() as u64, buf.len() as u64) }
+}
+
+/// Read data from a channel into `buf`.
+/// Returns bytes read or negative on error.
+pub fn chan_read(handle: u64, buf: &mut [u8]) -> isize {
+    unsafe { syscall3(SYS_CHAN_READ, handle, buf.as_ptr() as u64, buf.len() as u64) }
+}
+
+// ===========================================================================
+//  Port API (AQ5) — multi-source event waiting (like kqueue / Zircon ports)
+// ===========================================================================
+
+/// Create a new event port. Returns the port handle or negative.
+pub fn port_create() -> isize {
+    unsafe { syscall0(SYS_PORT_CREATE) }
+}
+
+/// Bind an event source to a port.
+/// `source_type` identifies the kind (IRQ, channel, ring, timer),
+/// `source_id` is the specific source, `key` is returned on wakeup.
+pub fn port_bind(port: u64, source_type: u64, source_id: u64, key: u64) -> isize {
+    unsafe { syscall4(SYS_PORT_BIND, port, source_type, source_id, key) }
+}
+
+/// Wait for an event on a port. Blocks until at least one bound source fires.
+/// Returns the key of the fired source or negative on error.
+pub fn port_wait(port: u64) -> isize {
+    unsafe { syscall1(SYS_PORT_WAIT, port) }
+}
+
+/// Unbind an event source from a port.
+pub fn port_unbind(port: u64, source_id: u64) -> isize {
+    unsafe { syscall2(SYS_PORT_UNBIND, port, source_id) }
+}
+
+// ===========================================================================
+//  Trace API (AQ8) — kernel event ring buffer dump
+// ===========================================================================
+
+/// Dump the kernel trace ring buffer to the console.
+/// Returns 0 on success or negative on error.
+pub fn trace_dump() -> isize {
+    unsafe { syscall0(SYS_TRACE_DUMP) }
 }

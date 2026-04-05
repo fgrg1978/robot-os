@@ -179,6 +179,34 @@ pub const SYS_BUZZER_OFF:  u64 = 421;
 /// Activate syscall filter for current task (one-way — cannot be disabled).
 pub const SYS_SECCOMP: u64 = 430;
 
+// IO Ring (AQ1)
+pub const SYS_IO_SETUP:  u64 = 503;
+pub const SYS_IO_SUBMIT: u64 = 504;
+pub const SYS_IO_WAIT:   u64 = 505;
+
+// Channels (AQ1)
+pub const SYS_CHAN_CREATE: u64 = 506;
+pub const SYS_CHAN_WRITE:  u64 = 507;
+pub const SYS_CHAN_READ:   u64 = 508;
+
+// MMIO/IRQ mapping (AQ1)
+pub const SYS_MMIO_MAP: u64 = 509;
+pub const SYS_IRQ_BIND: u64 = 510;
+
+// Ports (AQ5)
+pub const SYS_PORT_CREATE: u64 = 511;
+pub const SYS_PORT_BIND:   u64 = 512;
+pub const SYS_PORT_WAIT:   u64 = 513;
+pub const SYS_PORT_UNBIND: u64 = 514;
+
+// Handles (AQ6)
+pub const SYS_HANDLE_GRANT:  u64 = 515;
+pub const SYS_HANDLE_REVOKE: u64 = 516;
+pub const SYS_HANDLE_DUP:    u64 = 517;
+
+// Trace (AQ8)
+pub const SYS_TRACE_DUMP: u64 = 518;
+
 // Service manager
 pub const SYS_SERVICE_REGISTER:   u64 = 390;
 pub const SYS_SERVICE_UNREGISTER: u64 = 391;

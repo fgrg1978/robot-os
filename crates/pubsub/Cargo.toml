@@ -1,0 +1,7 @@
+[package]
+name = "robot_os_pubsub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+robot_os_sync = { workspace = true }

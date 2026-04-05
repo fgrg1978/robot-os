@@ -31,6 +31,9 @@ bitflags! {
         const DIRTY    = 1 << 7;
         /// OS-defined: Copy-on-Write flag (bit 8, in RSW field).
         const COW      = 1 << 8;
+        /// OS-defined: Demand-mapped page (bit 9, in RSW field).
+        /// PTE is invalid but marks a reserved virtual range (allocate on fault).
+        const DEMAND   = 1 << 9;
 
         // Common combinations — kernel mappings pre-set A+D to avoid page faults
         // on RISC-V implementations with software-managed A/D bits (ADUE=0).

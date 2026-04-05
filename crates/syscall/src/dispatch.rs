@@ -175,6 +175,113 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         // Security (AQ11): activate syscall filter (one-way)
         SYS_SECCOMP => robot_os_sched::seccomp::activate_profile(a0),
 
+        // IO Ring (AQ1)
+        SYS_IO_SETUP => {
+            let tid = robot_os_sched::current_task_tid() as usize;
+            match robot_os_ipc::io_ring_create(tid) {
+                Some((ring_id, _sq_base)) => ring_id as i64,
+                None => -1,
+            }
+        }
+        SYS_IO_SUBMIT => {
+            // a0 = ring_id — submission is a no-op until kernel-side IO workers exist.
+            let _ = a0;
+            0
+        }
+        SYS_IO_WAIT => {
+            // a0 = ring_id — return number of pending completions.
+            robot_os_ipc::io_ring_pending(a0 as u32) as i64
+        }
+
+        // Channels (AQ1)
+        SYS_CHAN_CREATE => {
+            match robot_os_ipc::channel_create() {
+                Some(idx) => idx as i64,
+                None => -1,
+            }
+        }
+        SYS_CHAN_WRITE => sys_ipc_send(a0, a1, a2),
+        SYS_CHAN_READ  => sys_ipc_recv(a0, a1, a2),
+
+        // MMIO/IRQ mapping (AQ1) — stubs until userspace driver model is complete.
+        SYS_MMIO_MAP => sys_stub(),
+        SYS_IRQ_BIND => sys_stub(),
+
+        // Ports (AQ5)
+        SYS_PORT_CREATE => {
+            let tid = robot_os_sched::current_task_tid() as usize;
+            match robot_os_ipc::port_create(tid) {
+                Some(id) => id as i64,
+                None => -1,
+            }
+        }
+        SYS_PORT_BIND => {
+            // a0 = port_id, a1 = source_type (0=channel, 1=ring), a2 = source_id, a3 = user_key
+            match a1 {
+                0 => {
+                    let kind = robot_os_ipc::PortSourceKind::Channel(a2 as u32);
+                    if robot_os_ipc::port_bind(a0 as u32, kind, a3) { 0 } else { -1 }
+                }
+                1 => {
+                    let kind = robot_os_ipc::PortSourceKind::Ring(a2 as u32);
+                    if robot_os_ipc::port_bind(a0 as u32, kind, a3) { 0 } else { -1 }
+                }
+                _ => -1,
+            }
+        }
+        SYS_PORT_WAIT => {
+            // a0 = port_id — poll for one event, return key or -1.
+            match robot_os_ipc::port_poll(a0 as u32) {
+                Some(evt) => evt.key as i64,
+                None => {
+                    // Block until an event arrives (AQ0: IO-wait).
+                    robot_os_sched::task_block(robot_os_sched::WaitReason::Port(a0 as u32));
+                    match robot_os_ipc::port_poll(a0 as u32) {
+                        Some(evt) => evt.key as i64,
+                        None => -1,
+                    }
+                }
+            }
+        }
+        SYS_PORT_UNBIND => {
+            // a0 = port_id — destroy the port entirely (simplified).
+            robot_os_ipc::port_destroy(a0 as u32);
+            0
+        }
+
+        // Handles (AQ6)
+        SYS_HANDLE_GRANT => {
+            // a0 = owner_tid, a1 = kind_raw, a2 = perms_raw
+            // Simplified: grant a Sensor handle (kind=0→Sensor(a1 as u8)).
+            let kind = robot_os_ipc::HandleKind::Sensor(a1 as u8);
+            let perms = if a2 & 0x2 != 0 { robot_os_ipc::HandlePerms::RW }
+                        else { robot_os_ipc::HandlePerms::RO };
+            match robot_os_ipc::handle_grant(a0 as u32, kind, perms) {
+                Some(id) => id as i64,
+                None => -1,
+            }
+        }
+        SYS_HANDLE_REVOKE => {
+            robot_os_ipc::handle_revoke(a0 as u32);
+            0
+        }
+        SYS_HANDLE_DUP => {
+            // a0 = handle_id, a1 = new_owner_tid
+            match robot_os_ipc::handle_dup(a0 as u32, a1 as u32) {
+                Some(id) => id as i64,
+                None => -1,
+            }
+        }
+
+        // Trace (AQ8)
+        SYS_TRACE_DUMP => {
+            /// Default number of trace entries to dump.
+            const TRACE_DUMP_DEFAULT_COUNT: usize = 50;
+            let count = if a0 == 0 { TRACE_DUMP_DEFAULT_COUNT } else { a0 as usize };
+            robot_os_ipc::trace_dump(count);
+            0
+        }
+
         _ => -1,
     }
 }

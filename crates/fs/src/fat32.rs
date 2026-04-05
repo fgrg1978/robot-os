@@ -72,6 +72,146 @@ const FAT32_EOC: u32 = 0x0FFF_FFF8;  // End-of-chain marker
 
 const SECTOR_SIZE: usize = 512;
 
+// ── Write-Ahead Journal (AS — Power-Loss Safety) ────────────────────────────
+
+/// Journal sector location — sector 1, immediately after BPB.
+const JOURNAL_SECTOR: u32 = 1;
+
+/// Journal entry states.
+const JOURNAL_EMPTY: u8 = 0x00;
+const JOURNAL_PENDING: u8 = 0x01;
+const JOURNAL_COMMITTED: u8 = 0x02;
+
+/// Journal operation types.
+const JOURNAL_OP_ALLOC: u8 = 1;
+#[allow(dead_code)]
+const JOURNAL_OP_FREE: u8 = 2;
+const JOURNAL_OP_WRITE_DIR: u8 = 3;
+const JOURNAL_OP_UNLINK: u8 = 4;
+
+/// Journal magic bytes — "JRNL".
+const JOURNAL_MAGIC: [u8; 4] = [b'J', b'R', b'N', b'L'];
+
+/// Size of the reserved portion after JournalEntry fixed fields.
+const JOURNAL_RESERVED_SIZE: usize = 490;
+
+/// Journal entry format — fits in one 512-byte sector.
+/// Written BEFORE the actual FAT/directory update, so on power loss
+/// we can replay or discard the pending operation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct JournalEntry {
+    magic: [u8; 4],                         // "JRNL"
+    state: u8,                              // EMPTY, PENDING, COMMITTED
+    op_type: u8,                            // ALLOC, FREE, WRITE_DIR, UNLINK
+    _pad: [u8; 2],
+    cluster: u32,                           // target cluster
+    fat_value: u32,                         // new FAT entry value
+    dir_sector: u32,                        // directory sector being modified
+    dir_offset: u16,                        // offset within directory sector
+    _reserved: [u8; JOURNAL_RESERVED_SIZE], // padding to 512 bytes
+}
+
+impl JournalEntry {
+    const fn empty() -> Self {
+        JournalEntry {
+            magic: JOURNAL_MAGIC,
+            state: JOURNAL_EMPTY,
+            op_type: 0,
+            _pad: [0; 2],
+            cluster: 0,
+            fat_value: 0,
+            dir_sector: 0,
+            dir_offset: 0,
+            _reserved: [0; JOURNAL_RESERVED_SIZE],
+        }
+    }
+
+    /// Serialize journal entry into a 512-byte sector buffer.
+    fn to_sector(&self, buf: &mut [u8; SECTOR_SIZE]) {
+        buf.fill(0);
+        buf[0..4].copy_from_slice(&self.magic);
+        buf[4] = self.state;
+        buf[5] = self.op_type;
+        // _pad at [6..8]
+        buf[8..12].copy_from_slice(&self.cluster.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.fat_value.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.dir_sector.to_le_bytes());
+        buf[20..22].copy_from_slice(&self.dir_offset.to_le_bytes());
+    }
+
+    /// Deserialize journal entry from a 512-byte sector buffer.
+    fn from_sector(buf: &[u8; SECTOR_SIZE]) -> Self {
+        let mut entry = JournalEntry::empty();
+        entry.magic.copy_from_slice(&buf[0..4]);
+        entry.state = buf[4];
+        entry.op_type = buf[5];
+        entry.cluster = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        entry.fat_value = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        entry.dir_sector = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        entry.dir_offset = u16::from_le_bytes([buf[20], buf[21]]);
+        entry
+    }
+}
+
+/// Write a journal entry to the journal sector.
+fn fat32_journal_write(entry: &JournalEntry) -> Result<(), ()> {
+    let mut buf = [0u8; SECTOR_SIZE];
+    entry.to_sector(&mut buf);
+    write_sector(JOURNAL_SECTOR, &buf)
+}
+
+/// Read the journal entry from the journal sector.
+fn fat32_journal_read() -> Result<JournalEntry, ()> {
+    let mut buf = [0u8; SECTOR_SIZE];
+    read_sector(JOURNAL_SECTOR, &mut buf)?;
+    Ok(JournalEntry::from_sector(&buf))
+}
+
+/// Clear the journal (set state to EMPTY).
+fn fat32_journal_clear() -> Result<(), ()> {
+    let entry = JournalEntry::empty();
+    fat32_journal_write(&entry)
+}
+
+/// Check and replay journal on mount.
+/// If journal has PENDING entry -> roll back (free allocated clusters).
+/// If journal has COMMITTED entry -> complete (clear journal).
+fn fat32_journal_recover() -> Result<(), ()> {
+    let entry = fat32_journal_read()?;
+
+    // Not a valid journal entry — nothing to recover.
+    if entry.magic != JOURNAL_MAGIC {
+        return Ok(());
+    }
+
+    match entry.state {
+        JOURNAL_PENDING => {
+            // Operation was not completed — roll back.
+            // If it was an alloc, free the cluster that was partially allocated.
+            if entry.op_type == JOURNAL_OP_ALLOC && entry.cluster >= 2 {
+                let _ = fat32_write_fat_entry(entry.cluster, 0);
+            }
+            // For FREE/WRITE_DIR/UNLINK with PENDING state, the FAT/dir
+            // was not yet modified, so nothing to undo.
+            robot_os_drivers::kprintln!(
+                "[FAT32] Journal recovery: rolled back pending op={}",
+                entry.op_type
+            );
+            fat32_journal_clear()
+        }
+        JOURNAL_COMMITTED => {
+            // Operation completed but journal wasn't cleared — just clear it.
+            robot_os_drivers::kprintln!("[FAT32] Journal recovery: cleared committed entry");
+            fat32_journal_clear()
+        }
+        _ => {
+            // EMPTY or unknown — nothing to do.
+            Ok(())
+        }
+    }
+}
+
 // ── Mounted volume state ──────────────────────────────────────────────────────
 
 struct Fat32Vol {
@@ -148,6 +288,11 @@ pub fn fat32_mount() -> Result<(), ()> {
         "[FAT32] Mounted: FAT@{}, data@{}, root_clus={}, spc={}",
         fat_start, data_start, root_clus, spc
     );
+
+    // Recover from any incomplete operations before power loss.
+    drop(v);
+    fat32_journal_recover()?;
+
     Ok(())
 }
 
@@ -408,6 +553,12 @@ fn fat32_creat_root_dirent(name83: &[u8; 11], cluster: u32, size: u32) -> Result
 }
 
 /// Mark a root-directory entry as deleted (first byte = 0xE5).
+///
+/// Uses journal for power-loss safety:
+///   1. Write journal (PENDING, op=UNLINK)
+///   2. Mark directory entry deleted
+///   3. Write journal (COMMITTED)
+///   4. Clear journal
 pub fn fat32_unlink_root(name83: &[u8; 11]) -> Result<(), ()> {
     let (root_cluster, spc, data_start) = {
         let v = FAT32.lock();
@@ -430,8 +581,41 @@ pub fn fat32_unlink_root(name83: &[u8; 11]) -> Result<(), ()> {
                 ent_name[..8].copy_from_slice(&sec_buf[off..off + 8]);
                 ent_name[8..11].copy_from_slice(&sec_buf[off + 8..off + 11]);
                 if &ent_name == name83 {
-                    sec_buf[off] = 0xE5; // Mark deleted
-                    return write_sector(first_sector + s, &sec_buf);
+                    // Step 1: Journal PENDING before modifying directory.
+                    let sector_num = first_sector + s;
+                    let journal = JournalEntry {
+                        magic: JOURNAL_MAGIC,
+                        state: JOURNAL_PENDING,
+                        op_type: JOURNAL_OP_UNLINK,
+                        _pad: [0; 2],
+                        cluster: 0,
+                        fat_value: 0,
+                        dir_sector: sector_num,
+                        dir_offset: off as u16,
+                        _reserved: [0; JOURNAL_RESERVED_SIZE],
+                    };
+                    fat32_journal_write(&journal)?;
+
+                    // Step 2: Mark deleted.
+                    sec_buf[off] = 0xE5;
+                    write_sector(sector_num, &sec_buf)?;
+
+                    // Step 3: Journal COMMITTED.
+                    let committed = JournalEntry {
+                        magic: JOURNAL_MAGIC,
+                        state: JOURNAL_COMMITTED,
+                        op_type: JOURNAL_OP_UNLINK,
+                        _pad: [0; 2],
+                        cluster: 0,
+                        fat_value: 0,
+                        dir_sector: sector_num,
+                        dir_offset: off as u16,
+                        _reserved: [0; JOURNAL_RESERVED_SIZE],
+                    };
+                    fat32_journal_write(&committed)?;
+
+                    // Step 4: Clear journal.
+                    return fat32_journal_clear();
                 }
             }
         }
@@ -444,6 +628,14 @@ pub fn fat32_unlink_root(name83: &[u8; 11]) -> Result<(), ()> {
 ///
 /// Existing data is freed first.  A new cluster chain is allocated, the data
 /// is written sector-by-sector, and a fresh directory entry is committed.
+///
+/// Write ordering with journal (AS — power-loss safety):
+///   1. Write journal entry (state=PENDING)
+///   2. Write data clusters
+///   3. Write FAT table
+///   4. Write directory entry
+///   5. Write journal entry (state=COMMITTED)
+///   6. Clear journal (state=EMPTY)
 pub fn fat32_write_file(name83: &[u8; 11], data: &[u8]) -> Result<(), ()> {
     if !FAT32.lock().mounted { return Err(()); }
 
@@ -462,7 +654,23 @@ pub fn fat32_write_file(name83: &[u8; 11], data: &[u8]) -> Result<(), ()> {
     let first_cluster = if data.is_empty() {
         0u32  // Empty file: no cluster
     } else {
-        let fc  = fat32_alloc_cluster()?;
+        let fc = fat32_alloc_cluster()?;
+
+        // Step 1: Write journal (PENDING) before any FAT/dir modifications.
+        let journal = JournalEntry {
+            magic: JOURNAL_MAGIC,
+            state: JOURNAL_PENDING,
+            op_type: JOURNAL_OP_WRITE_DIR,
+            _pad: [0; 2],
+            cluster: fc,
+            fat_value: FAT32_EOC,
+            dir_sector: 0,
+            dir_offset: 0,
+            _reserved: [0; JOURNAL_RESERVED_SIZE],
+        };
+        fat32_journal_write(&journal)?;
+
+        // Step 2: Write data clusters.
         let mut cur = fc;
         let mut off = 0usize;
         loop {
@@ -470,6 +678,7 @@ pub fn fat32_write_file(name83: &[u8; 11], data: &[u8]) -> Result<(), ()> {
             fat32_write_cluster(cur, &data[off..end])?;
             off = end;
             if off >= data.len() { break; }
+            // Step 3: Extend FAT chain.
             let next = fat32_alloc_cluster()?;
             fat32_write_fat_entry(cur, next)?;
             cur = next;
@@ -477,8 +686,25 @@ pub fn fat32_write_file(name83: &[u8; 11], data: &[u8]) -> Result<(), ()> {
         fc
     };
 
-    // Write the directory entry.
-    fat32_creat_root_dirent(name83, first_cluster, data.len() as u32)
+    // Step 4: Write the directory entry.
+    fat32_creat_root_dirent(name83, first_cluster, data.len() as u32)?;
+
+    // Step 5: Mark journal as COMMITTED.
+    let committed = JournalEntry {
+        magic: JOURNAL_MAGIC,
+        state: JOURNAL_COMMITTED,
+        op_type: JOURNAL_OP_WRITE_DIR,
+        _pad: [0; 2],
+        cluster: first_cluster,
+        fat_value: FAT32_EOC,
+        dir_sector: 0,
+        dir_offset: 0,
+        _reserved: [0; JOURNAL_RESERVED_SIZE],
+    };
+    fat32_journal_write(&committed)?;
+
+    // Step 6: Clear journal.
+    fat32_journal_clear()
 }
 
 /// Convert a raw filename (no slashes) to FAT32 8.3 format.
@@ -503,6 +729,21 @@ pub fn fat32_unlink_path(name: &[u8]) -> Result<(), ()> {
         if cluster >= 2 { fat32_free_chain(cluster); }
     }
     fat32_unlink_root(&name83)
+}
+
+// ── Sync (AS — Power-Loss Safety) ────────────────────────────────────────────
+
+/// Force flush all pending writes to disk.
+/// In our simple implementation, writes are already synchronous (no write cache),
+/// but this ensures the journal is cleared.
+pub fn fat32_sync() -> Result<(), ()> {
+    if !FAT32.lock().mounted { return Err(()); }
+    // Ensure journal is in a clean state.
+    let entry = fat32_journal_read()?;
+    if entry.magic == JOURNAL_MAGIC && entry.state == JOURNAL_COMMITTED {
+        fat32_journal_clear()?;
+    }
+    Ok(())
 }
 
 // ── Directory listing ─────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ pub mod scheduler;
 pub mod smp;
 pub mod wait;
 pub mod seccomp;
+pub mod driver;
 #[cfg(target_pointer_width = "64")]
 pub mod process;
 
@@ -18,6 +19,7 @@ pub use scheduler::{
     wq_block_current, wq_wake_by_tid,
     current_syscall_filter, set_current_syscall_filter,
     set_task_syscall_filter, task_create_filtered,
+    task_set_deadline, deadline_admission_check,
 };
 
 #[cfg(not(any(feature = "no-mmu", feature = "esp32c3")))]
@@ -34,6 +36,14 @@ pub use task::{
     SENSOR_AHRS_PRIORITY, FLIGHT_CTRL_PRIORITY, WATCHDOG_PRIORITY,
     RT_PRIORITY_THRESHOLD, RT_TIME_SLICE_TICKS,
     WaitReason, DeadlineParams, SyscallFilter, SYSCALL_FILTER_MAX,
+};
+
+pub use driver::{
+    driver_register, driver_set_mmio, driver_set_irq,
+    driver_start, driver_heartbeat, driver_heartbeat_with_time,
+    driver_on_crash, driver_on_crash_with_time, driver_check_health,
+    driver_info, driver_count,
+    DriverState, DriverEntry, MmioRegion,
 };
 
 pub use wait::{

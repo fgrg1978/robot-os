@@ -421,6 +421,10 @@ pub fn task_exit() -> ! {
         // Use a nested block so the guard is dropped (lock released) before
         // do_schedule(), which may context-switch and never return to this frame.
         if idx != usize::MAX {
+            // AQ2: Notify driver manager — if this task was a registered driver,
+            // record the crash so auto-restart can kick in.
+            crate::driver::driver_on_crash(idx);
+
             {
                 let _pool = PoolGuard::acquire();
                 task_mut(idx).state = TaskState::Zombie;
@@ -458,10 +462,19 @@ pub fn task_yield() {
     robot_os_arch::csr::write_sstatus(sstatus);
 }
 
+/// Microseconds per CLINT tick (10 MHz clock = 0.1 us per tick).
+/// 1 us = 10 ticks, so to convert us to ticks: multiply by this value.
+const TICKS_PER_US: u64 = 10;
+
+/// Fixed-point scale for deadline admission control (1.0 = this value).
+/// Using 10000 gives 0.01% granularity for utilization checks.
+const ADMISSION_SCALE: u64 = 10_000;
+
 /// Called from the timer interrupt handler (interrupts already disabled by hardware).
 ///
 /// RT tasks: never preempted by timer — only by a strictly higher-priority ready task.
 /// Normal tasks: preempted when time slice expires (standard round-robin).
+/// Deadline tasks: decrement remaining budget; replenish on deadline expiry.
 pub fn schedule() {
     let cpu = current_cpu_id();
     unsafe {
@@ -470,27 +483,61 @@ pub fn schedule() {
             let task = task_mut(current_idx);
             task.total_runtime += 1;
 
+            // Deadline task: track budget consumption and period expiry.
+            if task.deadline.period_us > 0 {
+                if task.deadline.remaining > 0 {
+                    task.deadline.remaining -= 1;
+                }
+                // Check if deadline has expired (overrun).
+                // Use total_runtime as a proxy for elapsed ticks since we cannot
+                // access the CLINT directly from this crate.
+                // The abs_deadline is checked against a monotonic tick counter
+                // that is incremented each timer tick.
+                let now_ticks = DEADLINE_TICK_COUNTER.load(Ordering::Relaxed);
+                if now_ticks > task.deadline.abs_deadline {
+                    // Deadline overrun — replenish for next period.
+                    let period_ticks = task.deadline.period_us * TICKS_PER_US;
+                    let runtime_ticks = task.deadline.runtime_us * TICKS_PER_US;
+                    task.deadline.abs_deadline += period_ticks;
+                    task.deadline.remaining = runtime_ticks;
+                }
+                // Always reschedule deadline tasks so EDF picks the earliest.
+                DEADLINE_TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+                do_schedule(cpu);
+                return;
+            }
+
             if is_rt_priority(task.priority) {
                 // RT task: only preempt if a higher-priority task is waiting.
                 match cpu_peek_highest_prio(cpu) {
                     Some(ready_prio) if ready_prio < task.priority => {
                         // Higher-priority task ready — preempt.
                     }
-                    _ => return, // No higher-priority task — keep running.
+                    _ => {
+                        DEADLINE_TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        return; // No higher-priority task — keep running.
+                    }
                 }
             } else {
                 // Normal task: standard time-slice expiry.
                 if task.time_slice > 0 {
                     task.time_slice -= 1;
                     if task.time_slice > 0 {
+                        DEADLINE_TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
                         return; // Still has remaining time — don't preempt.
                     }
                 }
             }
         }
+        DEADLINE_TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
         do_schedule(cpu);
     }
 }
+
+/// Monotonic tick counter for deadline scheduling.
+/// Incremented every timer tick in `schedule()`.
+static DEADLINE_TICK_COUNTER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Start the scheduler on the calling CPU (boot CPU).
 ///
@@ -518,18 +565,72 @@ pub fn start() -> ! {
     unreachable!()
 }
 
+/// Find the ready deadline task with the earliest absolute deadline on `cpu`.
+///
+/// Scans all valid tasks assigned to (or compatible with) `cpu` that are in
+/// Ready state and have `period_us > 0` (deadline task) with remaining budget.
+/// Returns the task pool index of the winner, or `None`.
+///
+/// # Safety
+/// Caller must ensure no concurrent mutation of TASKS/TASK_VALID (interrupts
+/// disabled or pool lock held).
+unsafe fn find_earliest_deadline(cpu: usize) -> Option<usize> {
+    let mut best_idx: Option<usize> = None;
+    let mut best_deadline: u64 = u64::MAX;
+
+    for i in 0..MAX_TASKS {
+        if !TASK_VALID[i] { continue; }
+        let t = &TASKS[i];
+        if t.state != TaskState::Ready && t.state != TaskState::Running { continue; }
+        if t.deadline.period_us == 0 { continue; }
+        if t.deadline.remaining == 0 { continue; }
+        // Check CPU affinity compatibility.
+        let ok_cpu = if t.cpu_affinity >= 0 {
+            t.cpu_affinity as usize == cpu
+        } else {
+            true
+        };
+        if !ok_cpu { continue; }
+        if t.deadline.abs_deadline < best_deadline {
+            best_deadline = t.deadline.abs_deadline;
+            best_idx = Some(i);
+        }
+    }
+    best_idx
+}
+
 /// Core scheduling logic: pick next task for `cpu` and context-switch to it.
+///
+/// Scheduling priority order:
+/// 1. Deadline tasks (EDF — earliest absolute deadline first)
+/// 2. RT + normal tasks (bitmap-based priority queue)
 ///
 /// # Safety
 /// Must be called with interrupts disabled on the calling CPU.
 /// No locks may be held when this function is called (context_switch may not return).
 unsafe fn do_schedule(cpu: usize) {
-    let next_idx = match cpu_dequeue(cpu) {
-        Some(idx) => idx,
-        None => return, // No ready tasks on this CPU — caller will idle.
+    // Phase 1: Check for deadline tasks (absolute priority over RT and normal).
+    let next_idx = if let Some(dl_idx) = find_earliest_deadline(cpu) {
+        // Remove the deadline task from the priority queue if it was enqueued there.
+        // Since we found it by scanning TASKS[], it might still be in the queue.
+        // We don't dequeue by index from the bitmap queue — instead we just skip
+        // the normal dequeue path. The task's state change to Running prevents
+        // double-selection.
+        dl_idx
+    } else {
+        // Phase 2: No deadline tasks — use bitmap-based priority queue.
+        match cpu_dequeue(cpu) {
+            Some(idx) => idx,
+            None => return, // No ready tasks on this CPU — caller will idle.
+        }
     };
 
     let old_idx = PER_CPU[cpu].current_idx;
+
+    // Don't switch if we'd switch to ourselves.
+    if next_idx == old_idx {
+        return;
+    }
 
     // Re-enqueue old task if it is still runnable.
     if old_idx != usize::MAX {
@@ -562,6 +663,57 @@ unsafe fn do_schedule(cpu: usize) {
 
     context_switch(old_ptr, next as *mut Task);
     // Returns here when the old task is rescheduled.
+}
+
+// ---- Deadline scheduling (AQ7) ----
+
+/// Configure deadline scheduling for a task.
+///
+/// `period_us` and `runtime_us` > 0 enables deadline (EDF) mode.
+/// The task will be scheduled with absolute priority over RT and normal tasks.
+/// Uses admission control: rejects if total utilization would exceed 100%.
+pub fn task_set_deadline(idx: usize, period_us: u64, runtime_us: u64) {
+    if idx >= MAX_TASKS || period_us == 0 || runtime_us == 0 || runtime_us > period_us {
+        return;
+    }
+    if !deadline_admission_check(period_us, runtime_us) {
+        return; // Would exceed total bandwidth — reject.
+    }
+    unsafe {
+        let _pool = PoolGuard::acquire();
+        if !TASK_VALID[idx] { return; }
+        let task = task_mut(idx);
+        let now_ticks = DEADLINE_TICK_COUNTER.load(Ordering::Relaxed);
+        let period_ticks = period_us * TICKS_PER_US;
+        let runtime_ticks = runtime_us * TICKS_PER_US;
+        task.deadline = DeadlineParams {
+            period_us,
+            runtime_us,
+            abs_deadline: now_ticks + period_ticks,
+            remaining: runtime_ticks,
+        };
+    }
+}
+
+/// Check if adding a deadline task would exceed total bandwidth.
+///
+/// Returns `true` if the task can be admitted (total utilization < 100%).
+/// Uses fixed-point integer math (scale = `ADMISSION_SCALE`) to avoid floats.
+pub fn deadline_admission_check(period_us: u64, runtime_us: u64) -> bool {
+    if period_us == 0 { return false; }
+    let mut total_util: u64 = 0;
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if !TASK_VALID[i] { continue; }
+            let dl = &TASKS[i].deadline;
+            if dl.period_us == 0 { continue; }
+            // Utilization = runtime / period, scaled by ADMISSION_SCALE.
+            total_util += (dl.runtime_us * ADMISSION_SCALE) / dl.period_us;
+        }
+    }
+    // Add the candidate task's utilization.
+    let candidate_util = (runtime_us * ADMISSION_SCALE) / period_us;
+    total_util + candidate_util <= ADMISSION_SCALE
 }
 
 // ---- Query functions ----
