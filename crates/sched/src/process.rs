@@ -392,6 +392,55 @@ fn fork_child_entry(_arg: usize) {
     // Fallback: if no context, just exit (shouldn't happen).
 }
 
+// ── MMIO mapping for userspace drivers (F00.2) ──────────────────────────────
+
+/// Base virtual address for user-space MMIO mappings.
+/// Placed at 1.5 GiB, below the stack at 2 GiB, above typical code/heap.
+const USER_MMIO_BASE: usize = 0x0000_0000_6000_0000; // 1.5 GiB
+
+/// Maximum size of a single MMIO mapping (1 MiB).
+const USER_MMIO_MAX_SIZE: usize = 1024 * 1024;
+
+/// Next free MMIO virtual address (grows upward).
+static MMIO_NEXT_VA: AtomicU64 = AtomicU64::new(USER_MMIO_BASE as u64);
+
+/// Map a physical MMIO region into the current task's user page table.
+/// Returns the virtual address in user space, or None on failure.
+///
+/// The mapping uses USER_RW flags (readable, writable, user-accessible, no exec).
+/// A+D bits are pre-set to avoid software-managed A/D faults on MMIO.
+pub fn mmio_map_user(phys_base: usize, size: usize) -> Option<usize> {
+    if size == 0 || size > USER_MMIO_MAX_SIZE {
+        return None;
+    }
+    let user_pt = crate::scheduler::current_user_pt();
+    if user_pt == 0 {
+        return None; // kernel task — no user page table
+    }
+
+    // Round size up to page boundary
+    let size_pages = page_up(size) / PAGE_SIZE;
+
+    // Allocate contiguous VA range
+    let va_base = MMIO_NEXT_VA.fetch_add((size_pages * PAGE_SIZE) as u64, Ordering::Relaxed) as usize;
+
+    // Map each page: physical MMIO directly into user PT with U+R+W+A+D flags
+    let flags = PteFlags::USER_RW
+        | PteFlags::ACCESSED
+        | PteFlags::DIRTY;
+
+    for i in 0..size_pages {
+        let va = va_base + i * PAGE_SIZE;
+        let pa = phys_base + i * PAGE_SIZE;
+        if vmm::map(user_pt, va, pa, flags).is_err() {
+            // Best-effort: partial mapping is still usable for already-mapped pages
+            break;
+        }
+    }
+
+    Some(va_base)
+}
+
 // ── Little-endian helpers ─────────────────────────────────────────────────────
 
 #[inline] fn r16(d: &[u8], off: usize) -> u16 {

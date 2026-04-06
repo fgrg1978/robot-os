@@ -211,12 +211,21 @@ pub fn close(sock: i32) {
 
 /// Handle an incoming UDP segment (called from ip::handle).
 /// Dispatches payload to the correct bound socket's ring buffer.
+/// DNS client port — intercept DNS responses before socket dispatch.
+const DNS_CLIENT_PORT: u16 = 5353;
+
 pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
     if data.len() < UDP_HDR_SIZE { return; }
     let hdr = unsafe { &*(data.as_ptr() as *const UdpHdr) };
     let dst_port = u16::from_be_bytes(hdr.dst_port);
     let src_port = u16::from_be_bytes(hdr.src_port);
     let payload  = &data[UDP_HDR_SIZE..];
+
+    // F05: Intercept DNS responses
+    if dst_port == DNS_CLIENT_PORT {
+        super::dns::handle_response(payload);
+        return;
+    }
 
     let mut socks = UDP_SOCKETS.lock();
     for i in 0..UDP_MAX_SOCKETS {

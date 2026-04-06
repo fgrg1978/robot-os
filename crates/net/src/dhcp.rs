@@ -289,6 +289,14 @@ pub fn dhcp_handle_ack(data: &[u8]) -> bool {
     if info.msg_type != DHCP_ACK { return false; }
 
     crate::net_set_ip(info.offered_ip, info.subnet, info.gateway);
+    // F05: Apply DNS server from DHCP lease
+    if info.dns != [0, 0, 0, 0] {
+        crate::dns::set_dns_server(info.dns);
+        robot_os_drivers::kprintln!(
+            "[DHCP] DNS server: {}.{}.{}.{}",
+            info.dns[0], info.dns[1], info.dns[2], info.dns[3],
+        );
+    }
     set_dhcp_state(DhcpState::Bound);
     robot_os_drivers::kprintln!(
         "[DHCP] ACK: bound to {}.{}.{}.{}  mask {}.{}.{}.{}  gw {}.{}.{}.{}",

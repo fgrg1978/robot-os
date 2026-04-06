@@ -2223,6 +2223,9 @@ fn handle_interrupt(_frame: &mut TrapFrame, cause: usize) {
                     // AQ0: Wake tasks blocked on this IRQ.
                     robot_os_sched::wake_by_irq(irq);
 
+                    // F00.3: Dispatch to userspace IRQ bindings (ports, etc.)
+                    robot_os_ipc::irq_dispatch(irq);
+
                     robot_os_drivers::plic::complete(hart as u32, irq);
                 }
             }

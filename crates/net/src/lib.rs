@@ -12,6 +12,7 @@ pub mod tcp;
 pub mod socket;
 #[allow(dead_code)]
 pub mod dhcp;
+pub mod dns;
 
 pub use socket::{
     socket_create, socket_bind, socket_connect,

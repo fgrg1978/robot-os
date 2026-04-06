@@ -140,7 +140,76 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         SYS_IPC_SEND    => sys_ipc_send(a0, a1, a2),
         SYS_IPC_RECEIVE => sys_ipc_recv(a0, a1, a2),
         SYS_IPC_DESTROY => sys_ipc_destroy(a0),
-        SYS_IPC_CALL ..= SYS_IPC_UNSHARE => sys_stub(), // advanced IPC
+        // IPC_CALL (F00.5): synchronous RPC
+        // a0 = server_channel, a1 = msg_ptr, a2 = msg_len, a3 = reply_buf_ptr, a4 = reply_buf_cap
+        SYS_IPC_CALL => {
+            let tid = robot_os_sched::current_task_tid();
+            let ch = a0 as usize;
+            // Copy message from user space
+            let mut msg_buf = [0u8; robot_os_ipc::RPC_MSG_MAX_LEN];
+            let msg_len = (a2 as usize).min(robot_os_ipc::RPC_MSG_MAX_LEN);
+            if msg_len > 0 && a1 != 0 {
+                unsafe { core::ptr::copy_nonoverlapping(a1 as *const u8, msg_buf.as_mut_ptr(), msg_len); }
+            }
+            // Send message to server channel
+            if robot_os_ipc::channel_send(ch, &msg_buf[..msg_len]) != 0 {
+                return -1; // channel full or invalid
+            }
+            // Register pending RPC
+            match robot_os_ipc::rpc_register(tid, a0 as u32) {
+                Some(_rpc_id) => {
+                    // Block caller until IPC_REPLY wakes us
+                    robot_os_sched::task_block(robot_os_sched::WaitReason::Rpc(tid));
+                    // After wake-up, retrieve reply
+                    let mut reply_tmp = [0u8; robot_os_ipc::RPC_MSG_MAX_LEN];
+                    match robot_os_ipc::rpc_get_reply(tid, &mut reply_tmp) {
+                        Some(reply_len) => {
+                            // Copy reply to caller's buffer if provided
+                            if a3 != 0 {
+                                let copy_len = (reply_len as usize).min(a4 as usize);
+                                unsafe { core::ptr::copy_nonoverlapping(reply_tmp.as_ptr(), a3 as *mut u8, copy_len); }
+                            }
+                            reply_len as i64
+                        }
+                        None => -1,
+                    }
+                }
+                None => -1, // no free RPC slots
+            }
+        }
+        // IPC_REPLY (F00.5): complete a pending RPC
+        // a0 = caller_tid, a1 = reply_ptr, a2 = reply_len
+        SYS_IPC_REPLY => {
+            let mut reply_buf = [0u8; robot_os_ipc::RPC_MSG_MAX_LEN];
+            let reply_len = (a2 as usize).min(robot_os_ipc::RPC_MSG_MAX_LEN);
+            if reply_len > 0 && a1 != 0 {
+                unsafe { core::ptr::copy_nonoverlapping(a1 as *const u8, reply_buf.as_mut_ptr(), reply_len); }
+            }
+            match robot_os_ipc::rpc_reply(a0 as u32, &reply_buf[..reply_len]) {
+                Some(caller_tid) => {
+                    robot_os_sched::wake_by_rpc(caller_tid);
+                    0
+                }
+                None => -1,
+            }
+        }
+        // IPC_SHARE (F00.4): create shared memory region
+        // a0 = page_count, a1 = perms (0=RO, 1=RW)
+        SYS_IPC_SHARE => {
+            let tid = robot_os_sched::current_task_tid();
+            let perms = if a1 != 0 { robot_os_ipc::ShmPerms::ReadWrite }
+                        else { robot_os_ipc::ShmPerms::ReadOnly };
+            match robot_os_ipc::shm_create(tid, a0 as usize, perms) {
+                Some(id) => id as i64,
+                None => -1,
+            }
+        }
+        // IPC_UNSHARE (F00.4): release shared memory reference
+        // a0 = shm_id
+        SYS_IPC_UNSHARE => {
+            robot_os_ipc::shm_release(a0 as u32);
+            0
+        }
 
         // Network
         SYS_NET_INFO   => sys_net_info(),
@@ -149,7 +218,28 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         SYS_NET_PING   => sys_net_ping(a0),
         SYS_NET_GETMAC => sys_net_getmac(),
         SYS_NET_STATS  => sys_net_stats(),
-        SYS_DNS_RESOLVE ..= SYS_MCAST_JOIN => sys_stub(),  // 266..=269
+        // F05: DNS resolver — a0 = hostname_ptr, a1 = hostname_len, a2 = result_ip_ptr
+        SYS_DNS_RESOLVE => {
+            let mut name_buf = [0u8; 64];
+            let name_len = (a1 as usize).min(name_buf.len());
+            if name_len == 0 || a0 == 0 { return -1; }
+            unsafe { core::ptr::copy_nonoverlapping(a0 as *const u8, name_buf.as_mut_ptr(), name_len); }
+            let hostname = match core::str::from_utf8(&name_buf[..name_len]) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            match robot_os_net::dns::resolve(hostname) {
+                Some(ip) => {
+                    if a2 != 0 {
+                        unsafe { core::ptr::copy_nonoverlapping(ip.as_ptr(), a2 as *mut u8, 4); }
+                    }
+                    // Return IP as u32 (network byte order)
+                    i64::from(u32::from_be_bytes(ip))
+                }
+                None => -1,
+            }
+        }
+        SYS_NTP_SYNC ..= SYS_MCAST_JOIN => sys_stub(),  // 267..=269
         // SYS_SHUTDOWN (270) and SYS_REBOOT (271) handled above
         SYS_MCAST_LEAVE ..= SYS_SECURE_RECV => sys_stub(),  // 272..=276
 
@@ -184,9 +274,8 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
             }
         }
         SYS_IO_SUBMIT => {
-            // a0 = ring_id — submission is a no-op until kernel-side IO workers exist.
-            let _ = a0;
-            0
+            // a0 = ring_id — process all pending SQ entries and write CQ completions.
+            robot_os_ipc::io_ring_submit(a0 as u32) as i64
         }
         SYS_IO_WAIT => {
             // a0 = ring_id — return number of pending completions.
@@ -203,9 +292,50 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         SYS_CHAN_WRITE => sys_ipc_send(a0, a1, a2),
         SYS_CHAN_READ  => sys_ipc_recv(a0, a1, a2),
 
-        // MMIO/IRQ mapping (AQ1) — stubs until userspace driver model is complete.
-        SYS_MMIO_MAP => sys_stub(),
-        SYS_IRQ_BIND => sys_stub(),
+        // MMIO mapping (F00.2): a0 = phys_base, a1 = size_bytes
+        // Maps a physical MMIO region into the calling task's userspace page table.
+        // Requires the caller to hold a Handle(MmioRegion(phys_base, size)).
+        SYS_MMIO_MAP => {
+            #[cfg(target_pointer_width = "64")]
+            {
+                let phys_base = a0 as usize;
+                let size = a1 as usize;
+                // Capability check: caller must own MmioRegion handle
+                let kind = robot_os_ipc::HandleKind::MmioRegion(phys_base, size);
+                if !cap_check(kind, false) {
+                    return E_PERM;
+                }
+                // Map into user page table (implemented in process module)
+                match robot_os_sched::process::mmio_map_user(phys_base, size) {
+                    Some(va) => va as i64,
+                    None => -1,
+                }
+            }
+            #[cfg(not(target_pointer_width = "64"))]
+            {
+                // No MMU on RV32 — MMIO is directly accessible
+                let _ = (a0, a1);
+                a0 as i64
+            }
+        }
+
+        // IRQ binding (F00.3): a0 = irq_number, a1 = target_type, a2 = target_id, a3 = user_key
+        // target_type: 0=wake_task (default via scheduler), 1=queue_to_port
+        SYS_IRQ_BIND => {
+            let irq = a0 as u32;
+            // Capability check: caller must own Irq handle
+            let kind = robot_os_ipc::HandleKind::Irq(irq);
+            if !cap_check(kind, false) {
+                return E_PERM;
+            }
+            let tid = robot_os_sched::current_task_tid();
+            let target = match a1 {
+                0 => robot_os_ipc::IrqTarget::WakeTask(tid),
+                1 => robot_os_ipc::IrqTarget::QueueToPort(a2 as u32, a3),
+                _ => return -1,
+            };
+            robot_os_ipc::irq_bind(irq, tid, target) as i64
+        }
 
         // Ports (AQ5)
         SYS_PORT_CREATE => {
@@ -216,18 +346,22 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
             }
         }
         SYS_PORT_BIND => {
-            // a0 = port_id, a1 = source_type (0=channel, 1=ring), a2 = source_id, a3 = user_key
-            match a1 {
-                0 => {
-                    let kind = robot_os_ipc::PortSourceKind::Channel(a2 as u32);
-                    if robot_os_ipc::port_bind(a0 as u32, kind, a3) { 0 } else { -1 }
-                }
-                1 => {
-                    let kind = robot_os_ipc::PortSourceKind::Ring(a2 as u32);
-                    if robot_os_ipc::port_bind(a0 as u32, kind, a3) { 0 } else { -1 }
-                }
-                _ => -1,
-            }
+            // a0 = port_id, a1 = source_type, a2 = source_id, a3 = user_key
+            // source_type: 0=channel, 1=ring, 2=irq, 3=timer
+            /// Port source type constants for syscall interface.
+            const PORT_SRC_CHANNEL: u64 = 0;
+            const PORT_SRC_RING:    u64 = 1;
+            const PORT_SRC_IRQ:     u64 = 2;
+            const PORT_SRC_TIMER:   u64 = 3;
+
+            let kind = match a1 {
+                PORT_SRC_CHANNEL => robot_os_ipc::PortSourceKind::Channel(a2 as u32),
+                PORT_SRC_RING    => robot_os_ipc::PortSourceKind::Ring(a2 as u32),
+                PORT_SRC_IRQ     => robot_os_ipc::PortSourceKind::Irq(a2 as u32),
+                PORT_SRC_TIMER   => robot_os_ipc::PortSourceKind::Timer(a2),
+                _ => return -1,
+            };
+            if robot_os_ipc::port_bind(a0 as u32, kind, a3) { 0 } else { -1 }
         }
         SYS_PORT_WAIT => {
             // a0 = port_id — poll for one event, return key or -1.
@@ -249,13 +383,55 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
             0
         }
 
-        // Handles (AQ6)
+        // Handles (AQ6 + F00.6: generalized grant)
+        // a0 = owner_tid, a1 = kind_type, a2 = param0, a3 = param1, a4 = perms_bits
+        // kind_type: 0=Sensor, 1=Gpio, 2=I2c, 3=Pwm, 4=Motor,
+        //            5=Channel, 6=Ring, 7=Port, 8=Irq, 9=MmioRegion
+        // perms_bits: bit0=read, bit1=write, bit2=execute, bit3=duplicate
         SYS_HANDLE_GRANT => {
-            // a0 = owner_tid, a1 = kind_raw, a2 = perms_raw
-            // Simplified: grant a Sensor handle (kind=0→Sensor(a1 as u8)).
-            let kind = robot_os_ipc::HandleKind::Sensor(a1 as u8);
-            let perms = if a2 & 0x2 != 0 { robot_os_ipc::HandlePerms::RW }
-                        else { robot_os_ipc::HandlePerms::RO };
+            // Only kernel tasks can grant handles (user_pt == 0)
+            if robot_os_sched::current_user_pt() != 0 {
+                return E_PERM;
+            }
+            /// Handle kind type constants for syscall interface.
+            const HANDLE_KIND_SENSOR:      u64 = 0;
+            const HANDLE_KIND_GPIO:        u64 = 1;
+            const HANDLE_KIND_I2C:         u64 = 2;
+            const HANDLE_KIND_PWM:         u64 = 3;
+            const HANDLE_KIND_MOTOR:       u64 = 4;
+            const HANDLE_KIND_CHANNEL:     u64 = 5;
+            const HANDLE_KIND_RING:        u64 = 6;
+            const HANDLE_KIND_PORT:        u64 = 7;
+            const HANDLE_KIND_IRQ:         u64 = 8;
+            const HANDLE_KIND_MMIO_REGION: u64 = 9;
+
+            let kind = match a1 {
+                HANDLE_KIND_SENSOR      => robot_os_ipc::HandleKind::Sensor(a2 as u8),
+                HANDLE_KIND_GPIO        => robot_os_ipc::HandleKind::Gpio(a2 as u32),
+                HANDLE_KIND_I2C         => robot_os_ipc::HandleKind::I2c(a2 as u8, a3 as u8),
+                HANDLE_KIND_PWM         => robot_os_ipc::HandleKind::Pwm(a2 as u8),
+                HANDLE_KIND_MOTOR       => robot_os_ipc::HandleKind::Motor(a2 as u32),
+                HANDLE_KIND_CHANNEL     => robot_os_ipc::HandleKind::Channel(a2 as u32),
+                HANDLE_KIND_RING        => robot_os_ipc::HandleKind::Ring(a2 as u32),
+                HANDLE_KIND_PORT        => robot_os_ipc::HandleKind::Port(a2 as u32),
+                HANDLE_KIND_IRQ         => robot_os_ipc::HandleKind::Irq(a2 as u32),
+                HANDLE_KIND_MMIO_REGION => robot_os_ipc::HandleKind::MmioRegion(a2 as usize, a3 as usize),
+                _ => return -1,
+            };
+
+            /// Permission bit masks for handle grants.
+            const PERM_BIT_READ:      u64 = 0x1;
+            const PERM_BIT_WRITE:     u64 = 0x2;
+            const PERM_BIT_EXECUTE:   u64 = 0x4;
+            const PERM_BIT_DUPLICATE: u64 = 0x8;
+
+            let perms = robot_os_ipc::HandlePerms {
+                read:      a4 & PERM_BIT_READ      != 0,
+                write:     a4 & PERM_BIT_WRITE     != 0,
+                execute:   a4 & PERM_BIT_EXECUTE   != 0,
+                duplicate: a4 & PERM_BIT_DUPLICATE != 0,
+            };
+
             match robot_os_ipc::handle_grant(a0 as u32, kind, perms) {
                 Some(id) => id as i64,
                 None => -1,

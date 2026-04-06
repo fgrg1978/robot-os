@@ -170,3 +170,169 @@ pub fn io_ring_pending(ring_id: u32) -> u32 {
         tail.wrapping_sub(head)
     }
 }
+
+// ---------------------------------------------------------------------------
+// IO Ring dispatch table — avoids circular dependencies (F00.1)
+// ---------------------------------------------------------------------------
+
+/// Error codes for IO ring operations.
+pub const IO_OK: i32 = 0;
+pub const IO_ERR_INVALID_OP: i32 = -1;
+pub const IO_ERR_INVALID_PARAM: i32 = -2;
+pub const IO_ERR_NO_OPS: i32 = -3;
+
+/// Dispatch table for IO ring operations. Registered by kernel at boot.
+/// Each function pointer maps to a hardware-level operation.
+pub struct IoRingOps {
+    pub read_sensor:   fn(sensor_type: u32, buf: *mut u8, buf_len: usize) -> i32,
+    pub write_gpio:    fn(pin: u32, value: u32) -> i32,
+    pub read_gpio:     fn(pin: u32) -> i32,
+    pub i2c_read:      fn(bus: u32, addr_reg: u32, buf: *mut u8, len: usize) -> i32,
+    pub i2c_write:     fn(bus: u32, addr_reg: u32, data: *const u8, len: usize) -> i32,
+    pub pwm_set:       fn(channel: u32, duty: u32) -> i32,
+    pub motor_speed:   fn(left: i32, right: i32) -> i32,
+    pub net_send:      fn(fd: u32, data: *const u8, len: usize) -> i32,
+    pub net_recv:      fn(fd: u32, buf: *mut u8, len: usize) -> i32,
+}
+
+/// Global dispatch table (set once at kernel init).
+static mut OPS: Option<&'static IoRingOps> = None;
+
+/// Register the IO ring dispatch table. Called once during kernel boot.
+pub fn io_ring_register_ops(ops: &'static IoRingOps) {
+    unsafe { OPS = Some(ops); }
+}
+
+/// Process all pending SQ entries for a ring. Returns number of completions,
+/// or a negative error code.
+///
+/// This runs inline in the SYS_IO_SUBMIT syscall — no separate kernel thread.
+/// Processes all entries from sq_head to sq_tail in batch.
+pub fn io_ring_submit(ring_id: u32) -> i32 {
+    if ring_id as usize >= MAX_IO_RINGS {
+        return IO_ERR_INVALID_PARAM;
+    }
+
+    let ops = unsafe { match OPS {
+        Some(o) => o,
+        None => return IO_ERR_NO_OPS,
+    }};
+
+    unsafe {
+        let state = &IO_RINGS[ring_id as usize];
+        if !state.active {
+            return IO_ERR_INVALID_PARAM;
+        }
+        let ring = state.phys_addr as *mut IoRing;
+
+        let mut head = (*ring).sq_head.load(Ordering::Acquire);
+        let tail = (*ring).sq_tail.load(Ordering::Acquire);
+        let mut completions: i32 = 0;
+
+        while head != tail {
+            let sq_idx = (head as usize) % RING_SQ_SIZE;
+            let sqe = (*ring).sq_entries[sq_idx];
+
+            // Dispatch based on opcode
+            let result = dispatch_sqe(&sqe, &mut (*ring).data_buf, ops);
+
+            // Write completion entry
+            let cq_tail = (*ring).cq_tail.load(Ordering::Acquire);
+            let cq_idx = (cq_tail as usize) % RING_CQ_SIZE;
+            (*ring).cq_entries[cq_idx] = CqEntry {
+                user_data: sqe.user_data,
+                result,
+                flags: 0,
+            };
+            (*ring).cq_tail.store(cq_tail.wrapping_add(1), Ordering::Release);
+
+            head = head.wrapping_add(1);
+            completions += 1;
+        }
+
+        // Advance SQ head
+        (*ring).sq_head.store(head, Ordering::Release);
+        completions
+    }
+}
+
+/// Dispatch a single SQ entry to the appropriate hardware operation.
+fn dispatch_sqe(sqe: &SqEntry, data_buf: &mut [u8; RING_DATA_BUF_SIZE], ops: &IoRingOps) -> i32 {
+    let p0 = sqe.param0;
+    let p1 = sqe.param1;
+    let p2 = sqe.param2;
+
+    match sqe.opcode {
+        OP_NOP => IO_OK,
+
+        OP_READ_SENSOR => {
+            let offset = p1 as usize;
+            let len = p2 as usize;
+            if offset + len > RING_DATA_BUF_SIZE {
+                return IO_ERR_INVALID_PARAM;
+            }
+            let buf_ptr = data_buf[offset..].as_mut_ptr();
+            (ops.read_sensor)(p0, buf_ptr, len)
+        }
+
+        OP_WRITE_GPIO => (ops.write_gpio)(p0, p1),
+
+        OP_READ_GPIO => (ops.read_gpio)(p0),
+
+        OP_I2C_READ => {
+            let offset = p1 as usize;
+            let len = p2 as usize;
+            if offset + len > RING_DATA_BUF_SIZE {
+                return IO_ERR_INVALID_PARAM;
+            }
+            let buf_ptr = data_buf[offset..].as_mut_ptr();
+            (ops.i2c_read)(p0, p1, buf_ptr, len)
+        }
+
+        OP_I2C_WRITE => {
+            let offset = p1 as usize;
+            let len = p2 as usize;
+            if offset + len > RING_DATA_BUF_SIZE {
+                return IO_ERR_INVALID_PARAM;
+            }
+            let data_ptr = data_buf[offset..].as_ptr();
+            (ops.i2c_write)(p0, p1, data_ptr, len)
+        }
+
+        OP_PWM_SET => (ops.pwm_set)(p0, p1),
+
+        OP_MOTOR_SPEED => (ops.motor_speed)(p0 as i32, p1 as i32),
+
+        OP_NET_SEND => {
+            let offset = p1 as usize;
+            let len = p2 as usize;
+            if offset + len > RING_DATA_BUF_SIZE {
+                return IO_ERR_INVALID_PARAM;
+            }
+            let data_ptr = data_buf[offset..].as_ptr();
+            (ops.net_send)(p0, data_ptr, len)
+        }
+
+        OP_NET_RECV => {
+            let offset = p1 as usize;
+            let len = p2 as usize;
+            if offset + len > RING_DATA_BUF_SIZE {
+                return IO_ERR_INVALID_PARAM;
+            }
+            let buf_ptr = data_buf[offset..].as_mut_ptr();
+            (ops.net_recv)(p0, buf_ptr, len)
+        }
+
+        OP_CAMERA_CAPTURE => {
+            // Stub — camera capture is complex, completed in a later phase
+            IO_OK
+        }
+
+        OP_IRQ_WAIT => {
+            // Stub — IRQ wait is handled by task_block in a later integration
+            IO_OK
+        }
+
+        _ => IO_ERR_INVALID_OP,
+    }
+}

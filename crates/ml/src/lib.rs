@@ -67,6 +67,14 @@
 pub mod gguf;
 pub mod quant;
 pub mod ggml_nano;
+// ── Phase F08: Convolutional operators ──────────────────────────────────────
+pub mod conv;
+// ── Phase F08.8: INT8 quantized inference ──────────────────────────────────
+pub mod int8;
+// ── Phase F15: Zero-copy inference pipeline ─────────────────────────────────
+pub mod pipeline;
+// ── Phase F19: Multi-model management ──────────────────────────────────────
+pub mod model_mgr;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

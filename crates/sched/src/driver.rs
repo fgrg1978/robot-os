@@ -303,3 +303,132 @@ pub fn driver_info(id: usize) -> Option<DriverEntry> {
 pub fn driver_count() -> usize {
     DRIVERS.lock().count
 }
+
+// ---------------------------------------------------------------------------
+// Driver spawn orchestration (F06)
+// ---------------------------------------------------------------------------
+
+/// ELF path for a driver (stored alongside the registry entry).
+pub const DRIVER_PATH_MAX_LEN: usize = 64;
+
+/// Descriptor for spawning a userspace driver.
+#[derive(Clone, Copy)]
+pub struct DriverDescriptor {
+    /// Human-readable name.
+    pub name: [u8; DRIVER_NAME_LEN],
+    pub name_len: u8,
+    /// FAT32 path to the driver ELF.
+    pub elf_path: [u8; DRIVER_PATH_MAX_LEN],
+    pub elf_path_len: u8,
+    /// MMIO regions to grant.
+    pub mmio: [MmioRegion; MAX_MMIO_PER_DRIVER],
+    pub mmio_count: u8,
+    /// IRQ numbers to grant.
+    pub irqs: [u32; MAX_IRQS_PER_DRIVER],
+    pub irq_count: u8,
+}
+
+impl DriverDescriptor {
+    pub const fn empty() -> Self {
+        Self {
+            name: [0; DRIVER_NAME_LEN],
+            name_len: 0,
+            elf_path: [0; DRIVER_PATH_MAX_LEN],
+            elf_path_len: 0,
+            mmio: [MmioRegion::empty(); MAX_MMIO_PER_DRIVER],
+            mmio_count: 0,
+            irqs: [0; MAX_IRQS_PER_DRIVER],
+            irq_count: 0,
+        }
+    }
+}
+
+/// Maximum number of drivers that can be auto-spawned at boot.
+pub const MAX_SPAWN_DESCRIPTORS: usize = 8;
+
+/// Boot-time driver descriptors (populated by kernel init, consumed by supervisor).
+static mut SPAWN_DESCRIPTORS: [DriverDescriptor; MAX_SPAWN_DESCRIPTORS] = {
+    const EMPTY: DriverDescriptor = DriverDescriptor::empty();
+    [EMPTY; MAX_SPAWN_DESCRIPTORS]
+};
+static mut SPAWN_COUNT: usize = 0;
+
+/// Register a driver descriptor for boot-time spawning.
+/// Called from kernel init to declare which drivers should be auto-spawned.
+pub fn driver_add_spawn_descriptor(desc: DriverDescriptor) -> bool {
+    unsafe {
+        if SPAWN_COUNT >= MAX_SPAWN_DESCRIPTORS {
+            return false;
+        }
+        SPAWN_DESCRIPTORS[SPAWN_COUNT] = desc;
+        SPAWN_COUNT += 1;
+        true
+    }
+}
+
+/// Get the number of registered spawn descriptors.
+pub fn driver_spawn_count() -> usize {
+    unsafe { SPAWN_COUNT }
+}
+
+/// Get a spawn descriptor by index.
+pub fn driver_spawn_descriptor(idx: usize) -> Option<DriverDescriptor> {
+    unsafe {
+        if idx >= SPAWN_COUNT { return None; }
+        Some(SPAWN_DESCRIPTORS[idx])
+    }
+}
+
+/// Spawn a driver from its descriptor.
+///
+/// This function:
+/// 1. Registers the driver in the driver table
+/// 2. Configures MMIO regions and IRQ bindings
+/// 3. Grants capability handles to the new task
+///
+/// The actual ELF loading and task creation is done by the caller
+/// (kernel main or supervisor task) since it requires `exec_user`
+/// which is in a different crate.
+///
+/// Returns the driver registry ID, or None on failure.
+pub fn driver_spawn_register(desc: &DriverDescriptor) -> Option<usize> {
+    let name = &desc.name[..desc.name_len as usize];
+
+    // 1. Register in driver table
+    let drv_id = driver_register(name)?;
+
+    // 2. Configure MMIO regions
+    for i in 0..desc.mmio_count as usize {
+        driver_set_mmio(drv_id, desc.mmio[i].base, desc.mmio[i].size);
+    }
+
+    // 3. Configure IRQ bindings
+    for i in 0..desc.irq_count as usize {
+        driver_set_irq(drv_id, desc.irqs[i]);
+    }
+
+    Some(drv_id)
+}
+
+/// Called by the supervisor to handle drivers that need restarting.
+///
+/// Scans the driver table for entries in `Registered` state (after crash
+/// recovery) and returns a list of (driver_id, name) pairs that need
+/// their ELF re-loaded.
+///
+/// Returns the number of drivers needing restart.
+pub fn driver_get_restart_list(out: &mut [(usize, [u8; DRIVER_NAME_LEN])]) -> usize {
+    let table = DRIVERS.lock();
+    let mut count = 0;
+
+    for (i, entry) in table.entries.iter().enumerate() {
+        if entry.state == DriverState::Registered && entry.restart_count > 0 {
+            if count < out.len() {
+                out[count] = (i, entry.name);
+                count += 1;
+            }
+        }
+    }
+
+    count
+}

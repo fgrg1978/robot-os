@@ -138,6 +138,23 @@ const SSTHRESH_INITIAL: u32 = TCP_BUF_SIZE as u32;
 const DUP_ACK_THRESHOLD: u8 = 3;
 
 // ---------------------------------------------------------------------------
+// Out-of-order reassembly (F01)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of out-of-order segments buffered per connection.
+const OOO_MAX_SEGMENTS: usize = 4;
+
+/// Maximum data bytes per out-of-order segment (save memory).
+const OOO_SEGMENT_MAX_LEN: usize = 256;
+
+// ---------------------------------------------------------------------------
+// FIN state machine (F01)
+// ---------------------------------------------------------------------------
+
+/// TIME-WAIT duration in milliseconds (2 × MSL, MSL = 1 second for LAN).
+const TIME_WAIT_MS: u64 = 2_000;
+
+// ---------------------------------------------------------------------------
 // RTT fixed-point scaling
 // ---------------------------------------------------------------------------
 
@@ -195,6 +212,24 @@ struct TcpHdr {
 }
 
 // ---------------------------------------------------------------------------
+// Out-of-order segment buffer
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct OooSegment {
+    seq:   u32,
+    len:   u16,
+    data:  [u8; OOO_SEGMENT_MAX_LEN],
+    valid: bool,
+}
+
+impl OooSegment {
+    const fn empty() -> Self {
+        Self { seq: 0, len: 0, data: [0u8; OOO_SEGMENT_MAX_LEN], valid: false }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TcpConn
 // ---------------------------------------------------------------------------
 
@@ -235,6 +270,14 @@ pub struct TcpConn {
 
     // --- MSS negotiation ---
     remote_mss:       u16,            // MSS advertised by remote peer
+
+    // --- Out-of-order reassembly (F01) ---
+    ooo_buf:          [OooSegment; OOO_MAX_SEGMENTS],
+    ooo_count:        u8,
+
+    // --- FIN state machine (F01) ---
+    fin_seq:          u32,            // sequence number of our FIN
+    time_wait_start:  u64,            // tick when TimeWait began
 }
 
 impl TcpConn {
@@ -271,6 +314,12 @@ impl TcpConn {
             last_ack_recv: 0,
 
             remote_mss:    TCP_DEFAULT_REMOTE_MSS,
+
+            ooo_buf:       [OooSegment::empty(); OOO_MAX_SEGMENTS],
+            ooo_count:     0,
+
+            fin_seq:       0,
+            time_wait_start: 0,
         }
     }
 
@@ -606,18 +655,37 @@ pub fn recv(idx: usize, buf: &mut [u8]) -> i32 {
     n as i32
 }
 
-/// Close a connection.
+/// Close a connection (proper FIN state machine — F01).
+///
+/// Established → send FIN → FinWait1 (active close)
+/// CloseWait  → send FIN → LastAck   (passive close response)
 pub fn close(idx: usize) {
     if idx >= TCP_MAX_CONNS { return; }
-    let (mac, ip, seq, ack_val, dst_ip, src_port, dst_port) = {
+    let (mac, ip, state, seq, ack_val, dst_ip, src_port, dst_port) = {
         let t = TCP.lock();
         let c = &t.conns[idx];
-        (t.our_mac, t.our_ip, c.seq, c.ack, c.remote_ip, c.local_port, c.remote_port)
+        (t.our_mac, t.our_ip, c.state, c.seq, c.ack, c.remote_ip, c.local_port, c.remote_port)
     };
-    send_segment(&mac, &ip, &dst_ip, src_port, dst_port, TCP_FIN | TCP_ACK, seq, ack_val, &[]);
-    let mut t = TCP.lock();
-    t.conns[idx].state   = TcpState::Closed;
-    t.conns[idx].unacked = false;
+    match state {
+        TcpState::Established => {
+            send_segment(&mac, &ip, &dst_ip, src_port, dst_port, TCP_FIN | TCP_ACK, seq, ack_val, &[]);
+            let mut t = TCP.lock();
+            t.conns[idx].fin_seq = seq;
+            t.conns[idx].state = TcpState::FinWait1;
+        }
+        TcpState::CloseWait => {
+            send_segment(&mac, &ip, &dst_ip, src_port, dst_port, TCP_FIN | TCP_ACK, seq, ack_val, &[]);
+            let mut t = TCP.lock();
+            t.conns[idx].fin_seq = seq;
+            t.conns[idx].state = TcpState::LastAck;
+        }
+        _ => {
+            // For other states, force close
+            let mut t = TCP.lock();
+            t.conns[idx].state   = TcpState::Closed;
+            t.conns[idx].unacked = false;
+        }
+    }
 }
 
 /// Accept an established TCP connection on `local_port`.
@@ -687,8 +755,8 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
             }
             TcpState::Established => {
                 // --- Sequence number validation ---
+                let expected_ack = { TCP.lock().conns[idx].ack };
                 if !payload.is_empty() {
-                    let expected_ack = { TCP.lock().conns[idx].ack };
                     if !seq_in_window(seq, expected_ack, TCP_WINDOW_SIZE as u32) {
                         // Out-of-window segment — drop silently
                         return;
@@ -770,29 +838,115 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                     }
                 }
 
-                // --- Payload processing ---
+                // --- Payload processing with OOO reassembly (F01) ---
                 if !payload.is_empty() {
-                    let mut t = TCP.lock();
-                    let c = &mut t.conns[idx];
-                    for &b in payload {
-                        let next = (c.rx_tail + 1) & TCP_BUF_MASK;
-                        if next != c.rx_head {
-                            c.rx_buf[c.rx_tail] = b;
-                            c.rx_tail = next;
+                    if seq == expected_ack {
+                        // In-order segment — write to rx_buf directly
+                        let mut t = TCP.lock();
+                        let c = &mut t.conns[idx];
+                        for &b in payload {
+                            let next = (c.rx_tail + 1) & TCP_BUF_MASK;
+                            if next != c.rx_head {
+                                c.rx_buf[c.rx_tail] = b;
+                                c.rx_tail = next;
+                            }
                         }
+                        c.ack = seq.wrapping_add(payload.len() as u32);
+                        c.last_activity = now;
+
+                        // Flush any OOO segments that are now contiguous
+                        flush_ooo_segments(c);
+
+                        // Send ACK with actual free window (flow control — F01)
+                        let free = rx_free_space(c);
+                        let (seq_n, ack_n) = (c.seq, c.ack);
+                        drop(t);
+                        send_segment_with_window(&mac, &ip, src_ip, dst_port, src_port,
+                                                 TCP_ACK, seq_n, ack_n, &[], free as u16);
+                    } else if seq.wrapping_sub(expected_ack) < TCP_WINDOW_SIZE as u32 {
+                        // Out-of-order but within window — buffer it (F01)
+                        let mut t = TCP.lock();
+                        let c = &mut t.conns[idx];
+                        store_ooo_segment(c, seq, payload);
+                        c.last_activity = now;
+                        // Send duplicate ACK (signals missing data to sender)
+                        let (seq_n, ack_n) = (c.seq, c.ack);
+                        drop(t);
+                        send_segment(&mac, &ip, src_ip, dst_port, src_port,
+                                     TCP_ACK, seq_n, ack_n, &[]);
                     }
-                    c.ack = seq.wrapping_add(payload.len() as u32);
-                    c.last_activity = now;
-                    let (seq_n, ack_n) = (c.seq, c.ack);
-                    drop(t);
-                    send_segment(&mac, &ip, src_ip, dst_port, src_port, TCP_ACK, seq_n, ack_n, &[]);
+                    // else: outside window, already filtered above
                 }
 
                 // --- FIN handling ---
                 if flags & TCP_FIN != 0 {
                     let mut t = TCP.lock();
-                    t.conns[idx].state = TcpState::CloseWait;
+                    let c = &mut t.conns[idx];
+                    c.ack = c.ack.wrapping_add(1); // FIN consumes one sequence number
+                    c.state = TcpState::CloseWait;
+                    c.last_activity = now;
+                    let (seq_n, ack_n) = (c.seq, c.ack);
+                    drop(t);
+                    // ACK the FIN
+                    send_segment(&mac, &ip, src_ip, dst_port, src_port,
+                                 TCP_ACK, seq_n, ack_n, &[]);
                 }
+            }
+            // --- FIN state machine states (F01) ---
+            TcpState::FinWait1 => {
+                if flags & TCP_ACK != 0 {
+                    let mut t = TCP.lock();
+                    let c = &mut t.conns[idx];
+                    // Our FIN has been ACKed
+                    if ack_num == c.fin_seq.wrapping_add(1) {
+                        if flags & TCP_FIN != 0 {
+                            // Simultaneous close: FIN+ACK → TimeWait
+                            c.ack = c.ack.wrapping_add(1);
+                            c.state = TcpState::TimeWait;
+                            c.time_wait_start = now;
+                            let (seq_n, ack_n) = (c.seq, c.ack);
+                            drop(t);
+                            send_segment(&mac, &ip, src_ip, dst_port, src_port,
+                                         TCP_ACK, seq_n, ack_n, &[]);
+                        } else {
+                            c.state = TcpState::FinWait2;
+                        }
+                    }
+                } else if flags & TCP_FIN != 0 {
+                    // Peer FIN before our FIN is ACKed → simultaneous close
+                    let mut t = TCP.lock();
+                    let c = &mut t.conns[idx];
+                    c.ack = c.ack.wrapping_add(1);
+                    c.state = TcpState::TimeWait;
+                    c.time_wait_start = now;
+                    let (seq_n, ack_n) = (c.seq, c.ack);
+                    drop(t);
+                    send_segment(&mac, &ip, src_ip, dst_port, src_port,
+                                 TCP_ACK, seq_n, ack_n, &[]);
+                }
+            }
+            TcpState::FinWait2 => {
+                if flags & TCP_FIN != 0 {
+                    let mut t = TCP.lock();
+                    let c = &mut t.conns[idx];
+                    c.ack = c.ack.wrapping_add(1);
+                    c.state = TcpState::TimeWait;
+                    c.time_wait_start = now;
+                    let (seq_n, ack_n) = (c.seq, c.ack);
+                    drop(t);
+                    send_segment(&mac, &ip, src_ip, dst_port, src_port,
+                                 TCP_ACK, seq_n, ack_n, &[]);
+                }
+            }
+            TcpState::LastAck => {
+                if flags & TCP_ACK != 0 {
+                    let mut t = TCP.lock();
+                    t.conns[idx].state = TcpState::Closed;
+                    t.conns[idx].unacked = false;
+                }
+            }
+            TcpState::TimeWait => {
+                // Ignore packets in TimeWait; timer in tcp_tick() will close
             }
             _ => {}
         }
@@ -833,6 +987,121 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OOO reassembly helpers (F01)
+// ---------------------------------------------------------------------------
+
+/// Store an out-of-order segment in the connection's OOO buffer.
+fn store_ooo_segment(c: &mut TcpConn, seg_seq: u32, data: &[u8]) {
+    let copy_len = data.len().min(OOO_SEGMENT_MAX_LEN);
+    if copy_len == 0 { return; }
+
+    // Check if we already have this segment
+    for i in 0..OOO_MAX_SEGMENTS {
+        if c.ooo_buf[i].valid && c.ooo_buf[i].seq == seg_seq {
+            return; // duplicate
+        }
+    }
+
+    // Find a free slot (or evict the highest seq — keeps lower seqs which are more useful)
+    let mut slot = None;
+    for i in 0..OOO_MAX_SEGMENTS {
+        if !c.ooo_buf[i].valid {
+            slot = Some(i);
+            break;
+        }
+    }
+    if slot.is_none() && (c.ooo_count as usize) >= OOO_MAX_SEGMENTS {
+        // Evict the entry with the highest sequence number
+        let mut max_seq = 0u32;
+        let mut max_idx = 0;
+        for i in 0..OOO_MAX_SEGMENTS {
+            if c.ooo_buf[i].valid && c.ooo_buf[i].seq.wrapping_sub(c.ack) > max_seq.wrapping_sub(c.ack) {
+                max_seq = c.ooo_buf[i].seq;
+                max_idx = i;
+            }
+        }
+        slot = Some(max_idx);
+        c.ooo_count = c.ooo_count.saturating_sub(1);
+    }
+
+    if let Some(s) = slot {
+        c.ooo_buf[s].seq = seg_seq;
+        c.ooo_buf[s].len = copy_len as u16;
+        c.ooo_buf[s].data[..copy_len].copy_from_slice(&data[..copy_len]);
+        c.ooo_buf[s].valid = true;
+        c.ooo_count = c.ooo_count.saturating_add(1);
+    }
+}
+
+/// Flush OOO segments that are now contiguous with conn.ack.
+fn flush_ooo_segments(c: &mut TcpConn) {
+    // Repeat until no more contiguous segments found
+    let mut flushed = true;
+    while flushed {
+        flushed = false;
+        for i in 0..OOO_MAX_SEGMENTS {
+            if !c.ooo_buf[i].valid { continue; }
+            if c.ooo_buf[i].seq == c.ack {
+                // This segment is now contiguous — write to rx_buf
+                let len = c.ooo_buf[i].len as usize;
+                for j in 0..len {
+                    let next = (c.rx_tail + 1) & TCP_BUF_MASK;
+                    if next != c.rx_head {
+                        c.rx_buf[c.rx_tail] = c.ooo_buf[i].data[j];
+                        c.rx_tail = next;
+                    }
+                }
+                c.ack = c.ack.wrapping_add(len as u32);
+                c.ooo_buf[i].valid = false;
+                c.ooo_count = c.ooo_count.saturating_sub(1);
+                flushed = true;
+                break; // restart scan since ack changed
+            }
+        }
+    }
+}
+
+/// Calculate free space in the receive buffer (for flow control — F01).
+fn rx_free_space(c: &TcpConn) -> usize {
+    let used = c.rx_available();
+    TCP_BUF_SIZE.saturating_sub(used).saturating_sub(1) // -1 to avoid full==empty ambiguity
+}
+
+// ---------------------------------------------------------------------------
+// send_segment with custom window (F01 flow control)
+// ---------------------------------------------------------------------------
+
+/// Like send_segment but with a custom advertised window (for flow control).
+fn send_segment_with_window(
+    our_mac: &[u8; 6], our_ip: &[u8; 4], dst_ip: &[u8; 4],
+    src_port: u16, dst_port: u16, flags: u8,
+    seq: u32, ack: u32, data: &[u8], window: u16,
+) {
+    let tcp_len = TCP_HDR_MIN + data.len();
+    if tcp_len > TCP_SEGMENT_BUF_SIZE { return; }
+
+    let mut buf = [0u8; TCP_SEGMENT_BUF_SIZE];
+    let hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut TcpHdr) };
+    hdr.src_port = src_port.to_be_bytes();
+    hdr.dst_port = dst_port.to_be_bytes();
+    hdr.seq      = seq.to_be_bytes();
+    hdr.ack      = ack.to_be_bytes();
+    hdr.data_off = TCP_DATA_OFF_MIN;
+    hdr.flags    = flags;
+    hdr.window   = window.to_be_bytes(); // custom window (flow control)
+    hdr.checksum = [0, 0];
+    hdr.urgent   = [0, 0];
+    buf[TCP_HDR_MIN..tcp_len].copy_from_slice(data);
+
+    let pseudo = ip::pseudo_checksum(our_ip, dst_ip, ip::IP_PROTO_TCP, tcp_len as u16);
+    let cs = tcp_checksum(pseudo, &buf[..tcp_len]);
+    buf[TCP_CHECKSUM_OFFSET]    = (cs >> 8) as u8;
+    buf[TCP_CHECKSUM_OFFSET_HI] = (cs & 0xff) as u8;
+
+    ip::send(our_mac, our_ip, dst_ip, ip::IP_PROTO_TCP, &buf[..tcp_len]);
 }
 
 /// Periodic tick — call from timer interrupt to drive retransmissions and keep-alive.
@@ -891,6 +1160,18 @@ pub fn tcp_tick() {
             // Congestion response: set ssthresh, reset cwnd
             c.ssthresh = (c.cwnd / 2).max(CWND_INITIAL);
             c.cwnd     = TCP_MSS as u32; // collapse to 1 segment
+            continue;
+        }
+
+        // --- TIME-WAIT timer (F01) ---
+        if state == TcpState::TimeWait {
+            let tw_start = { TCP.lock().conns[idx].time_wait_start };
+            let tw_duration = TIME_WAIT_MS * TICKS_PER_MS;
+            if now.saturating_sub(tw_start) >= tw_duration {
+                let mut t = TCP.lock();
+                t.conns[idx].state = TcpState::Closed;
+                t.conns[idx].unacked = false;
+            }
             continue;
         }
 

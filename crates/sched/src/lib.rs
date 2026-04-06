@@ -43,20 +43,22 @@ pub use driver::{
     driver_start, driver_heartbeat, driver_heartbeat_with_time,
     driver_on_crash, driver_on_crash_with_time, driver_check_health,
     driver_info, driver_count,
-    DriverState, DriverEntry, MmioRegion,
+    driver_add_spawn_descriptor, driver_spawn_count, driver_spawn_descriptor,
+    driver_spawn_register, driver_get_restart_list,
+    DriverState, DriverEntry, DriverDescriptor, MmioRegion,
 };
 
 pub use wait::{
     task_block,
     wake_by_irq, wake_by_channel, wake_by_ring, wake_by_port,
-    wake_expired_timers,
+    wake_expired_timers, wake_by_rpc,
 };
 
 #[cfg(target_pointer_width = "64")]
 pub use process::{
     exec_user, take_pending_exec, sret_to_user, ExecContext,
     copy_from_user, copy_to_user, copy_cstr_from_user, sys_brk_impl,
-    set_ecall_context,
+    set_ecall_context, mmio_map_user,
 };
 
 // ── RV32 stubs for process functions ────────────────────────────────────────

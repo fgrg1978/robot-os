@@ -2011,11 +2011,9 @@ fn cmd_can(args: &[&[u8]; MAX_ARGS], argc: usize) {
     if sub == b"info" {
         robot_os_drivers::can::can_info();
     } else if sub == b"send" {
-        let frame = robot_os_drivers::can::CanFrame {
-            id: 0x123,
-            dlc: 4,
-            data: [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0],
-        };
+        let frame = robot_os_drivers::can::CanFrame::standard(
+            0x123, &[0xDE, 0xAD, 0xBE, 0xEF],
+        );
         let rc = robot_os_drivers::can::can_send(&frame);
         robot_os_drivers::kprintln!("[CAN] send(id=0x123, 4B) = {}", rc);
     } else if sub == b"recv" {

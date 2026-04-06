@@ -7,6 +7,9 @@ pub mod io_ring;
 pub mod port;
 pub mod handle;
 pub mod trace;
+pub mod irq_bind;
+pub mod shm;
+pub mod rpc;
 
 pub use channel::{
     channel_create, channel_send, channel_recv, channel_destroy, channel_info,
@@ -30,12 +33,14 @@ pub use signal::{
 };
 
 pub use io_ring::{
-    IoRing, IoRingState, SqEntry, CqEntry,
+    IoRing, IoRingState, IoRingOps, SqEntry, CqEntry,
     io_ring_create, io_ring_destroy, io_ring_pending,
-    MAX_IO_RINGS, RING_SQ_SIZE, RING_CQ_SIZE,
+    io_ring_submit, io_ring_register_ops,
+    MAX_IO_RINGS, RING_SQ_SIZE, RING_CQ_SIZE, RING_DATA_BUF_SIZE,
     OP_NOP, OP_READ_SENSOR, OP_WRITE_GPIO, OP_READ_GPIO,
     OP_I2C_READ, OP_I2C_WRITE, OP_PWM_SET, OP_MOTOR_SPEED,
     OP_NET_SEND, OP_NET_RECV, OP_CAMERA_CAPTURE, OP_IRQ_WAIT,
+    IO_OK, IO_ERR_INVALID_OP, IO_ERR_INVALID_PARAM, IO_ERR_NO_OPS,
 };
 
 pub use port::{
@@ -59,4 +64,22 @@ pub use trace::{
     TRACE_IRQ, TRACE_SCHED, TRACE_SYSCALL, TRACE_DRIVER,
     TRACE_MM, TRACE_FAULT, TRACE_IPC, TRACE_USER,
     TRACE_BUF_SIZE,
+};
+
+pub use irq_bind::{
+    IrqBinding, IrqTarget,
+    irq_bind, irq_unbind_all, irq_dispatch,
+    MAX_IRQ_BINDINGS,
+};
+
+pub use shm::{
+    ShmRegion, ShmPerms,
+    shm_create, shm_acquire, shm_release, shm_info, shm_page_phys,
+    MAX_SHM_REGIONS, MAX_SHM_PAGES,
+};
+
+pub use rpc::{
+    RpcPending,
+    rpc_register, rpc_reply, rpc_get_reply, rpc_cancel_all,
+    MAX_PENDING_RPCS, RPC_MSG_MAX_LEN,
 };

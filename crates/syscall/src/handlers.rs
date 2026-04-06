@@ -34,7 +34,7 @@ use robot_os_net::{
 
 /// Check if the current task is allowed to access a hardware resource.
 /// Kernel tasks always pass. Userspace tasks need a matching handle.
-fn cap_check(kind: robot_os_ipc::HandleKind, need_write: bool) -> bool {
+pub fn cap_check(kind: robot_os_ipc::HandleKind, need_write: bool) -> bool {
     // Kernel tasks have full access (no handle needed)
     if robot_os_sched::current_user_pt() == 0 {
         return true;

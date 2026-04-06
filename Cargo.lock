@@ -73,6 +73,10 @@ name = "robot_os_config"
 version = "0.1.0"
 
 [[package]]
+name = "robot_os_crypto"
+version = "0.1.0"
+
+[[package]]
 name = "robot_os_drivers"
 version = "0.1.0"
 dependencies = [

@@ -35,6 +35,7 @@ members = [
     "crates/libsys",
     "crates/ota",
     "crates/pubsub",
+    "crates/crypto",
 ]
 
 [workspace.dependencies]

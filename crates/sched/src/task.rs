@@ -135,6 +135,8 @@ pub enum WaitReason {
     Port(u32),
     /// Waiting on a WaitQueue/Completion (woken by TID).
     WaitQueue,
+    /// Waiting for an RPC reply (woken by IPC_REPLY with matching caller TID).
+    Rpc(u32),
 }
 
 // ---- Deadline scheduling params (AQ7) ----

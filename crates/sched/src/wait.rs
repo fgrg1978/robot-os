@@ -42,6 +42,11 @@ pub fn wake_expired_timers(now_ticks: u64) {
     wake_matching(|r| matches!(r, WaitReason::Timer(deadline) if now_ticks >= *deadline));
 }
 
+/// Wake a task blocked on an RPC reply (matched by caller TID).
+pub fn wake_by_rpc(caller_tid: u32) {
+    wake_matching(|r| matches!(r, WaitReason::Rpc(tid) if *tid == caller_tid));
+}
+
 /// Internal: scan all tasks and wake those matching the predicate.
 fn wake_matching(pred: impl Fn(&WaitReason) -> bool) {
     for i in 0..MAX_TASKS {

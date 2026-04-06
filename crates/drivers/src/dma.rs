@@ -264,3 +264,93 @@ mod pdma {
 
 #[cfg(feature = "vf2")]
 pub use pdma::*;
+
+// ---------------------------------------------------------------------------
+// High-level DMA helpers (F02 wiring)
+// ---------------------------------------------------------------------------
+
+/// Reserved DMA channel for network packet copy.
+const DMA_CH_NET: usize = 0;
+
+/// Reserved DMA channel for camera frame copy.
+const DMA_CH_CAMERA: usize = 1;
+
+/// Reserved DMA channel for LiDAR scan copy.
+const DMA_CH_LIDAR: usize = 2;
+
+/// One-shot DMA memory copy. Reserves a channel, transfers, releases.
+///
+/// Returns 0 on success, -1 on failure.
+/// Falls back to CPU memcpy if DMA is unavailable.
+///
+/// # Safety
+/// `src` and `dst` must be valid, non-overlapping memory of `len` bytes.
+pub fn dma_memcpy(src: usize, dst: usize, len: usize) -> i32 {
+    /// Minimum transfer size to justify DMA overhead (below this, CPU is faster).
+    const DMA_MIN_TRANSFER_SIZE: usize = 256;
+
+    if len < DMA_MIN_TRANSFER_SIZE || len == 0 {
+        // Small transfer: CPU copy is faster than DMA setup overhead
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len); }
+        return 0;
+    }
+
+    // Try to use DMA
+    if dma_request(DMA_CH_NET) {
+        let result = dma_transfer(DMA_CH_NET, src, dst, len);
+        dma_release(DMA_CH_NET);
+        result
+    } else if dma_request(DMA_CH_CAMERA) {
+        // Fallback to alternate channel
+        let result = dma_transfer(DMA_CH_CAMERA, src, dst, len);
+        dma_release(DMA_CH_CAMERA);
+        result
+    } else {
+        // All channels busy — CPU fallback
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len); }
+        0
+    }
+}
+
+/// DMA copy for network packets (uses reserved NET channel).
+///
+/// # Safety
+/// See `dma_memcpy`.
+pub fn dma_net_copy(src: usize, dst: usize, len: usize) -> i32 {
+    if !dma_request(DMA_CH_NET) {
+        // Busy — fall back to CPU
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len); }
+        return 0;
+    }
+    let result = dma_transfer(DMA_CH_NET, src, dst, len);
+    dma_release(DMA_CH_NET);
+    result
+}
+
+/// DMA copy for camera frames (uses reserved CAMERA channel).
+///
+/// # Safety
+/// See `dma_memcpy`.
+pub fn dma_camera_copy(src: usize, dst: usize, len: usize) -> i32 {
+    if !dma_request(DMA_CH_CAMERA) {
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len); }
+        return 0;
+    }
+    let result = dma_transfer(DMA_CH_CAMERA, src, dst, len);
+    dma_release(DMA_CH_CAMERA);
+    result
+}
+
+/// DMA copy for LiDAR scans (uses reserved LIDAR channel).
+///
+/// # Safety
+/// See `dma_memcpy`.
+pub fn dma_lidar_copy(src: usize, dst: usize, len: usize) -> i32 {
+    if !dma_request(DMA_CH_LIDAR) {
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len); }
+        return 0;
+    }
+    let result = dma_transfer(DMA_CH_LIDAR, src, dst, len);
+    dma_release(DMA_CH_LIDAR);
+    result
+}

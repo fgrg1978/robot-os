@@ -445,6 +445,167 @@ fn math_atan2_cdeg(y: i32, x: i32) -> i32 {
     else { -angle }
 }
 
+// ── Scan Matching / SLAM (F12) ──────────────────────────────────────────────
+
+/// Maximum number of points in a 2D LiDAR scan.
+pub const SCAN_MAX_POINTS: usize = 360;
+
+/// Maximum ICP iterations.
+const ICP_MAX_ITER: usize = 20;
+
+/// ICP convergence threshold in mm² (stop when mean error below this).
+const ICP_CONVERGENCE_MM2: i64 = 25; // 5mm
+
+/// A 2D point in millimeters (relative to robot).
+#[derive(Clone, Copy, Default)]
+pub struct Point2D {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// A 2D LiDAR scan (set of points).
+pub struct Scan2D {
+    pub points: [Point2D; SCAN_MAX_POINTS],
+    pub count: u16,
+}
+
+impl Scan2D {
+    pub const fn new() -> Self {
+        Self {
+            points: [Point2D { x: 0, y: 0 }; SCAN_MAX_POINTS],
+            count: 0,
+        }
+    }
+}
+
+/// Result of scan matching: estimated translation (dx, dy) in mm and rotation in centi-degrees.
+#[derive(Clone, Copy, Default)]
+pub struct ScanMatchResult {
+    pub dx_mm: i32,
+    pub dy_mm: i32,
+    pub dtheta_cdeg: i32,
+    pub converged: bool,
+    pub mean_error_mm2: i64,
+}
+
+/// Simple ICP (Iterative Closest Point) scan matching.
+///
+/// Finds the rigid transform (translation only, no rotation for simplicity)
+/// that best aligns `current` scan to `reference` scan.
+/// Returns the estimated displacement.
+pub fn scan_match_icp(reference: &Scan2D, current: &Scan2D) -> ScanMatchResult {
+    let ref_count = reference.count as usize;
+    let cur_count = current.count as usize;
+    if ref_count < 2 || cur_count < 2 {
+        return ScanMatchResult::default();
+    }
+
+    let mut tx: i32 = 0;
+    let mut ty: i32 = 0;
+    let mut mean_err: i64 = i64::MAX;
+
+    for _iter in 0..ICP_MAX_ITER {
+        // For each current point (shifted by tx,ty), find closest reference point
+        let mut sum_dx: i64 = 0;
+        let mut sum_dy: i64 = 0;
+        let mut sum_err: i64 = 0;
+        let mut matches: u32 = 0;
+
+        for i in 0..cur_count.min(SCAN_MAX_POINTS) {
+            let cx = current.points[i].x + tx;
+            let cy = current.points[i].y + ty;
+
+            // Find nearest reference point (brute force, bounded by scan size)
+            let mut best_dist = i64::MAX;
+            let mut best_rx: i32 = 0;
+            let mut best_ry: i32 = 0;
+
+            for j in 0..ref_count.min(SCAN_MAX_POINTS) {
+                let dx = (reference.points[j].x - cx) as i64;
+                let dy = (reference.points[j].y - cy) as i64;
+                let dist = dx * dx + dy * dy;
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_rx = reference.points[j].x;
+                    best_ry = reference.points[j].y;
+                }
+            }
+
+            sum_dx += (best_rx - cx) as i64;
+            sum_dy += (best_ry - cy) as i64;
+            sum_err += best_dist;
+            matches += 1;
+        }
+
+        if matches == 0 { break; }
+
+        // Update transform
+        tx += (sum_dx / matches as i64) as i32;
+        ty += (sum_dy / matches as i64) as i32;
+        mean_err = sum_err / matches as i64;
+
+        if mean_err < ICP_CONVERGENCE_MM2 {
+            return ScanMatchResult {
+                dx_mm: tx, dy_mm: ty,
+                dtheta_cdeg: 0, // rotation not estimated in this simplified version
+                converged: true,
+                mean_error_mm2: mean_err,
+            };
+        }
+    }
+
+    ScanMatchResult {
+        dx_mm: tx, dy_mm: ty,
+        dtheta_cdeg: 0,
+        converged: mean_err < ICP_CONVERGENCE_MM2 * 4, // relaxed threshold
+        mean_error_mm2: mean_err,
+    }
+}
+
+/// Update occupancy grid from a LiDAR scan (probabilistic, log-odds).
+///
+/// `robot_x`, `robot_y`: robot position in grid coordinates.
+/// `scan`: current LiDAR scan (points relative to robot, in mm).
+pub fn grid_update_from_scan(
+    grid: &mut OccupancyGrid,
+    robot_x: usize, robot_y: usize,
+    scan: &Scan2D,
+) {
+    /// Log-odds increment for occupied cells.
+    const LOG_ODDS_OCC: i16 = 20;
+    /// Log-odds decrement for free cells (ray trace).
+    const LOG_ODDS_FREE: i16 = -5;
+
+    for i in 0..(scan.count as usize).min(SCAN_MAX_POINTS) {
+        let p = &scan.points[i];
+        let gx = robot_x as i32 + p.x / CELL_SIZE_MM as i32;
+        let gy = robot_y as i32 + p.y / CELL_SIZE_MM as i32;
+
+        // Mark endpoint as occupied
+        if gx >= 0 && (gx as usize) < GRID_SIZE && gy >= 0 && (gy as usize) < GRID_SIZE {
+            let cell = grid.get(gx as usize, gy as usize);
+            let new_val = (cell as i16 + LOG_ODDS_OCC).clamp(0, 255) as u8;
+            grid.set(gx as usize, gy as usize, new_val);
+        }
+
+        // Ray trace: mark free cells along the ray from robot to endpoint
+        // (simplified: step along the ray in CELL_SIZE increments)
+        let dist_cells = isqrt(((p.x / CELL_SIZE_MM as i32).pow(2)
+            + (p.y / CELL_SIZE_MM as i32).pow(2)) as u64) as i32;
+        if dist_cells > 1 {
+            for step in 1..dist_cells {
+                let fx = robot_x as i32 + (p.x * step) / (dist_cells * CELL_SIZE_MM as i32);
+                let fy = robot_y as i32 + (p.y * step) / (dist_cells * CELL_SIZE_MM as i32);
+                if fx >= 0 && (fx as usize) < GRID_SIZE && fy >= 0 && (fy as usize) < GRID_SIZE {
+                    let cell = grid.get(fx as usize, fy as usize);
+                    let new_val = (cell as i16 + LOG_ODDS_FREE).clamp(0, 255) as u8;
+                    grid.set(fx as usize, fy as usize, new_val);
+                }
+            }
+        }
+    }
+}
+
 // ── Info ─────────────────────────────────────────────────────────────────────
 
 /// Print navigation status.
@@ -470,4 +631,186 @@ pub fn nav_info() {
 
     let wp_idx = MISSION_CURRENT.load(Ordering::Relaxed);
     robot_os_drivers::kprintln!("[NAV] Mission: waypoint {}", wp_idx);
+}
+
+// ── A* Path Planning (F13) ──────────────────────────────────────────────────
+
+/// Maximum path length (waypoints in the found path).
+pub const ASTAR_MAX_PATH: usize = 128;
+
+/// Maximum nodes A* will explore before giving up.
+const ASTAR_MAX_OPEN: usize = 512;
+
+/// Cost multiplier for heuristic (×10 for integer math).
+const COST_STRAIGHT: u16 = 10;
+const COST_DIAGONAL: u16 = 14; // ~sqrt(2) × 10
+
+/// Occupancy threshold: cells above this value are considered obstacles.
+const OBSTACLE_THRESHOLD: u8 = 127;
+
+/// A* node in the open/closed set.
+#[derive(Clone, Copy)]
+struct AstarNode {
+    x: u8,
+    y: u8,
+    g: u16,     // cost from start
+    f: u16,     // g + heuristic
+    parent: u16, // index in nodes array (u16::MAX = no parent)
+    open: bool,
+    closed: bool,
+}
+
+impl AstarNode {
+    const fn empty() -> Self {
+        Self { x: 0, y: 0, g: u16::MAX, f: u16::MAX, parent: u16::MAX, open: false, closed: false }
+    }
+}
+
+/// Result of A* path search.
+pub struct AstarPath {
+    /// Grid coordinates of the path (start to goal).
+    pub points: [(u8, u8); ASTAR_MAX_PATH],
+    /// Number of valid points in the path.
+    pub len: usize,
+}
+
+impl AstarPath {
+    const fn empty() -> Self {
+        Self { points: [(0, 0); ASTAR_MAX_PATH], len: 0 }
+    }
+}
+
+/// Find a path from (sx, sy) to (gx, gy) on the occupancy grid using A*.
+///
+/// Returns a path (list of grid coordinates) or None if no path exists.
+/// All coordinates are grid cells (0..GRID_SIZE).
+pub fn astar_plan(grid: &OccupancyGrid, sx: usize, sy: usize, gx: usize, gy: usize) -> Option<AstarPath> {
+    if sx >= GRID_SIZE || sy >= GRID_SIZE || gx >= GRID_SIZE || gy >= GRID_SIZE {
+        return None;
+    }
+    if grid.get(gx, gy) > OBSTACLE_THRESHOLD {
+        return None; // goal is inside obstacle
+    }
+
+    // Node storage: flat array indexed by (y * GRID_SIZE + x), but we only
+    // track nodes that have been visited. Use a compact open list.
+    let mut nodes = [AstarNode::empty(); ASTAR_MAX_OPEN];
+    let mut node_count: usize = 0;
+
+    // Grid-indexed lookup: which node index corresponds to each cell.
+    // Using u16::MAX = unvisited. This uses 20KB for 100×100 grid.
+    let mut cell_node: [u16; GRID_SIZE * GRID_SIZE] = [u16::MAX; GRID_SIZE * GRID_SIZE];
+
+    // Start node
+    let start_h = heuristic(sx, sy, gx, gy);
+    nodes[0] = AstarNode { x: sx as u8, y: sy as u8, g: 0, f: start_h, parent: u16::MAX, open: true, closed: false };
+    cell_node[sy * GRID_SIZE + sx] = 0;
+    node_count = 1;
+
+    // 8-directional neighbors
+    const DIRS: [(i8, i8); 8] = [
+        (0, -1), (1, 0), (0, 1), (-1, 0),    // cardinal
+        (1, -1), (1, 1), (-1, 1), (-1, -1),   // diagonal
+    ];
+
+    loop {
+        // Find open node with lowest f
+        let mut best_idx: usize = usize::MAX;
+        let mut best_f: u16 = u16::MAX;
+        for i in 0..node_count {
+            if nodes[i].open && nodes[i].f < best_f {
+                best_f = nodes[i].f;
+                best_idx = i;
+            }
+        }
+        if best_idx == usize::MAX {
+            return None; // no path found
+        }
+
+        let current = nodes[best_idx];
+        nodes[best_idx].open = false;
+        nodes[best_idx].closed = true;
+
+        // Goal reached?
+        if current.x as usize == gx && current.y as usize == gy {
+            return Some(reconstruct_path(&nodes, best_idx));
+        }
+
+        // Expand neighbors
+        for (di, &(dx, dy)) in DIRS.iter().enumerate() {
+            let nx = current.x as i16 + dx as i16;
+            let ny = current.y as i16 + dy as i16;
+            if nx < 0 || ny < 0 || nx >= GRID_SIZE as i16 || ny >= GRID_SIZE as i16 {
+                continue;
+            }
+            let nx = nx as usize;
+            let ny = ny as usize;
+
+            if grid.get(nx, ny) > OBSTACLE_THRESHOLD {
+                continue; // obstacle
+            }
+
+            let move_cost = if di < 4 { COST_STRAIGHT } else { COST_DIAGONAL };
+            let new_g = current.g.saturating_add(move_cost);
+
+            let cell_idx = ny * GRID_SIZE + nx;
+            let existing = cell_node[cell_idx];
+
+            if existing != u16::MAX {
+                let node = &mut nodes[existing as usize];
+                if node.closed { continue; }
+                if new_g < node.g {
+                    node.g = new_g;
+                    node.f = new_g + heuristic(nx, ny, gx, gy);
+                    node.parent = best_idx as u16;
+                    node.open = true;
+                }
+            } else {
+                // New node
+                if node_count >= ASTAR_MAX_OPEN {
+                    return None; // search space exhausted
+                }
+                let h = heuristic(nx, ny, gx, gy);
+                nodes[node_count] = AstarNode {
+                    x: nx as u8, y: ny as u8,
+                    g: new_g, f: new_g + h,
+                    parent: best_idx as u16,
+                    open: true, closed: false,
+                };
+                cell_node[cell_idx] = node_count as u16;
+                node_count += 1;
+            }
+        }
+    }
+}
+
+/// Manhattan distance heuristic (×COST_STRAIGHT for integer consistency).
+fn heuristic(x1: usize, y1: usize, x2: usize, y2: usize) -> u16 {
+    let dx = if x1 > x2 { x1 - x2 } else { x2 - x1 };
+    let dy = if y1 > y2 { y1 - y2 } else { y2 - y1 };
+    ((dx + dy) as u16) * COST_STRAIGHT
+}
+
+/// Reconstruct path from goal node back to start.
+fn reconstruct_path(nodes: &[AstarNode; ASTAR_MAX_OPEN], goal_idx: usize) -> AstarPath {
+    let mut path = AstarPath::empty();
+
+    // Trace back from goal to start
+    let mut stack = [(0u8, 0u8); ASTAR_MAX_PATH];
+    let mut stack_len = 0;
+    let mut idx = goal_idx;
+
+    while idx != usize::MAX && stack_len < ASTAR_MAX_PATH {
+        let node = &nodes[idx];
+        stack[stack_len] = (node.x, node.y);
+        stack_len += 1;
+        idx = if node.parent == u16::MAX { usize::MAX } else { node.parent as usize };
+    }
+
+    // Reverse into path
+    for i in 0..stack_len {
+        path.points[i] = stack[stack_len - 1 - i];
+    }
+    path.len = stack_len;
+    path
 }
