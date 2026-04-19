@@ -145,3 +145,23 @@ pub fn set_next_tick(hart: u32) {
     let next = now + TIMER_FREQ / hz;
     set_timer(hart, next);
 }
+
+/// M03: Tickless timer — schedule the timer at the earliest useful deadline.
+///
+/// `nearest_deadline` is the earliest pending `WaitReason::Timer(t)` deadline
+/// from the scheduler (pass `robot_os_sched::nearest_timer_deadline()`).
+/// If `None`, falls back to the standard periodic tick.
+///
+/// Programs the hardware timer at `min(nearest_deadline, next_periodic_tick)`
+/// so sleeping tasks wake at exactly the right time while preemption still fires.
+pub fn set_next_tick_smart(hart: u32, nearest_deadline: Option<u64>) {
+    let now  = get_time();
+    let hz   = SCHED_HZ.load(Ordering::Relaxed) as u64;
+    let tick = now + TIMER_FREQ / hz;
+
+    let next = match nearest_deadline {
+        Some(deadline) => deadline.min(tick),
+        None           => tick,
+    };
+    set_timer(hart, next);
+}

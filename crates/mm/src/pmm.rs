@@ -86,14 +86,12 @@ pub fn init(mem_start: usize, mem_size: usize, kernel_end: usize) {
         }
     }
 
-    // Count free pages
-    let mut free = 0usize;
-    for i in 0..total {
-        if !bitmap_test(&pmm.bitmap, i) {
-            free += 1;
-        }
-    }
-    pmm.free_pages = free;
+    // Count free pages via popcount on bitmap words — O(BITMAP_WORDS)
+    // (~128K iter for 4M-page systems via bit ops) vs the previous
+    // O(total) bit-by-bit loop (~16M iter). 100× faster on init.
+    let used_bits: u32 = pmm.bitmap.iter().map(|w| w.count_ones()).sum();
+    let used = used_bits as usize;
+    pmm.free_pages = total.saturating_sub(used);
     pmm.initialized = true;
 }
 

@@ -1,0 +1,18 @@
+[package]
+name = "robot_os_regression_tests"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side regression tests for kernel bugs found and fixed. Excluded from workspace."
+
+# Excluded from workspace; runs on the host (Apple Silicon) via:
+#   cd crates/regression-tests && cargo +stable test --target aarch64-apple-darwin
+#
+# Each module here corresponds to a SPECIFIC bug previously fixed. Adding a
+# new test here is the standard procedure when a bug is discovered: it
+# locks the regression so future refactors can't silently reintroduce it.
+
+[dependencies]
+
+[dev-dependencies]
+# TS01 — property-based tests. Generates random inputs to check invariants.
+proptest = "1"

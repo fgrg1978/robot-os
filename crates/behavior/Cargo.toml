@@ -9,3 +9,5 @@ no-ml = []
 [dependencies]
 robot_os_sync    = { workspace = true }
 robot_os_drivers = { workspace = true }
+robot_os_fs      = { workspace = true }
+robot_os_crypto  = { path = "../crypto" }

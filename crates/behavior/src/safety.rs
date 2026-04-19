@@ -111,6 +111,8 @@ pub enum SafetyViolation {
     FallDetected,
     Overheated,
     RemoteEstop,
+    /// Robot has crossed the circular geofence boundary (E03).
+    GeofenceViolation,
 }
 
 impl SafetyResult {
@@ -266,6 +268,12 @@ fn check_wheeled(state: &SensorState) -> SafetyResult {
         }
     }
 
+    // E03: Geofence check (EmergencyStop for wheeled — can't RTL)
+    if let Some(mut r) = check_geofence_from_gps(state) {
+        r.action = SafetyAction::EmergencyStop; // wheeled can't fly back
+        return r;
+    }
+
     SafetyResult::safe()
 }
 
@@ -311,6 +319,9 @@ fn check_drone(state: &SensorState) -> SafetyResult {
             };
         }
     }
+
+    // E03: Geofence check (only when GPS is available)
+    if let Some(r) = check_geofence_from_gps(state) { return r; }
 
     SafetyResult::safe()
 }
@@ -388,4 +399,119 @@ fn isqrt(n: u64) -> u64 {
         y = (x + n / x) / 2;
     }
     x
+}
+
+// ── E03: Circular Geofence (GPS boundary) ────────────────────────────────────
+//
+// A single circular geofence centered on a GPS coordinate.  The robot must
+// stay within `radius_m` metres of the centre.  If it exits the fence, the
+// safety system triggers `ReturnToLaunch` (drone) or `EmergencyStop` (wheeled).
+//
+// The fence is disabled when `radius_m == 0`.
+//
+// Distance is approximated using the equirectangular projection:
+//
+//   Δlat_m  = (lat - center_lat) * LAT_DEG_TO_M
+//   Δlon_m  = (lon - center_lon) * LON_DEG_TO_M * cos(center_lat)
+//   dist_m  = sqrt(Δlat_m² + Δlon_m²)
+//
+// The trig-free version replaces cos(lat) with a precomputed integer factor.
+// Valid for fences ≤ 50 km from equator; sufficient for robotics use.
+
+use robot_os_sync::SpinLock;
+
+/// Geofence configuration stored in a SpinLock for atomic updates from brain.
+struct GeofenceConfig {
+    /// Centre latitude (micro-degrees × 10⁶, i.e. degrees * 1_000_000).
+    center_lat_udeg: i32,
+    /// Centre longitude (micro-degrees).
+    center_lon_udeg: i32,
+    /// Radius in metres (0 = disabled).
+    radius_m: u32,
+}
+
+impl GeofenceConfig {
+    const fn disabled() -> Self {
+        GeofenceConfig { center_lat_udeg: 0, center_lon_udeg: 0, radius_m: 0 }
+    }
+}
+
+static GEOFENCE: SpinLock<GeofenceConfig> = SpinLock::new(GeofenceConfig::disabled());
+
+/// Configure the circular geofence.
+///
+/// `center_lat_udeg` — latitude in micro-degrees (degrees × 1_000_000).
+/// `center_lon_udeg` — longitude in micro-degrees.
+/// `radius_m`        — radius in metres (0 = disable fence).
+pub fn geofence_set(center_lat_udeg: i32, center_lon_udeg: i32, radius_m: u32) {
+    let mut g = GEOFENCE.lock();
+    g.center_lat_udeg = center_lat_udeg;
+    g.center_lon_udeg = center_lon_udeg;
+    g.radius_m        = radius_m;
+}
+
+/// Disable the geofence.
+pub fn geofence_disable() {
+    GEOFENCE.lock().radius_m = 0;
+}
+
+/// Returns true if GPS position is outside the configured geofence.
+/// Always returns false if the fence is disabled (radius_m == 0).
+///
+/// `lat_udeg`, `lon_udeg` — current position in micro-degrees.
+pub fn geofence_check(lat_udeg: i32, lon_udeg: i32) -> bool {
+    /// Metres per degree of latitude (constant, ~111 km/deg).
+    const LAT_M_PER_DEG_UDEG: i64 = 111_000; // metres per 1_000_000 µdeg
+
+    let g = GEOFENCE.lock();
+    if g.radius_m == 0 { return false; }
+
+    // Δlat and Δlon in micro-degrees
+    let dlat_udeg = (lat_udeg - g.center_lat_udeg) as i64;
+    let dlon_udeg = (lon_udeg - g.center_lon_udeg) as i64;
+
+    // Convert to metres (integer, scaled by 1000 for precision)
+    // Δlat_m * 1000 = dlat_udeg * LAT_M_PER_DEG_UDEG / 1_000_000 * 1000
+    //               = dlat_udeg * LAT_M_PER_DEG_UDEG / 1_000
+    let dlat_mm = dlat_udeg * LAT_M_PER_DEG_UDEG / 1_000_000;
+
+    // Longitude scale: cos(lat) approximation using centre latitude.
+    // cos(lat) ≈ 1 - (lat_deg² / 2) for |lat| < 45°; we use integer 1000ths.
+    // More accurately: we precompute cos_factor = cos(center_lat) * 1000
+    // Using the identity: cos(x) ≈ (1 - 2sin²(x/2)), small-angle: ≈ 1 - x²/2
+    // For a simpler bound, use cos(45°) ≈ 707/1000 as minimum (worst case).
+    let lat_deg_abs = (g.center_lat_udeg.unsigned_abs() / 1_000_000) as i64;
+    // cos_factor/1000 = (1 - lat_deg² / 20000) clamped to [500, 1000]
+    let cos_factor: i64 = (1000 - (lat_deg_abs * lat_deg_abs / 20000)).clamp(500, 1000);
+
+    let dlon_mm = dlon_udeg * LAT_M_PER_DEG_UDEG * cos_factor / (1_000_000 * 1000);
+
+    // Squared distance in m² (no sqrt needed — compare to radius²)
+    let dist_sq_m2 = dlat_mm * dlat_mm + dlon_mm * dlon_mm;
+    let radius_m2  = (g.radius_m as i64) * (g.radius_m as i64);
+
+    dist_sq_m2 > radius_m2
+}
+
+/// Minimum GPS fix quality required for geofence enforcement.
+const GEOFENCE_MIN_FIX: u8 = 2;
+/// Minimum satellites required for geofence enforcement.
+const GEOFENCE_MIN_SATELLITES: u8 = 3;
+
+/// Check geofence against GPS data in the current sensor snapshot.
+/// Returns a SafetyResult if violated, else None.
+fn check_geofence_from_gps(state: &SensorState) -> Option<SafetyResult> {
+    let valid = state.gps_fix >= GEOFENCE_MIN_FIX
+        && state.gps_satellites >= GEOFENCE_MIN_SATELLITES;
+
+    if !valid { return None; } // No GPS fix — can't check fence
+
+    if geofence_check(state.gps_lat_udeg, state.gps_lon_udeg) {
+        Some(SafetyResult {
+            action: SafetyAction::ReturnToLaunch,
+            violation: SafetyViolation::GeofenceViolation,
+        })
+    } else {
+        None
+    }
 }

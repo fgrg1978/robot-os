@@ -44,6 +44,12 @@ pub struct SensorState {
     // Digital sensor flags (PIR/sound/IR triggers)
     pub sensor_flags:   u16,
 
+    // GPS (E03 geofence — micro-degrees × 10⁶)
+    pub gps_lat_udeg:   i32,
+    pub gps_lon_udeg:   i32,
+    pub gps_fix:        u8,
+    pub gps_satellites: u8,
+
     // Remote VLA action (last received)
     pub remote_action: VlaAction,
 
@@ -71,6 +77,10 @@ impl SensorState {
             velocity_mm_s: 0,
             temp_cdeg:     0,
             sensor_flags:  0,
+            gps_lat_udeg:   0,
+            gps_lon_udeg:   0,
+            gps_fix:        0,
+            gps_satellites: 0,
             remote_action: VlaAction::new(),
             timestamp: 0,
         }

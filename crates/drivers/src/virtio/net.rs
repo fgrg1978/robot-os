@@ -14,6 +14,13 @@ use super::{
 use robot_os_sync::SpinLock;
 
 // ---- VirtIO Net header (prepended to every packet) ----
+//
+// The legacy header is 10 bytes (no num_buffers field). Modern v1.0+ adds a
+// 2-byte num_buffers when VIRTIO_NET_F_MRG_RXBUF is negotiated. We do NOT
+// negotiate any features beyond the implicit defaults, so QEMU uses the
+// 10-byte legacy header — confirmed empirically by inspecting raw RX bytes.
+// Using 12 here silently shifts the Ethernet frame by 2 bytes and makes
+// every ethertype check fail (ARP / IP never recognised → no networking).
 
 #[repr(C)]
 struct VirtioNetHdr {
@@ -23,14 +30,13 @@ struct VirtioNetHdr {
     gso_size:    u16,
     csum_start:  u16,
     csum_offset: u16,
-    num_buffers: u16,
 }
 
 impl VirtioNetHdr {
     const fn zeroed() -> Self {
         VirtioNetHdr {
             flags: 0, gso_type: 0, hdr_len: 0, gso_size: 0,
-            csum_start: 0, csum_offset: 0, num_buffers: 0,
+            csum_start: 0, csum_offset: 0,
         }
     }
 }
@@ -200,8 +206,14 @@ pub fn poll_recv(buf: &mut [u8]) -> usize {
     let mut net = NET.lock();
     if !net.ready { return 0; }
 
-    let desc_idx = match unsafe { virtq_poll(&mut net.rxq) } {
-        Some(i) => i,
+    // Use _with_len so we know the actual frame length — without it we'd
+    // hand the network stack the entire RX_BUF_SIZE and ethertype/headers
+    // would be parsed out of stale buffer contents (silently broken: ARP
+    // never matches, TCP SYN never seen, accept() never returns).
+    let (desc_idx, dev_len) = match unsafe {
+        crate::virtio::virtq_poll_with_len(&mut net.rxq)
+    } {
+        Some(x) => x,
         None    => return 0,
     };
 
@@ -212,8 +224,10 @@ pub fn poll_recv(buf: &mut [u8]) -> usize {
         net.rx_bufs[s].as_ptr() as usize == rx_buf_ptr
     });
     if let Some(slot) = slot_opt {
-        // Skip VirtIO net header (first NET_HDR_SIZE bytes)
-        let packet = &net.rx_bufs[slot][NET_HDR_SIZE..];
+        // dev_len includes the VirtIO net header; subtract it to get the
+        // Ethernet frame length.
+        let frame_len = dev_len.saturating_sub(NET_HDR_SIZE);
+        let packet = &net.rx_bufs[slot][NET_HDR_SIZE..NET_HDR_SIZE + frame_len];
         let n = packet.len().min(buf.len());
         buf[..n].copy_from_slice(&packet[..n]);
 

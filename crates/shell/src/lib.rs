@@ -1011,13 +1011,76 @@ fn cmd_ota_rollback() {
 }
 
 /// Receive firmware over TCP, write to inactive slot, validate CRC-32.
+/// OT02.A — promote a staged `KERN_X.TMP` into the live `KERN_X.BIN`.
+///
+/// FAT32 has no atomic rename primitive in our driver, so we emulate it
+/// by streaming the TMP contents into a freshly-opened BIN and then
+/// unlinking the TMP. If a power-loss happens during the stream, the
+/// next boot finds:
+///   - TMP still present (will be overwritten by the next OTA attempt)
+///   - BIN truncated or absent
+///   - BOOTMETA NOT updated yet → kernel still boots from the other slot
+/// So a torn promotion is recoverable without operator action.
+fn ota_promote_tmp_to_bin(tmp_path: &[u8], bin_path: &[u8]) -> bool {
+    // Buffer reused for read+write copy. The slot binary is bounded by
+    // OTA_MAX_IMAGE_SIZE so we know the loop terminates.
+    static mut PROMOTE_BUF: [u8; 4096] = [0u8; 4096];
+    let buf = unsafe { &mut *(&raw mut PROMOTE_BUF) };
+
+    // Open source (TMP) for read.
+    let mut src_fdt = robot_os_fs::FdTable::new();
+    let src_fd = robot_os_fs::vfs_open(&mut src_fdt, tmp_path, robot_os_fs::O_RDONLY);
+    if src_fd < 0 {
+        return false;
+    }
+
+    // Drop any pre-existing BIN, then create fresh.
+    let _ = robot_os_fs::fat32_unlink_path(bin_path);
+    let mut dst_fdt = robot_os_fs::FdTable::new();
+    let dst_fd = robot_os_fs::vfs_open(&mut dst_fdt, bin_path,
+        robot_os_fs::O_WRONLY | robot_os_fs::O_CREAT | robot_os_fs::O_TRUNC);
+    if dst_fd < 0 {
+        robot_os_fs::vfs_close(&mut src_fdt, src_fd);
+        return false;
+    }
+
+    // Copy in chunks until EOF.
+    loop {
+        let got = robot_os_fs::vfs_read(&mut src_fdt, src_fd,
+                                          buf.as_mut_ptr(), buf.len());
+        if got <= 0 { break; }
+        let wrote = robot_os_fs::vfs_write(&mut dst_fdt, dst_fd,
+                                            buf.as_ptr(), got as usize);
+        if wrote != got {
+            robot_os_fs::vfs_close(&mut src_fdt, src_fd);
+            robot_os_fs::vfs_close(&mut dst_fdt, dst_fd);
+            return false;
+        }
+    }
+    robot_os_fs::vfs_close(&mut src_fdt, src_fd);
+    robot_os_fs::vfs_close(&mut dst_fdt, dst_fd);
+
+    // Flush dirty FAT32 cache so .BIN is durable before we drop .TMP.
+    let _ = robot_os_fs::fat32_sync();
+
+    // Best-effort unlink of the staging file. If it fails the next OTA
+    // attempt will TRUNC it, so it's not a hard error.
+    let _ = robot_os_fs::fat32_unlink_path(tmp_path);
+
+    true
+}
+
 fn cmd_ota_recv(port: u16) {
     let target_slot = robot_os_ota::ota_inactive_slot();
-    let target_path = robot_os_ota::ota_slot_path(target_slot);
+    let final_path  = robot_os_ota::ota_slot_path(target_slot);
+    // OT02.A — write to a staging .TMP file first; promote to .BIN only
+    // after the full payload validates against the CRC32 in the header.
+    let target_path = if target_slot == robot_os_ota::SLOT_A {
+        robot_os_ota::OTA_SLOT_A_TMP_PATH
+    } else {
+        robot_os_ota::OTA_SLOT_B_TMP_PATH
+    };
     let platform = robot_os_ota::ota_current_platform();
-
-    robot_os_drivers::kprintln!("[OTA] Listening on port {} — target slot {}",
-        port, if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
 
     // Create TCP listener
     let listen_fd = robot_os_net::socket_create(
@@ -1038,53 +1101,79 @@ fn cmd_ota_recv(port: u16) {
         return;
     }
 
-    // Accept connection
-    let client_fd = loop {
-        robot_os_net::net_poll();
-        let r = robot_os_net::socket_accept(listen_fd);
-        if r >= 0 { break r; }
-        robot_os_sched::task_yield();
-    };
-    robot_os_drivers::kprintln!("[OTA] Client connected — receiving header...");
+    // Print AFTER bind+listen so the test script's pattern only fires once
+    // the socket is genuinely ready to accept connections.
+    robot_os_drivers::kprintln!("[OTA] Listening on port {} — target slot {}",
+        port, if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
 
-    // Receive OTA header (24 bytes)
+    // Accept + header loop: retry on probe connections that close before sending
+    // a valid header (e.g. health-check probes, accidental connections).
     static mut OTA_HDR_BUF: [u8; 24] = [0u8; 24];
     let hdr_buf = unsafe { &mut *(&raw mut OTA_HDR_BUF) };
-    let mut hdr_got = 0usize;
 
-    while hdr_got < robot_os_ota::OTA_HEADER_SIZE {
-        robot_os_net::net_poll();
-        let n = robot_os_net::socket_recv(client_fd, &mut hdr_buf[hdr_got..]);
-        if n > 0 {
-            hdr_got += n as usize;
-        } else if n < 0 {
-            robot_os_drivers::kprintln!("[OTA] Connection lost during header");
-            robot_os_net::socket_close(client_fd);
-            robot_os_net::socket_close(listen_fd);
-            return;
-        }
-        robot_os_sched::task_yield();
-    }
+    let (client_fd, header) = 'accept_loop: loop {
+        // Wait for next TCP connection.
+        let cfd = loop {
+            robot_os_net::net_poll();
+            let r = robot_os_net::socket_accept(listen_fd);
+            if r >= 0 { break r; }
+            robot_os_sched::task_yield();
+        };
+        robot_os_drivers::kprintln!("[OTA] Client connected — receiving header...");
 
-    // Parse and validate header
-    let header = match robot_os_ota::ota_parse_header(hdr_buf) {
-        Some(h) => h,
-        None => {
-            robot_os_drivers::kprintln!("[OTA] Invalid header (bad magic or version)");
-            robot_os_net::socket_close(client_fd);
-            robot_os_net::socket_close(listen_fd);
-            return;
+        // Receive the fixed-size OTA header.
+        let mut hdr_got = 0usize;
+        hdr_buf.fill(0);
+        let header_ok = 'recv_hdr: loop {
+            robot_os_net::net_poll();
+            let n = robot_os_net::socket_recv(cfd, &mut hdr_buf[hdr_got..
+                robot_os_ota::OTA_HEADER_SIZE]);
+            if n > 0 {
+                hdr_got += n as usize;
+                if hdr_got >= robot_os_ota::OTA_HEADER_SIZE { break 'recv_hdr true; }
+            } else if n < 0 {
+                robot_os_drivers::kprintln!("[OTA] Connection lost during header — retry");
+                robot_os_net::socket_close(cfd);
+                break 'recv_hdr false;
+            }
+            robot_os_sched::task_yield();
+        };
+        if !header_ok { continue 'accept_loop; }
+
+        // Parse header.
+        let hdr = match robot_os_ota::ota_parse_header(hdr_buf) {
+            Some(h) => h,
+            None => {
+                robot_os_drivers::kprintln!("[OTA] Invalid header (bad magic or version)");
+                robot_os_net::socket_close(cfd);
+                continue 'accept_loop;
+            }
+        };
+
+        // Validate header (platform, size bounds).
+        if !robot_os_ota::ota_validate_header(&hdr, platform) {
+            robot_os_drivers::kprintln!("[OTA] Header validation failed (platform={}, size={})",
+                hdr.platform_id, hdr.image_size);
+            robot_os_net::socket_close(cfd);
+            continue 'accept_loop;
         }
+
+        // OT03 anti-rollback: reject firmware older than the floor.
+        let current_meta = robot_os_ota::ota_read_boot_meta();
+        if !robot_os_ota::ota_check_rollback_pure(hdr.fw_version, current_meta.min_fw_version) {
+            robot_os_drivers::kprintln!(
+                "[OTA] Anti-rollback: incoming fw={} < floor={} — rejected",
+                hdr.fw_version, current_meta.min_fw_version);
+            robot_os_net::socket_close(cfd);
+            continue 'accept_loop;
+        }
+
+        break 'accept_loop (cfd, hdr);
     };
 
-    if !robot_os_ota::ota_validate_header(&header, platform) {
-        robot_os_drivers::kprintln!("[OTA] Header validation failed (platform={}, size={})",
-            header.platform_id, header.image_size);
-        robot_os_net::socket_close(client_fd);
-        robot_os_net::socket_close(listen_fd);
-        return;
-    }
-
+    // Do NOT close listen_fd here — some TCP stacks tear down accepted
+    // connections when the listening socket closes. Keep it alive until after
+    // the full payload transfer completes.
     robot_os_drivers::kprintln!("[OTA] Header OK — fw={} size={} crc={:#010x}",
         header.fw_version, header.image_size, header.image_crc32);
 
@@ -1109,6 +1198,7 @@ fn cmd_ota_recv(port: u16) {
 
     robot_os_drivers::kprintln!("[OTA] Receiving {} bytes...", header.image_size);
 
+    let mut idle_iters: u32 = 0;
     while remaining > 0 {
         robot_os_net::net_poll();
         let max_recv = remaining.min(chunk.len());
@@ -1119,12 +1209,23 @@ fn cmd_ota_recv(port: u16) {
             robot_os_fs::vfs_write(&mut fd_table, file_fd, chunk.as_ptr(), got);
             remaining -= got;
             total_written += got;
+            idle_iters = 0;
+            // Don't yield while we have data to drain — every yield gives
+            // the scheduler an opportunity to switch us out and lets the
+            // peer's window fill again before we resume.
+            continue;
         } else if n < 0 {
             robot_os_drivers::kprintln!("[OTA] Connection lost ({}/{} bytes received)",
                 total_written, header.image_size);
             break;
         }
-        robot_os_sched::task_yield();
+        // No data: poll a few more times before yielding, so a packet that
+        // arrives just-after-our-recv doesn't sit one full task quantum.
+        idle_iters = idle_iters.saturating_add(1);
+        if idle_iters >= 8 {
+            idle_iters = 0;
+            robot_os_sched::task_yield();
+        }
     }
 
     robot_os_fs::vfs_close(&mut fd_table, file_fd);
@@ -1132,17 +1233,30 @@ fn cmd_ota_recv(port: u16) {
     robot_os_net::socket_close(listen_fd);
 
     if remaining > 0 {
-        robot_os_drivers::kprintln!("[OTA] INCOMPLETE — deleting partial image");
+        robot_os_drivers::kprintln!("[OTA] INCOMPLETE — deleting partial .TMP");
         let _ = robot_os_fs::fat32_unlink_path(target_path);
         return;
     }
 
-    // Verify CRC-32
+    // Verify CRC-32 BEFORE promoting .TMP → .BIN
     let computed_crc = crc_state.finalize();
     if computed_crc != header.image_crc32 {
         robot_os_drivers::kprintln!("[OTA] CRC MISMATCH: computed={:#010x} expected={:#010x}",
             computed_crc, header.image_crc32);
-        robot_os_drivers::kprintln!("[OTA] Deleting corrupt image");
+        robot_os_drivers::kprintln!("[OTA] Deleting corrupt .TMP");
+        let _ = robot_os_fs::fat32_unlink_path(target_path);
+        return;
+    }
+
+    // OT02.A — promote .TMP to .BIN. FAT32 has no atomic rename so the
+    // pattern is: unlink old .BIN (if any), then write the .TMP contents
+    // to .BIN. Power-loss between unlink and final-write means the slot
+    // is empty on the next boot — but BOOTMETA hasn't been updated yet,
+    // so we still boot from the *other* (good) slot.
+    let promote_ok = ota_promote_tmp_to_bin(target_path, final_path);
+    if !promote_ok {
+        robot_os_drivers::kprintln!("[OTA] Promote {:?} → final failed; cleaning up",
+            target_path);
         let _ = robot_os_fs::fat32_unlink_path(target_path);
         return;
     }
@@ -1760,6 +1874,27 @@ fn cmd_wdt() {
     }
 }
 
+/// WCET report and jitter statistics (F16).
+fn cmd_wcet(args: &[&[u8]; MAX_ARGS], argc: usize) {
+    if argc >= 2 && args[1] == b"reset" {
+        robot_os_drivers::wcet::wcet_reset_all();
+        robot_os_drivers::kprintln!("[WCET] Statistics reset.");
+        return;
+    }
+    if argc >= 2 && args[1] == b"jitter" {
+        robot_os_drivers::wcet::jitter_report();
+        return;
+    }
+    if argc >= 2 && args[1] == b"check" {
+        let viols = robot_os_drivers::wcet::wcet_check_bounds();
+        if viols == 0 {
+            robot_os_drivers::kprintln!("[WCET] All bounds satisfied.");
+        }
+        return;
+    }
+    robot_os_drivers::wcet::wcet_report();
+}
+
 /// Basic memory write+read fuzz test over a stack buffer.
 fn cmd_fuzz() {
     const N: usize = 256;
@@ -2077,6 +2212,15 @@ fn cmd_fork() {
     robot_os_drivers::kprintln!("[FORK] Result: {}", rc);
 }
 
+// ── OTA auto-recv task entry ──────────────────────────────────────────────────
+
+/// Kernel task entry for CONFIG.INI `ota_auto_recv_port`.
+/// Spawned by main.rs when the config key is non-zero; `port_arg` is the port.
+pub fn ota_recv_task_entry(port_arg: usize) {
+    robot_os_drivers::kprintln!("[OTA] Auto-recv task running on port {}", port_arg);
+    cmd_ota_recv(port_arg as u16);
+}
+
 // ── Main shell loop ───────────────────────────────────────────────────────────
 
 /// Main shell entry point.  Runs forever, reading and executing commands.
@@ -2174,6 +2318,7 @@ pub fn shell_run() -> ! {
                     robot_os_drivers::kprintln!("[SHELL] fork disabled (compiled with --features no-mmu)");
                 }
                 else if cmd == b"crash"    { cmd_crash(&args, argc); }
+                else if cmd == b"wcet"     { cmd_wcet(&args, argc); }
                 else if cmd == b"shutdown" { cmd_shutdown(); }
                 else if cmd == b"reboot"   { cmd_reboot(); }
                 else {

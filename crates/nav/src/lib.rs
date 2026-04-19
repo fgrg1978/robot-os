@@ -203,6 +203,11 @@ impl Mission {
 
     /// Get current waypoint index.
     pub fn current_index(&self) -> u8 { self.current }
+
+    /// Get waypoint at index, or None if out of range.
+    pub fn get_waypoint(&self, idx: usize) -> Option<Waypoint> {
+        if idx < self.count as usize { Some(self.waypoints[idx]) } else { None }
+    }
 }
 
 // ── Navigation controller ───────────────────────────────────────────────────
@@ -695,7 +700,6 @@ pub fn astar_plan(grid: &OccupancyGrid, sx: usize, sy: usize, gx: usize, gy: usi
     // Node storage: flat array indexed by (y * GRID_SIZE + x), but we only
     // track nodes that have been visited. Use a compact open list.
     let mut nodes = [AstarNode::empty(); ASTAR_MAX_OPEN];
-    let mut node_count: usize = 0;
 
     // Grid-indexed lookup: which node index corresponds to each cell.
     // Using u16::MAX = unvisited. This uses 20KB for 100×100 grid.
@@ -705,7 +709,7 @@ pub fn astar_plan(grid: &OccupancyGrid, sx: usize, sy: usize, gx: usize, gy: usi
     let start_h = heuristic(sx, sy, gx, gy);
     nodes[0] = AstarNode { x: sx as u8, y: sy as u8, g: 0, f: start_h, parent: u16::MAX, open: true, closed: false };
     cell_node[sy * GRID_SIZE + sx] = 0;
-    node_count = 1;
+    let mut node_count: usize = 1;
 
     // 8-directional neighbors
     const DIRS: [(i8, i8); 8] = [
@@ -813,4 +817,160 @@ fn reconstruct_path(nodes: &[AstarNode; ASTAR_MAX_OPEN], goal_idx: usize) -> Ast
     }
     path.len = stack_len;
     path
+}
+
+// ===========================================================================
+// R02: Speculative Waypoint Cache (SPO-inspired)
+// ===========================================================================
+//
+// The brain sends waypoints one at a time over the network.  Transmission
+// latency (10-50 ms) means the robot can stand still waiting for the next
+// command even when the next destination is predictable.
+//
+// The speculative cache pre-computes the `N` most likely next waypoints from
+// the current mission plan.  When the robot completes a waypoint, it
+// immediately starts executing the top speculative candidate instead of
+// waiting for brain confirmation.
+//
+// If the brain then sends a different waypoint (speculation miss), the robot
+// corrects course.  The cost of a miss is one heading change; the benefit of
+// a hit is eliminating the full round-trip latency.
+//
+// Inspired by: SPO (Speculative Pre-Optimization) from the Reality-Native OS
+// design and the classic out-of-order execution idea from processor design.
+
+use robot_os_sync::SpinLock;
+
+/// Maximum number of speculative candidates in the cache.
+pub const SPEC_WP_CACHE_SIZE: usize = 4;
+
+/// Confidence in a speculative waypoint (0-255; 255 = certain).
+pub const SPEC_CONFIDENCE_HIGH:   u8 = 200;
+pub const SPEC_CONFIDENCE_MEDIUM: u8 = 128;
+pub const SPEC_CONFIDENCE_LOW:    u8 = 64;
+
+/// One speculative waypoint candidate.
+#[derive(Clone, Copy)]
+pub struct SpecWaypoint {
+    /// The predicted next waypoint.
+    pub wp: Waypoint,
+    /// Confidence score (higher = more likely to be correct).
+    pub confidence: u8,
+    /// Whether this slot is occupied.
+    pub valid: bool,
+}
+
+impl SpecWaypoint {
+    pub const fn empty() -> Self {
+        SpecWaypoint {
+            wp: Waypoint::new(),
+            confidence: 0,
+            valid: false,
+        }
+    }
+}
+
+struct SpecCache {
+    candidates: [SpecWaypoint; SPEC_WP_CACHE_SIZE],
+    /// How many valid candidates are stored.
+    count: usize,
+    /// Speculation hit counter (for telemetry).
+    hits: u32,
+    /// Speculation miss counter.
+    misses: u32,
+}
+
+impl SpecCache {
+    const fn new() -> Self {
+        SpecCache {
+            candidates: [SpecWaypoint::empty(); SPEC_WP_CACHE_SIZE],
+            count: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+}
+
+static SPEC_CACHE: SpinLock<SpecCache> = SpinLock::new(SpecCache::new());
+
+/// Fill the speculative cache from the next `n` waypoints in the current mission.
+///
+/// Called after the robot confirms arrival at a waypoint, so the cache is
+/// ready before the brain's reply arrives.
+pub fn spec_wp_prefill(mission: &Mission) {
+    let mut cache = SPEC_CACHE.lock();
+    cache.count = 0;
+
+    let current = mission.current_index() as usize;
+    let total   = mission.len() as usize;
+
+    let fill = (SPEC_WP_CACHE_SIZE).min(total.saturating_sub(current + 1));
+    for i in 0..fill {
+        let wp_idx = current + 1 + i;
+        if wp_idx >= total { break; }
+        let confidence = if i == 0 {
+            SPEC_CONFIDENCE_HIGH
+        } else if i == 1 {
+            SPEC_CONFIDENCE_MEDIUM
+        } else {
+            SPEC_CONFIDENCE_LOW
+        };
+        if let Some(wp) = mission.get_waypoint(wp_idx) {
+            cache.candidates[i] = SpecWaypoint {
+                wp,
+                confidence,
+                valid: true,
+            };
+        }
+        cache.count += 1;
+    }
+}
+
+/// Return the best speculative candidate (highest confidence), or None.
+pub fn spec_wp_top() -> Option<Waypoint> {
+    let cache = SPEC_CACHE.lock();
+    if cache.count == 0 { return None; }
+    let mut best_idx = 0;
+    let mut best_conf = 0u8;
+    for i in 0..cache.count {
+        if cache.candidates[i].valid && cache.candidates[i].confidence > best_conf {
+            best_conf = cache.candidates[i].confidence;
+            best_idx = i;
+        }
+    }
+    if cache.candidates[best_idx].valid {
+        Some(cache.candidates[best_idx].wp)
+    } else {
+        None
+    }
+}
+
+/// Confirm that the speculative waypoint matched (brain sent the same one).
+pub fn spec_wp_hit() {
+    SPEC_CACHE.lock().hits += 1;
+}
+
+/// Report a speculation miss (brain sent a different waypoint).
+/// Clears the cache so stale predictions are not re-used.
+pub fn spec_wp_miss() {
+    let mut cache = SPEC_CACHE.lock();
+    cache.misses += 1;
+    for c in cache.candidates.iter_mut() { *c = SpecWaypoint::empty(); }
+    cache.count = 0;
+}
+
+/// Inject a custom speculative waypoint (e.g., from a local planner).
+pub fn spec_wp_push(wp: Waypoint, confidence: u8) -> bool {
+    let mut cache = SPEC_CACHE.lock();
+    if cache.count >= SPEC_WP_CACHE_SIZE { return false; }
+    let idx = cache.count;
+    cache.candidates[idx] = SpecWaypoint { wp, confidence, valid: true };
+    cache.count += 1;
+    true
+}
+
+/// Return speculation hit/miss counts for telemetry.
+pub fn spec_wp_stats() -> (u32, u32) {
+    let cache = SPEC_CACHE.lock();
+    (cache.hits, cache.misses)
 }

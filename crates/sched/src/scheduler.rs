@@ -29,11 +29,19 @@ pub const MAX_CPUS: usize = 4;
 static NEXT_ASID: AtomicU16 = AtomicU16::new(1);
 
 /// Allocate a unique ASID for a user-space page table.
+///
+/// Memory ordering: AcqRel on success so the returned ASID is sequenced
+/// after every prior allocator operation (no two CPUs can get the same
+/// ASID). Acquire on failure so the next iteration sees the latest
+/// value. Relaxed here would let two CPUs race and reuse an ASID before
+/// TLB shootdown completes — a stale TLB entry for ASID N on hart A
+/// then references hart B's freshly-allocated page table.
 pub fn alloc_asid() -> u16 {
     loop {
-        let current = NEXT_ASID.load(Ordering::Relaxed);
+        let current = NEXT_ASID.load(Ordering::Acquire);
         let next = if current == u16::MAX { 1 } else { current + 1 };
-        if NEXT_ASID.compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        if NEXT_ASID.compare_exchange(current, next,
+            Ordering::AcqRel, Ordering::Acquire).is_ok() {
             return current;
         }
     }
@@ -222,8 +230,10 @@ unsafe fn task_mut(idx: usize) -> &'static mut Task {
 
 /// Pick the CPU with the fewest ready tasks.
 /// Uses NUM_ONLINE_CPUS to limit the search. Not locked — approximate is fine.
+/// Acquire load pairs with the SeqCst store in kernel_main before wake_harts
+/// so secondaries observe the published task pool / per-CPU queues.
 unsafe fn find_least_loaded_cpu() -> usize {
-    let num_online = NUM_ONLINE_CPUS.load(Ordering::Relaxed);
+    let num_online = NUM_ONLINE_CPUS.load(Ordering::Acquire);
     let mut min_count = usize::MAX;
     let mut min_cpu = 0;
     for i in 0..num_online {
@@ -337,10 +347,12 @@ pub fn task_create_affinity(
             let stack_top = stack_top & !0xF; // align to 16 bytes (RISC-V ABI)
 
             let entry_addr = task_entry_wrapper as *const () as usize as CtxReg;
+            let target_cpu = pick_target_cpu(affinity);
             task.context = TaskContext {
                 sp: stack_top as CtxReg,
                 pc: entry_addr,
                 ra: entry_addr,
+                tp: target_cpu as CtxReg,
                 ..Default::default()
             };
 
@@ -361,7 +373,6 @@ pub fn task_create_affinity(
                 (TASK_STACKS.0[idx].as_mut_ptr() as *mut u64).write_volatile(STACK_CANARY);
             }
 
-            let target_cpu = pick_target_cpu(affinity);
             (idx, target_cpu)
         }; // pool lock released here
 
@@ -477,6 +488,11 @@ const ADMISSION_SCALE: u64 = 10_000;
 /// Deadline tasks: decrement remaining budget; replenish on deadline expiry.
 pub fn schedule() {
     let cpu = current_cpu_id();
+    // F03.4: If preemption is disabled (e.g. spinlock held, critical section),
+    // skip the context switch but still let the caller's bookkeeping run.
+    if PREEMPT_COUNT[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed) > 0 {
+        return;
+    }
     unsafe {
         let current_idx = PER_CPU[cpu].current_idx;
         if current_idx != usize::MAX {
@@ -996,4 +1012,102 @@ pub fn wq_wake_by_tid(tid: u32) {
             break;
         }
     }
+}
+
+// ── M03: Tickless scheduling helpers ────────────────────────────────────────
+
+/// Return the nearest pending timer deadline across all blocked tasks.
+///
+/// Used by the tickless scheduler to program mtimecmp at the exact tick needed
+/// rather than firing at a fixed periodic rate.  Returns `None` if no tasks
+/// are currently sleeping on a timer.
+pub fn nearest_timer_deadline() -> Option<u64> {
+    let mut min_deadline: Option<u64> = None;
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if !TASK_VALID[i] { continue; }
+            let task = task_ref(i);
+            if task.state != TaskState::Blocked { continue; }
+            if let WaitReason::Timer(deadline) = task.wait_reason {
+                min_deadline = Some(match min_deadline {
+                    Some(cur) => cur.min(deadline),
+                    None      => deadline,
+                });
+            }
+        }
+    }
+    min_deadline
+}
+
+/// Read-only reference to task via raw pointer (avoids aliasing with task_mut).
+/// # Safety
+/// Caller must not hold a mutable reference to the same slot simultaneously.
+#[inline(always)]
+unsafe fn task_ref(idx: usize) -> &'static Task {
+    unsafe { &*(core::ptr::addr_of!(TASKS[idx])) }
+}
+
+// ── Preemption control (F03.4) ────────────────────────────────────────────────
+//
+// Per-CPU preemption depth counter.  When > 0, `schedule()` returns immediately
+// without performing a context switch.  Nesting is supported: each
+// `preempt_disable()` must be matched by exactly one `preempt_enable()`.
+//
+// Typical use:
+//   preempt_disable();
+//   // ... critical section that must not be interrupted by the scheduler ...
+//   preempt_enable();
+//
+// IRQ handlers are NOT affected — the hardware timer still fires, but
+// `schedule()` checks the counter and bails early if preemption is disabled.
+
+use core::sync::atomic::AtomicI32;
+
+/// Per-CPU preemption depth. Positive means preemption is disabled.
+/// We use `MAX_CPUS` slots indexed by `current_cpu_id()`.
+static PREEMPT_COUNT: [AtomicI32; MAX_CPUS] = [
+    AtomicI32::new(0), AtomicI32::new(0),
+    AtomicI32::new(0), AtomicI32::new(0),
+];
+
+/// Increment the preemption disable count for the current CPU.
+///
+/// After this call, `schedule()` will not perform a context switch until a
+/// matching `preempt_enable()` brings the count back to zero.
+/// This function may be called from any context (task or IRQ handler).
+#[inline]
+pub fn preempt_disable() {
+    let cpu = current_cpu_id().min(MAX_CPUS - 1);
+    PREEMPT_COUNT[cpu].fetch_add(1, Ordering::Relaxed);
+    // Compiler fence: prevent instruction reordering across the barrier.
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// Decrement the preemption disable count for the current CPU.
+///
+/// If the count reaches zero, preemption is re-enabled and a deferred
+/// `schedule()` may run immediately if a higher-priority task became runnable
+/// while preemption was disabled.
+///
+/// # Panics
+/// Panics in debug builds if called when preemption is already enabled
+/// (i.e. the count would go negative), which indicates a mismatched pair.
+#[inline]
+pub fn preempt_enable() {
+    let cpu = current_cpu_id().min(MAX_CPUS - 1);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    let prev = PREEMPT_COUNT[cpu].fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "preempt_enable() without matching preempt_disable()");
+    // If we just re-enabled preemption, run the scheduler in case a higher-
+    // priority task became runnable while we held the disable.
+    if prev == 1 {
+        schedule();
+    }
+}
+
+/// Returns true if preemption is currently disabled on this CPU.
+#[inline]
+pub fn preempt_disabled() -> bool {
+    let cpu = current_cpu_id().min(MAX_CPUS - 1);
+    PREEMPT_COUNT[cpu].load(Ordering::Relaxed) > 0
 }

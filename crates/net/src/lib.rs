@@ -7,18 +7,41 @@
 pub mod ethernet;
 pub mod arp;
 pub mod ip;
+pub mod ipv6;
 pub mod udp;
 pub mod tcp;
 pub mod socket;
 #[allow(dead_code)]
 pub mod dhcp;
 pub mod dns;
+pub mod ntp;
+// E02 — multi-link transport (WiFi/LoRa/RF failover).
+pub mod multilink;
+pub mod lora;
+pub mod rf;
+
+pub use multilink::{
+    Transport, TransportError, MultiLinkTransport,
+    MAX_LINKS,
+    TRANSPORT_MAX_CONSEC_FAILURES,
+    TRANSPORT_FAILOVER_TIMEOUT_TICKS,
+    LINK_PROBE_INTERVAL_TICKS,
+    LINK_QUALITY_DOWN, LINK_QUALITY_GOOD, LINK_QUALITY_UNKNOWN,
+};
+pub use lora::LoRaTransport;
+pub use rf::{RfTransport, RF_MAX_PAYLOAD};
 
 pub use socket::{
     socket_create, socket_bind, socket_connect,
     socket_listen, socket_listen_bound, socket_accept,
     socket_send, socket_recv, socket_close,
     SockAddr, AF_INET, SOCK_STREAM, SOCK_DGRAM, IPPROTO_TCP, IPPROTO_UDP,
+};
+
+pub use ipv6::{
+    ipv6_init, ipv6_link_local, ipv6_ready, udpv6_send,
+    eui64_link_local, pseudo_checksum,
+    ETH_TYPE_IPV6, IPV6_HDR_SIZE,
 };
 
 // ── Network configuration ─────────────────────────────────────────────────────
@@ -105,31 +128,49 @@ pub fn net_init() {
     if ready {
         let cfg = NET_CFG.lock();
         tcp::init(cfg.mac, cfg.ip);
+        // F22: IPv6 — compute link-local address from MAC (EUI-64).
+        ipv6::ipv6_init(&cfg.mac);
+        let ll = ipv6::ipv6_link_local();
         robot_os_drivers::kprintln!(
             "[NET] Stack ready — IP: {}.{}.{}.{}, GW: {}.{}.{}.{}",
             cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3],
             cfg.gateway[0], cfg.gateway[1], cfg.gateway[2], cfg.gateway[3],
+        );
+        robot_os_drivers::kprintln!(
+            "[NET] IPv6 link-local: {:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:\
+             {:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+            ll[0],ll[1],ll[2],ll[3],ll[4],ll[5],ll[6],ll[7],
+            ll[8],ll[9],ll[10],ll[11],ll[12],ll[13],ll[14],ll[15]
         );
     }
 }
 
 /// Poll for incoming packets and process them.
 /// Should be called periodically (e.g. from timer handler or shell loop).
+///
+/// Drains the entire RX queue per call (up to `MAX_DRAIN_PER_CALL` frames)
+/// instead of just one — otherwise the kernel falls behind under load.
 pub fn net_poll() {
-    let mut buf = [0u8; ethernet::ETH_FRAME_MAX];
-    let n = net_raw_recv(&mut buf);
-    if n == 0 { return; }
+    /// Bound the drain so we don't starve other tasks if the device is
+    /// flooding (e.g. broadcast storm). 64 ≈ one Ethernet line-rate burst.
+    const MAX_DRAIN_PER_CALL: usize = 64;
 
     let (mac, ip) = {
         let cfg = NET_CFG.lock();
         (cfg.mac, cfg.ip)
     };
 
-    if let Some((hdr, payload)) = ethernet::parse(&buf[..n]) {
-        match hdr.ethertype() {
-            ethernet::ETH_TYPE_ARP => arp::handle(payload, &mac, &ip),
-            ethernet::ETH_TYPE_IP  => ip::handle(payload, &mac, &ip),
-            _                      => {}
+    let mut buf = [0u8; ethernet::ETH_FRAME_MAX];
+    for _ in 0..MAX_DRAIN_PER_CALL {
+        let n = net_raw_recv(&mut buf);
+        if n == 0 { break; }
+        if let Some((hdr, payload)) = ethernet::parse(&buf[..n]) {
+            match hdr.ethertype() {
+                ethernet::ETH_TYPE_ARP  => arp::handle(payload, &mac, &ip),
+                ethernet::ETH_TYPE_IP   => ip::handle(payload, &mac, &ip),
+                ethernet::ETH_TYPE_IPV6 => ipv6::ipv6_rx(payload, payload.len()),
+                _                       => {}
+            }
         }
     }
 }

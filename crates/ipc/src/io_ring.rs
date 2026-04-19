@@ -336,3 +336,82 @@ fn dispatch_sqe(sqe: &SqEntry, data_buf: &mut [u8; RING_DATA_BUF_SIZE], ops: &Io
         _ => IO_ERR_INVALID_OP,
     }
 }
+
+// ===========================================================================
+// M05: Async IO Ring worker
+// ===========================================================================
+
+use core::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+/// Flag set when at least one ring has pending SQEs.
+/// The IO Ring worker task polls this to avoid spinning when there is no work.
+pub static IO_RING_WORK_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Signal that a ring has new SQEs (called from SYS_IO_SUBMIT_ASYNC syscall).
+#[inline]
+pub fn io_ring_signal_async() {
+    IO_RING_WORK_PENDING.store(true, AOrd::Release);
+}
+
+/// Check if there is pending async work.
+#[inline]
+pub fn io_ring_has_async_work() -> bool {
+    IO_RING_WORK_PENDING.load(AOrd::Acquire)
+}
+
+/// Process all pending SQEs across ALL active rings — called from worker task.
+///
+/// Returns the total number of SQEs processed in this round.
+pub fn io_ring_worker_poll() -> i32 {
+    IO_RING_WORK_PENDING.store(false, AOrd::Release);
+
+    let ops = unsafe { match OPS {
+        Some(o) => o,
+        None => return 0,
+    }};
+
+    let mut total = 0;
+    unsafe {
+        for i in 0..MAX_IO_RINGS {
+            let state = &IO_RINGS[i];
+            if !state.active { continue; }
+            let ring = state.phys_addr as *mut IoRing;
+            let head = (*ring).sq_head.load(AOrd::Acquire);
+            let tail = (*ring).sq_tail.load(AOrd::Acquire);
+            if head == tail { continue; } // no work on this ring
+
+            let count = io_ring_process_ring(ring, ops);
+            if count > 0 {
+                total += count;
+                // If ring still has pending entries, signal again for next round.
+                let new_head = (*ring).sq_head.load(AOrd::Acquire);
+                let new_tail = (*ring).sq_tail.load(AOrd::Acquire);
+                if new_head != new_tail {
+                    IO_RING_WORK_PENDING.store(true, AOrd::Release);
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Process all pending SQEs in a single ring. Returns count processed.
+unsafe fn io_ring_process_ring(ring: *mut IoRing, ops: &IoRingOps) -> i32 {
+    let mut head = (*ring).sq_head.load(AOrd::Acquire);
+    let tail     = (*ring).sq_tail.load(AOrd::Acquire);
+    let mut done = 0;
+
+    while head != tail {
+        let sq_idx = (head as usize) % RING_SQ_SIZE;
+        let sqe    = (*ring).sq_entries[sq_idx];
+        let result = dispatch_sqe(&sqe, &mut (*ring).data_buf, ops);
+        let cq_tail = (*ring).cq_tail.load(AOrd::Acquire);
+        let cq_idx  = (cq_tail as usize) % RING_CQ_SIZE;
+        (*ring).cq_entries[cq_idx] = CqEntry { user_data: sqe.user_data, result, flags: 0 };
+        (*ring).cq_tail.store(cq_tail.wrapping_add(1), AOrd::Release);
+        head = head.wrapping_add(1);
+        done += 1;
+    }
+    (*ring).sq_head.store(head, AOrd::Release);
+    done
+}

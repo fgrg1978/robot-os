@@ -2,7 +2,7 @@
 // Phase 7 — enables kernel to launch RISC-V 64-bit ELF user programs.
 
 use robot_os_arch::mmu::{PteFlags, PAGE_SIZE, make_satp};
-use robot_os_mm::{pmm, vmm};
+use robot_os_mm::{pmm, vmm, vdso};
 use robot_os_sync::SpinLock;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -110,9 +110,21 @@ fn load_elf(elf: &[u8]) -> Option<ExecContext> {
     // Track the highest mapped virtual address for initial brk.
     let mut brk_va: usize = 0;
 
+    /// Maximum user image VA span — 2 GiB matches USER_STACK_TOP.
+    /// Prevents a malicious ELF from claiming p_memsz = u64::MAX and
+    /// looping forever / exhausting all PMM pages. The stack is
+    /// reserved separately above this region.
+    const USER_IMAGE_MAX: usize = 0x4000_0000; // 1 GiB image cap
+
     for i in 0..e_phnum {
-        let ph = e_phoff + i * e_phentsize;
-        if ph + 56 > elf.len() { break; }
+        // Bounded ph offset — `i * e_phentsize` must not overflow, and
+        // the program header itself (56 bytes) must fit entirely in the
+        // ELF blob. Even if e_phentsize > 56, we only read 56 bytes.
+        let ph = match e_phoff.checked_add(i.checked_mul(e_phentsize)?) {
+            Some(p) => p,
+            None    => break,
+        };
+        if ph.checked_add(56).map_or(true, |end| end > elf.len()) { break; }
 
         if r32(elf, ph) != PT_LOAD { continue; }
 
@@ -124,6 +136,23 @@ fn load_elf(elf: &[u8]) -> Option<ExecContext> {
 
         if p_memsz == 0 { continue; }
 
+        // Sanity bounds on user-supplied ELF fields. Without these a
+        // malicious ELF can:
+        //   - set p_vaddr in kernel space (S-mode mapping in user PT)
+        //   - set p_memsz huge → infinite alloc loop / OOM kernel
+        //   - set p_filesz > p_memsz → unspecified by ELF spec, refuse
+        //   - set p_offset+p_filesz > elf.len() → OOB read
+        if p_vaddr >= USER_STACK_TOP                     { return None; }
+        if p_memsz > USER_IMAGE_MAX                      { return None; }
+        if p_filesz > p_memsz                            { return None; }
+        let va_end_unaligned = match p_vaddr.checked_add(p_memsz) {
+            Some(v) if v <= USER_STACK_TOP => v,
+            _ => return None, // overflow OR end above user stack
+        };
+        if let Some(src_end) = p_offset.checked_add(p_filesz) {
+            if src_end > elf.len() { return None; }
+        } else { return None; }
+
         let flags = if p_flags & PF_W != 0 {
             PteFlags::USER_RW | PteFlags::ACCESSED | PteFlags::DIRTY
         } else {
@@ -131,7 +160,7 @@ fn load_elf(elf: &[u8]) -> Option<ExecContext> {
         };
 
         let va_start = p_vaddr & !(PAGE_SIZE - 1);
-        let va_end   = page_up(p_vaddr + p_memsz);
+        let va_end   = page_up(va_end_unaligned);
 
         if va_end > brk_va { brk_va = va_end; }
 
@@ -142,15 +171,17 @@ fn load_elf(elf: &[u8]) -> Option<ExecContext> {
 
             let seg_off = va.saturating_sub(p_vaddr);
             if seg_off < p_filesz {
-                let src_off = p_offset + seg_off;
+                let src_off = p_offset.saturating_add(seg_off);
                 let copy_n  = p_filesz.saturating_sub(seg_off).min(PAGE_SIZE);
-                if src_off + copy_n <= elf.len() {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            elf.as_ptr().add(src_off),
-                            phys as *mut u8,
-                            copy_n,
-                        );
+                if let Some(src_end) = src_off.checked_add(copy_n) {
+                    if src_end <= elf.len() {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                elf.as_ptr().add(src_off),
+                                phys as *mut u8,
+                                copy_n,
+                            );
+                        }
                     }
                 }
             }
@@ -169,6 +200,18 @@ fn load_elf(elf: &[u8]) -> Option<ExecContext> {
             PteFlags::USER_RW | PteFlags::ACCESSED | PteFlags::DIRTY,
         );
         va += PAGE_SIZE;
+    }
+
+    // Map vDSO page (read-only) so user-space can read kernel time data
+    // without issuing an ecall.
+    let vdso_phys = vdso::vdso_phys();
+    if vdso_phys != 0 {
+        let _ = vmm::map(
+            user_pt,
+            vdso::VDSO_USER_BASE,
+            vdso_phys,
+            PteFlags::USER_RO | PteFlags::ACCESSED,
+        );
     }
 
     let user_satp = make_satp(user_pt, crate::alloc_asid()) as u64;
@@ -403,6 +446,42 @@ const USER_MMIO_MAX_SIZE: usize = 1024 * 1024;
 
 /// Next free MMIO virtual address (grows upward).
 static MMIO_NEXT_VA: AtomicU64 = AtomicU64::new(USER_MMIO_BASE as u64);
+
+/// Map a shared memory region (F00.4) into the current task's user page table.
+///
+/// Takes the physical pages directly from the caller to avoid a dependency on
+/// `robot_os_ipc` (which already depends on `robot_os_sched` — would be circular).
+///
+/// - `phys_pages`: slice of physical page addresses to map contiguously.
+/// - `rw`: true = read-write, false = read-only.
+///
+/// Returns the virtual base address, or None on failure.
+pub fn shm_map_user(phys_pages: &[usize], rw: bool) -> Option<usize> {
+    let user_pt = crate::scheduler::current_user_pt();
+    if user_pt == 0 {
+        return None; // kernel task
+    }
+    let page_count = phys_pages.len();
+    if page_count == 0 {
+        return None;
+    }
+    let va_base = MMIO_NEXT_VA.fetch_add(
+        (page_count * PAGE_SIZE) as u64,
+        Ordering::Relaxed,
+    ) as usize;
+    let flags = if rw {
+        PteFlags::USER_RW | PteFlags::ACCESSED | PteFlags::DIRTY
+    } else {
+        PteFlags::USER_RO | PteFlags::ACCESSED | PteFlags::DIRTY
+    };
+    for (i, &phys) in phys_pages.iter().enumerate() {
+        let va = va_base + i * PAGE_SIZE;
+        if vmm::map(user_pt, va, phys, flags).is_err() {
+            return None; // partial mapping; caller responsible for shm_release
+        }
+    }
+    Some(va_base)
+}
 
 /// Map a physical MMIO region into the current task's user page table.
 /// Returns the virtual address in user space, or None on failure.

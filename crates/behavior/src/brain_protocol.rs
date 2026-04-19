@@ -65,6 +65,8 @@ pub const PKT_CONFIG:    u8 = 0x83;
 pub const PKT_OTA_BEGIN: u8 = 0x84;
 pub const PKT_OTA_CHUNK: u8 = 0x85;
 pub const PKT_OTA_END:   u8 = 0x86;
+/// E04: Brain → Robot: control an attached payload (spray, gripper, cam trigger).
+pub const PKT_PAYLOAD:   u8 = 0x87;
 pub const PKT_ESTOP:     u8 = 0x88;
 
 // Robot types
@@ -468,31 +470,79 @@ pub fn decode_config_cmd(payload: &[u8]) -> Option<ConfigCmd> {
     })
 }
 
+// ── PayloadCmd (E04) ────────────────────────────────────────────────────────
+
+/// Payload type: spray pump (GPIO on/off).
+pub const PAYLOAD_TYPE_SPRAY:       u8 = 0;
+/// Payload type: gripper servo (0=closed … 100=open).
+pub const PAYLOAD_TYPE_GRIPPER:     u8 = 1;
+/// Payload type: external camera shutter trigger (GPIO pulse).
+pub const PAYLOAD_TYPE_CAM_TRIGGER: u8 = 2;
+
+/// Generic off state for spray / digital payloads.
+pub const PAYLOAD_OFF: u8 = 0;
+/// Generic on state for spray / digital payloads.
+pub const PAYLOAD_ON:  u8 = 1;
+
+/// Gripper: fully open (value=100).
+pub const GRIPPER_OPEN:   u8 = 100;
+/// Gripper: fully closed (value=0).
+pub const GRIPPER_CLOSED: u8 = 0;
+
+/// Total payload size for PKT_PAYLOAD:
+/// payload_type(1) + channel(1) + value(1) + duration_ms(2 LE) = 5 bytes.
+pub const PAYLOAD_PAYLOAD_SIZE: usize = 5;
+
+const PL_OFF_TYPE:     usize = 0;
+const PL_OFF_CHANNEL:  usize = 1;
+const PL_OFF_VALUE:    usize = 2;
+const PL_OFF_DURATION: usize = 3;
+
+/// Decoded payload command from the Brain Server.
+#[derive(Clone, Copy, Debug)]
+pub struct PayloadCmd {
+    /// Which payload type (PAYLOAD_TYPE_*).
+    pub payload_type: u8,
+    /// Which device index (0 = first of that type).
+    pub channel:      u8,
+    /// Command value: 0/1 for on/off; 0-100 for gripper position.
+    pub value:        u8,
+    /// Optional duration (ms); 0 = indefinite / one-shot.
+    pub duration_ms:  u16,
+}
+
+/// Decode a PayloadCmd from the payload bytes of a `PKT_PAYLOAD` packet.
+///
+/// Returns `None` if the payload is too short.
+pub fn decode_payload_cmd(payload: &[u8]) -> Option<PayloadCmd> {
+    if payload.len() < PAYLOAD_PAYLOAD_SIZE { return None; }
+    Some(PayloadCmd {
+        payload_type: payload[PL_OFF_TYPE],
+        channel:      payload[PL_OFF_CHANNEL],
+        value:        payload[PL_OFF_VALUE],
+        duration_ms:  get_u16(payload, PL_OFF_DURATION),
+    })
+}
+
 // ── Little-endian helpers ─────────────────────────────────────────────────────
+
+// All these emit a single store on RV64 once the optimiser sees the
+// slice operation. The hand-rolled byte-by-byte version had to retain
+// per-byte bounds checks in some build configurations.
 
 #[inline]
 fn put_u16(buf: &mut [u8], off: usize, v: u16) {
-    let b = v.to_le_bytes();
-    buf[off]     = b[0];
-    buf[off + 1] = b[1];
+    buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
 
 #[inline]
 fn put_i32(buf: &mut [u8], off: usize, v: i32) {
-    let b = v.to_le_bytes();
-    buf[off]     = b[0];
-    buf[off + 1] = b[1];
-    buf[off + 2] = b[2];
-    buf[off + 3] = b[3];
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
 #[inline]
 fn put_u32(buf: &mut [u8], off: usize, v: u32) {
-    let b = v.to_le_bytes();
-    buf[off]     = b[0];
-    buf[off + 1] = b[1];
-    buf[off + 2] = b[2];
-    buf[off + 3] = b[3];
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
 #[inline]
@@ -503,8 +553,7 @@ fn put_u64(buf: &mut [u8], off: usize, v: u64) {
 
 #[inline]
 fn put_i64(buf: &mut [u8], off: usize, v: i64) {
-    let b = v.to_le_bytes();
-    for i in 0..8 { buf[off + i] = b[i]; }
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
 // ── Little-endian reader helpers ─────────────────────────────────────────────

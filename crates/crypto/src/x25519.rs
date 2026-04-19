@@ -46,10 +46,10 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     k[31] |= 64;
 
     // Decode u-coordinate of point
-    let mut u = decode_u_coordinate(point);
+    let u = decode_u_coordinate(point);
 
     // Montgomery ladder
-    let mut x_1 = u;
+    let x_1 = u;
     let mut x_2 = fe_one();
     let mut z_2 = fe_zero();
     let mut x_3 = u;
@@ -208,11 +208,10 @@ fn fe_mul_small(a: &Fe, small: u64) -> Fe {
     // carry * 2^256 mod p = carry * 38 (since 2^256 = 38 mod p)
     let extra = carry as u64;
     if extra > 0 {
-        let mut c2 = 0u128;
         let add = extra as u128 * 38;
         let sum = r[0] as u128 + add;
         r[0] = sum as u64;
-        c2 = sum >> 64;
+        let mut c2 = sum >> 64;
         for i in 1..4 {
             let s = r[i] as u128 + c2;
             r[i] = s as u64;

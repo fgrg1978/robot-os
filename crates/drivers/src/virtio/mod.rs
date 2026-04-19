@@ -347,7 +347,24 @@ pub unsafe fn virtq_submit(dev: &VirtioDev, queue_idx: u32, desc_head: usize, vq
 // ---- virtq_poll (port of virtq_poll in virtio.c) ----
 
 /// Returns Some(desc_head) if a request completed, None if queue is empty.
+///
+/// NOTE: this drops the `len` field from the used-ring entry — for net RX
+/// that means callers don't know the actual received packet length. Prefer
+/// `virtq_poll_with_len()` for RX paths where the device writes a variable
+/// amount into the descriptor's buffer.
 pub unsafe fn virtq_poll(vq: &mut Virtq) -> Option<usize> {
+    virtq_poll_with_len(vq).map(|(id, _)| id)
+}
+
+/// Like `virtq_poll`, but also returns the device-reported length written
+/// into the buffer. Required for RX paths (Ethernet, block reads) where the
+/// payload is shorter than the buffer; without it the consumer reads past
+/// the real data into stale buffer contents.
+///
+/// Both `id` and `len` come from the device — a buggy or malicious device
+/// can write any value. We bounds-check both before returning so callers
+/// can trust them as array indices / slice lengths without further checks.
+pub unsafe fn virtq_poll_with_len(vq: &mut Virtq) -> Option<(usize, usize)> {
     fence(Ordering::Acquire); // fence r,r
 
     if vq.last_used_idx == (*vq.used).idx {
@@ -355,10 +372,20 @@ pub unsafe fn virtq_poll(vq: &mut Virtq) -> Option<usize> {
     }
 
     let used_idx = (vq.last_used_idx as usize) % vq.num as usize;
-    let id = (*vq.used).ring[used_idx].id as usize;
+    let id  = (*vq.used).ring[used_idx].id  as usize;
+    let len = (*vq.used).ring[used_idx].len as usize;
     vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
 
-    Some(id)
+    // Defensive bounds: a malicious / malfunctioning device could write
+    // an `id` outside the descriptor table. Indexing without this check
+    // is OOB read in `vq.desc.add(id)` calls higher up the stack.
+    let qsize = vq.num as usize;
+    if id >= qsize { return None; }
+    // `len` larger than the descriptor's buffer length should also be
+    // impossible per virtio spec, but we let the caller cap it against
+    // its own buffer size so we don't have to re-derive that here.
+
+    Some((id, len))
 }
 
 // ---- virtio_read_config32 / 64 ----

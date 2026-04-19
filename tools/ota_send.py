@@ -86,7 +86,7 @@ def main():
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
+        sock.settimeout(120)
         sock.connect((args.host, args.port))
         print("[OTA] Connected — sending header + payload...")
 
@@ -94,6 +94,23 @@ def main():
         sock.sendall(payload)
         print(f"[OTA] Sent {OTA_HEADER_SIZE + len(payload)} bytes total")
 
+        # Half-close: signal end-of-stream to the kernel without dropping the
+        # connection. The kernel keeps draining its rx buffer until the OTA
+        # task reads everything; only then is it safe for us to close. Without
+        # SHUT_WR + a final read, the kernel hits FIN with data still in flight
+        # and reports INCOMPLETE.
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        # Drain any final bytes the kernel might send back (it doesn't, but
+        # this also blocks until the kernel closes its side gracefully).
+        sock.settimeout(60)
+        try:
+            while sock.recv(4096):
+                pass
+        except (OSError, socket.timeout):
+            pass
         sock.close()
         print("[OTA] Done. Run 'ota status' on the robot to verify.")
     except Exception as e:

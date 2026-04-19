@@ -68,8 +68,10 @@ fn put_i32(buf: &mut [u8], off: usize, v: i32) {
 
 /// Helper: write i64 LE at offset.
 fn put_i64(buf: &mut [u8], off: usize, v: i64) {
-    let b = v.to_le_bytes();
-    for i in 0..8 { buf[off + i] = b[i]; }
+    // copy_from_slice vectorises to a single store on RV64; the
+    // hand-rolled byte-by-byte loop did not always inline the bounds
+    // check elision the optimiser does for slice ops.
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
 /// Helper: read u16 LE from offset.
@@ -171,9 +173,15 @@ pub fn decode_goal_packet(buf: &[u8; GOAL_PACKET_SIZE]) -> Option<VlaGoal> {
 // ── Remote configuration ─────────────────────────────────────────────────────
 
 /// Configure the VLA server address.
+///
+/// Memory ordering: store the IP/port FIRST, then publish ENABLED with
+/// Release semantics. Readers that observe ENABLED=true via Acquire are
+/// guaranteed to see the IP/port writes that preceded it. The previous
+/// version used Relaxed for the port store, which allowed a reader to
+/// observe ENABLED=true with a stale port value (publishing race).
 pub fn remote_configure(ip: [u8; 4], port: u16) {
     *REMOTE_IP.lock() = ip;
-    REMOTE_PORT.store(port as u32, Ordering::Relaxed);
+    REMOTE_PORT.store(port as u32, Ordering::Release);
     REMOTE_ENABLED.store(true, Ordering::Release);
 }
 
@@ -193,8 +201,10 @@ pub fn remote_server_ip() -> [u8; 4] {
 }
 
 /// Get the configured server port.
+/// Acquire pairs with the Release in `remote_configure` so the port
+/// observed here is consistent with REMOTE_ENABLED.
 pub fn remote_server_port() -> u16 {
-    REMOTE_PORT.load(Ordering::Relaxed) as u16
+    REMOTE_PORT.load(Ordering::Acquire) as u16
 }
 
 /// Record that a packet was sent.
@@ -223,11 +233,15 @@ pub fn remote_socket() -> i32 {
 }
 
 /// Get remote connection info for status display.
+///
+/// `enabled` and `server_port` use Acquire to pair with the Release
+/// stores in `remote_configure`; counters are Relaxed (statistics with
+/// no synchronisation role).
 pub fn remote_info() -> RemoteInfo {
     RemoteInfo {
-        enabled:      REMOTE_ENABLED.load(Ordering::Relaxed),
+        enabled:      REMOTE_ENABLED.load(Ordering::Acquire),
         server_ip:    *REMOTE_IP.lock(),
-        server_port:  REMOTE_PORT.load(Ordering::Relaxed) as u16,
+        server_port:  REMOTE_PORT.load(Ordering::Acquire) as u16,
         packets_sent: PACKETS_SENT.load(Ordering::Relaxed),
         packets_recv: PACKETS_RECV.load(Ordering::Relaxed),
         connected:    REMOTE_CONNECTED.load(Ordering::Relaxed),

@@ -51,6 +51,17 @@ fn panic(info: &PanicInfo) -> ! {
     robot_os_drivers::uart::puts(task_name);
     robot_os_drivers::uart::puts("\n");
 
+    // ── F11.3: Increment crash counter (boot-loop detection) ────────────
+    let crashes = robot_os_drivers::wdt::crash_counter_increment();
+    robot_os_drivers::uart::puts("[PANIC] Crash counter = ");
+    let mut cbuf = [0u8; 10];
+    robot_os_drivers::uart::puts(fmt_u32(crashes, &mut cbuf));
+    if robot_os_drivers::wdt::crash_counter_is_boot_loop() {
+        robot_os_drivers::uart::puts(" [BOOT LOOP DETECTED — safe mode on next boot]\n");
+    } else {
+        robot_os_drivers::uart::puts("\n");
+    }
+
     // ── Persist crash log to FAT32 (best-effort) ────────────────────────
     write_crash_log(info, hart, task_name);
 

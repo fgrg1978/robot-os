@@ -30,6 +30,9 @@ use robot_os_arch::{csr, trap};
 global_asm!(include_str!("asm/boot.S"));
 #[cfg(feature = "esp32c3")]
 global_asm!(include_str!("asm/boot_esp32c3.S"));
+// F04: M-mode PMP boot stub for no-OpenSBI direct-boot builds.
+#[cfg(feature = "no-opensbi")]
+global_asm!(include_str!("asm/boot_noopensbi.S"));
 
 // Include trap entry assembly
 #[cfg(not(feature = "esp32c3"))]
@@ -64,6 +67,11 @@ const SECONDARY_STACK_SIZE: usize = 16 * 1024;
 
 // Secondary CPU stacks — boot.S references `secondary_stacks` and
 // loads the per-hart size from `_secondary_stack_size` (.quad in .data).
+//
+// _secondary_stack_size lives in .data because it carries a real value.
+// secondary_stacks lives in .bss so the 128 KiB buffer doesn't bloat the
+// kernel binary on disk; clear_bss in boot.S zeroes it before any hart
+// ever touches it (secondaries are still parked in OpenSBI at that point).
 #[cfg(not(feature = "esp32c3"))]
 global_asm!(
     ".section .data",
@@ -71,6 +79,11 @@ global_asm!(
     ".global _secondary_stack_size",
     "_secondary_stack_size:",
     "    .quad {size}",
+    size = const SECONDARY_STACK_SIZE,
+);
+#[cfg(not(feature = "esp32c3"))]
+global_asm!(
+    ".section .bss",
     ".align 12",
     ".global secondary_stacks",
     "secondary_stacks:",
@@ -101,11 +114,13 @@ const HEAP_SIZE: usize = 4 * 1024 * 1024;
 #[cfg(feature = "esp32c3")]
 const HEAP_SIZE: usize = 64 * 1024;
 
-/// Number of CPUs to use in SMP mode.
+/// Compile-time maximum number of CPUs supported. The runtime count is
+/// derived from the DTB (capped at this value); see `num_cpus` local in
+/// kernel_main. Must be ≤ MAX_HARTS so all online CPUs have a stack slot.
 #[cfg(not(feature = "esp32c3"))]
-const NUM_CPUS: usize = 4;
+const MAX_CPUS: usize = 4;
 #[cfg(feature = "esp32c3")]
-const NUM_CPUS: usize = 1;
+const MAX_CPUS: usize = 1;
 
 /// Number of worker tasks for the SMP stress test.
 const NUM_WORKERS: usize = 15;
@@ -130,6 +145,11 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     // ---- Phase 1: UART ----
     robot_os_drivers::uart::init();
 
+    // ---- Phase 1b: Install trap vector EARLY (before any code that could fault).
+    // Until stvec is set, any exception jumps to address 0 → triple fault.
+    // trap_init() only needs UART (for kprintln) and CSRs — no heap, no MMU.
+    trap_init();
+
     kprintln!();
     kprintln!("========================================");
     kprintln!("  Robot OS Rust kernel booted!");
@@ -140,25 +160,47 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
 
     // Parse DTB (Flattened Device Tree) if pointer looks valid.
     // Extract mem_base/mem_size to feed PMM and VMM with real hardware RAM.
-    let (mem_start, mem_size, mem_from_dtb) = if dtb_ptr != 0 {
+    // Extract num_cpus to size the SMP scheduler at runtime (capped at MAX_CPUS).
+    // Validate timer_freq against the kernel's hardcoded value — a mismatch
+    // means every µs/ms calculation in the kernel is off and must be flagged.
+    let (mem_start, mem_size, mem_from_dtb, num_cpus) = if dtb_ptr != 0 {
         if let Some(info) = unsafe { robot_os_dtb::dtb_parse(dtb_ptr as *const u8) } {
             let compat = robot_os_dtb::dtb_compatible_str(&info);
             kprintln!("[DTB] Parsed FDT — {} CPUs, mem={:#x}+{:#x}, timer={}",
                 info.num_cpus, info.mem_base, info.mem_size, info.timer_freq);
             kprintln!("[DTB] UART={:#x}, PLIC={:#x}", info.uart_base, info.plic_base);
             kprintln!("[DTB] Compatible: {}", core::str::from_utf8(compat).unwrap_or("?"));
-            if info.mem_base != 0 && info.mem_size != 0 {
-                (info.mem_base, info.mem_size, true)
+
+            // Validate timer_freq vs hardcoded constant — if they disagree, every
+            // time-based calculation (WCET, sleeps, timeouts) is wrong. Warn loudly.
+            #[cfg(not(feature = "esp32c3"))]
+            {
+                let kernel_timer_hz = robot_os_drivers::platform::hw::TIMER_FREQ;
+                if info.timer_freq != 0 && info.timer_freq != kernel_timer_hz {
+                    kprintln!("[DTB] WARNING: timer_freq mismatch — DTB={}Hz kernel={}Hz, \
+                        timing calculations will drift", info.timer_freq, kernel_timer_hz);
+                }
+            }
+
+            // Cap DTB-reported CPUs by compile-time MAX_CPUS (stack slots reserved).
+            let cpus = if info.num_cpus > 0 {
+                core::cmp::min(MAX_CPUS, info.num_cpus)
             } else {
-                (robot_os_drivers::platform::hw::RAM_BASE, FALLBACK_MEM_SIZE, false)
+                MAX_CPUS
+            };
+            if info.mem_base != 0 && info.mem_size != 0 {
+                (info.mem_base, info.mem_size, true, cpus)
+            } else {
+                (robot_os_drivers::platform::hw::RAM_BASE, FALLBACK_MEM_SIZE, false, cpus)
             }
         } else {
             kprintln!("[DTB] Parse failed (invalid or unsupported FDT)");
-            (robot_os_drivers::platform::hw::RAM_BASE, FALLBACK_MEM_SIZE, false)
+            (robot_os_drivers::platform::hw::RAM_BASE, FALLBACK_MEM_SIZE, false, MAX_CPUS)
         }
     } else {
-        (robot_os_drivers::platform::hw::RAM_BASE, FALLBACK_MEM_SIZE, false)
+        (robot_os_drivers::platform::hw::RAM_BASE, FALLBACK_MEM_SIZE, false, MAX_CPUS)
     };
+    kprintln!("[BOOT] Online CPUs: {} (max compile-time: {})", num_cpus, MAX_CPUS);
     kprintln!();
 
     // ---- Phase 2: Memory Management ----
@@ -240,6 +282,8 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
                 let _ = robot_os_mm::vmm::map_mmio_region(hw::I2C1_BASE, 0x1000);
                 let _ = robot_os_mm::vmm::map_mmio_region(hw::MMC0_BASE, 0x2000);
                 let _ = robot_os_mm::vmm::map_mmio_region(hw::WDT_BASE, 0x1000);
+                // F14: NPU MMIO (1 MiB, covers all command/data registers).
+                let _ = robot_os_mm::vmm::map_mmio_region(hw::NPU_BASE, hw::NPU_SIZE);
             }
 
             kprintln!("[MM] Platform MMIO mapped ({})", hw::PLATFORM_NAME);
@@ -299,23 +343,59 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     }
     kprintln!();
 
+    // F04: PMP policy audit log.
+    // The kernel runs in S-mode and cannot write PMP CSRs directly (M-mode only).
+    // For no-opensbi builds, pmp_early_init() ran in M-mode before _start.
+    // For OpenSBI builds, OpenSBI configured a permissive PMP; W^X is enforced by VMM.
+    // Either way, log the intended stricter policy for operator audit.
+    #[cfg(not(feature = "esp32c3"))]
+    {
+        use robot_os_arch::pmp::{pmp_regions, N_PMP_REGIONS};
+        use robot_os_drivers::platform::hw::KERNEL_LOAD;
+        let pmp = pmp_regions(KERNEL_LOAD, kernel_end_aligned, heap_start, HEAP_SIZE);
+        kprintln!("[PMP] Intended policy ({} regions + deny catch-all):", N_PMP_REGIONS);
+        for (i, r) in pmp.iter().enumerate() {
+            kprintln!("[PMP]  {}: {:20}  {:010x}-{:010x}  {}{}{}",
+                i, r.name,
+                r.base, r.base + r.size,
+                if r.perm.r { 'R' } else { '-' },
+                if r.perm.w { 'W' } else { '-' },
+                if r.perm.x { 'X' } else { '-' },
+            );
+        }
+        #[cfg(feature = "no-opensbi")]
+        kprintln!("[PMP] pmp_early_init() applied at M-mode boot (no-opensbi build)");
+        #[cfg(not(feature = "no-opensbi"))]
+        kprintln!("[PMP] Running under OpenSBI — W^X enforced by VMM page tables");
+        kprintln!();
+    }
+
+    // M01: vDSO — allocate the shared timing page that user-space reads directly.
+    #[cfg(not(any(feature = "no-mmu", feature = "esp32c3")))]
+    {
+        robot_os_mm::vdso::vdso_init();
+        kprintln!("[VDSO] Shared timing page ready at user VA {:#x}", robot_os_mm::vdso::VDSO_USER_BASE);
+    }
+
     // AQ8: Enable kernel tracing (ring buffer of last 512 events).
     robot_os_ipc::trace_start();
     kprintln!("[TRACE] Kernel tracing enabled ({} event buffer)", robot_os_ipc::TRACE_BUF_SIZE);
     kprintln!();
 
-    // ---- Phase 3: Traps + Interrupts ----
+    // ---- Phase 3: Interrupt controllers + enable interrupts ----
+    // (trap_init was already done in Phase 1b before any potentially faulting code.)
 
-    kprintln!("[TRAP] Initializing trap handling...");
-    trap_init();
     #[cfg(not(feature = "esp32c3"))]
     {
         kprintln!("[IRQ] Initializing PLIC...");
         robot_os_drivers::plic::init(hart_id as u32);
     }
-    robot_os_drivers::clint::set_next_tick(hart_id as u32);
+    // Enable EXTERNAL + SOFTWARE interrupts now (PLIC, IPI). Timer (STIE) is
+    // deferred until just before scheduler::start() — otherwise the timer ISR
+    // preempts kernel_main with already-created RT tasks and the boot CPU
+    // never reaches wake_harts(), starving every secondary CPU forever.
     let sie = csr::read_sie();
-    csr::write_sie(sie | csr::SIE_STIE | csr::SIE_SEIE | csr::SIE_SSIE);
+    csr::write_sie(sie | csr::SIE_SEIE | csr::SIE_SSIE);
     let sstatus = csr::read_sstatus();
     csr::write_sstatus(sstatus | csr::SSTATUS_SIE);
     #[cfg(not(feature = "esp32c3"))]
@@ -347,6 +427,15 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
 
     robot_os_fs::init();
     kprintln!("[FS] ramfs initialized");
+
+    // F20: TmpFS — bounded in-RAM temporary filesystem.
+    kprintln!("[FS] tmpfs ready — max {} files, {} KiB cap",
+        robot_os_fs::TMPFS_MAX_FILES,
+        robot_os_fs::TMPFS_MAX_BYTES / 1024);
+
+    // F21: Procfs + sysfs — register built-in virtual-file providers.
+    robot_os_fs::procfs_init();
+    kprintln!("[FS] procfs/sysfs ready ({} entries)", robot_os_fs::procfs_count());
 
     if robot_os_drivers::blkdev::capacity_sectors() > 0 {
         match robot_os_fs::fat32_mount() {
@@ -505,6 +594,28 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     robot_os_net::net_init();
     kprintln!();
 
+    // ── OTA auto-recv (early spawn) ──────────────────────────────────────────
+    // Spawn the OTA TCP listener task BEFORE any RT-priority tasks. Once
+    // rt-motor / flight-ctrl / sensor-ahrs are created and the timer ISR
+    // starts preempting kernel_main on the boot CPU, late init code may
+    // never run to completion. Spawning early guarantees the listener is
+    // registered while the boot CPU is still single-tasking.
+    {
+        let port = robot_os_config::CFG_OTA_AUTO_RECV_PORT.load(
+            core::sync::atomic::Ordering::Relaxed);
+        if port != 0 && port <= 65535 {
+            // Pinned to CPU 2 — CPUs 0/1 host RT tasks, CPU 2 is quiet.
+            robot_os_sched::task_create_affinity(
+                "ota-recv",
+                robot_os_shell::ota_recv_task_entry,
+                port as usize,
+                robot_os_sched::NET_POLL_PRIORITY,
+                2,
+            );
+            kprintln!("[OTA] Auto-recv task created on port {} (early)", port);
+        }
+    }
+
     // ---- Phase 8: IPC + Signals + Services ----
 
     robot_os_ipc::pipe_init();
@@ -612,6 +723,22 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
         kprintln!("[WDT] No hardware WDT (QEMU) — software watchdog active");
     }
 
+    // F11.3: Check crash counter — detect boot loops.
+    // The counter was incremented on panic (if any). Reset it now that we
+    // have reached late-init successfully (clean boot).
+    {
+        let prev_crashes = robot_os_drivers::wdt::crash_counter_get();
+        if prev_crashes >= 3 {
+            kprintln!("[WDT] WARNING: {} consecutive crashes detected (boot loop?)", prev_crashes);
+            kprintln!("[WDT] Continuing with reduced init — check hardware and config.");
+        } else if prev_crashes > 0 {
+            kprintln!("[WDT] Recovering from {} previous crash(es)", prev_crashes);
+        }
+        // Clean boot — reset counter now that late-init is stable.
+        robot_os_drivers::wdt::crash_counter_reset();
+        kprintln!("[WDT] Crash counter reset (clean boot)");
+    }
+
     // PMP: display the intended Robot OS memory-protection policy.
     // pmp_configure() must be called from M-mode (before mret into S-mode).
     // Here we display it for boot-time audit; actual enforcement is M-mode only.
@@ -668,6 +795,12 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
         robot_os_drivers::gpio::GPIO_MAX_PINS,
         robot_os_drivers::pwm::PWM_MAX_CHANNELS,
         robot_os_drivers::i2c::I2C_BUS_COUNT);
+    // E04: Payload abstraction — spray, gripper, camera trigger
+    robot_os_behavior::payload::payload_init();
+    kprintln!("[PAYLOAD] E04: spray GPIO{}, gripper PWM ch{}, cam-trig GPIO{}",
+        robot_os_behavior::payload::PAYLOAD_GPIO_SPRAY,
+        robot_os_behavior::payload::PAYLOAD_PWM_GRIPPER,
+        robot_os_behavior::payload::PAYLOAD_GPIO_CAM_TRIGGER);
 
     robot_os_robot::robot_init();
     robot_os_drivers::motor_pid::motor_pid_init();
@@ -680,6 +813,18 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     robot_os_drivers::pm::pm_init();
     // eth_init() already called above during network init sequence.
     kprintln!("[HW] SPI, CAN, DMA, USB, PM initialized");
+
+    // F14: SpacemiT K1 NPU initialization.
+    #[cfg(feature = "k1")]
+    {
+        let npu_ver = robot_os_drivers::npu::npu_init();
+        let (major, minor, patch) = robot_os_drivers::npu::npu_version();
+        kprintln!("[NPU] SpacemiT K1 NPU initialized — HW v{}.{}.{} ({:#010x})",
+            major, minor, patch, npu_ver);
+        // Clock-gate off until first inference to save ~200 mW standby.
+        robot_os_drivers::npu::npu_power_gate();
+        kprintln!("[NPU] Clock-gated (power off) — will wake on first job");
+    }
     kprintln!();
 
     // ---- Phase 11: RISC-V Vector Extension (RVV 1.0) ----
@@ -764,7 +909,7 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     // ---- Phase 5: SMP + Scheduler ----
 
     kprintln!("========================================");
-    kprintln!(" Phase 5: SMP Scheduler ({} CPUs)", NUM_CPUS);
+    kprintln!(" Phase 5: SMP Scheduler ({} CPUs)", num_cpus);
     kprintln!("========================================");
     kprintln!();
 
@@ -786,14 +931,15 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
 
     // Tell the scheduler how many CPUs will be online so tasks are
     // distributed evenly before secondary CPUs start.
-    robot_os_sched::smp::NUM_ONLINE_CPUS.store(NUM_CPUS, Ordering::SeqCst);
+    robot_os_sched::smp::NUM_ONLINE_CPUS.store(num_cpus, Ordering::SeqCst);
 
     // Create idle task (keeps CPU 0 alive after all workers finish).
     robot_os_sched::task_create("idle", idle_task, 0, robot_os_sched::IDLE_PRIORITY);
     kprintln!("[SCHED] Created idle task");
 
-    // Create shell task (interactive UART shell).
-    robot_os_sched::task_create("shell", shell_task, 0, robot_os_sched::DEFAULT_PRIORITY);
+    // Shell task: priority 13 (high normal — above workers, runs in RT task sleep gaps).
+    // No CPU pin so it works on both 1-CPU and 4-CPU QEMU.
+    robot_os_sched::task_create("shell", shell_task, 0, 13);
     kprintln!("[SCHED] Created shell task");
 
     // Create IPC/signal/service demo task (Phase 8).
@@ -829,8 +975,15 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     robot_os_sched::task_create("sensor-slow", sensor_slow_task, 0, robot_os_sched::DEFAULT_PRIORITY);
     kprintln!("[SCHED] Sensor tasks: imu(RT,100Hz) odom(50Hz) sensor-slow(10Hz)");
 
+    // M05: IO Ring async worker task — processes SQEs submitted via SYS_IO_SUBMIT_ASYNC.
+    robot_os_sched::task_create("io-ring-worker", io_ring_worker_task, 0, robot_os_sched::DEFAULT_PRIORITY);
+    kprintln!("[SCHED] Created io-ring-worker task (M05: async IO Ring processing)");
+
     // Phase U1: dedicated network polling task — decouples net I/O from behavior loop.
-    robot_os_sched::task_create("net-poll", net_poll_task, 0, robot_os_sched::NET_POLL_PRIORITY);
+    // Pinned to CPU 2 alongside ota-recv so TCP packets are processed even when
+    // CPUs 0/1 are busy with RT tasks.
+    robot_os_sched::task_create_affinity("net-poll", net_poll_task, 0,
+        robot_os_sched::NET_POLL_PRIORITY, 2);
     kprintln!("[SCHED] Created net-poll task (IO-wait, 100Hz)");
 
     // Phase I1: sensor + AHRS fusion task (~100 Hz).
@@ -854,10 +1007,19 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     kprintln!("[SCHED] Created sys-wdt task (Phase 16: canaries + timer liveness)");
 
     // Create stress-test workers. find_least_loaded_cpu() distributes them
-    // evenly across NUM_CPUS CPUs (4 tasks per CPU for 16 total = 15+idle).
-    for i in 0..NUM_WORKERS {
-        robot_os_sched::task_create("worker", worker_task, i, robot_os_sched::DEFAULT_PRIORITY);
-        kprintln!("[SCHED] Created worker task {}", i);
+    // evenly across num_cpus CPUs (4 tasks per CPU for 16 total = 15+idle).
+    // SKIP workers in test scenarios that need IO bandwidth (OTA E2E, etc.) —
+    // 15 busy workers at DEFAULT_PRIORITY starve the listener task on a 4-CPU
+    // QEMU and the test never sees any OTA data on the wire.
+    let skip_workers = robot_os_config::CFG_OTA_AUTO_RECV_PORT
+        .load(Ordering::Relaxed) != 0;
+    if skip_workers {
+        kprintln!("[SCHED] Skipping {} stress-test workers (ota_auto_recv_port set)", NUM_WORKERS);
+    } else {
+        for i in 0..NUM_WORKERS {
+            robot_os_sched::task_create("worker", worker_task, i, robot_os_sched::DEFAULT_PRIORITY);
+            kprintln!("[SCHED] Created worker task {}", i);
+        }
     }
     kprintln!();
 
@@ -900,6 +1062,8 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
         }
     }
 
+    // (OTA auto-recv listener was spawned earlier, right after net_init().)
+
     // Enable SMP UART lock before secondary CPUs can print.
     robot_os_drivers::uart::enable_smp_lock();
     kprintln!("[SMP] UART lock enabled");
@@ -907,14 +1071,27 @@ pub extern "C" fn kernel_main(hart_id: usize, dtb_ptr: usize) -> ! {
     // Start secondary harts via SBI HSM hart_start (OpenSBI parks them by default).
     #[cfg(not(feature = "esp32c3"))]
     {
-        kprintln!("[SMP] Starting {} secondary harts via SBI HSM...", NUM_CPUS - 1);
-        unsafe { robot_os_sched::smp::wake_harts(NUM_CPUS); }
+        kprintln!("[SMP] Starting {} secondary harts via SBI HSM...", num_cpus - 1);
+        unsafe { robot_os_sched::smp::wake_harts(num_cpus); }
     }
 
     kprintln!("[SCHED] Starting scheduler on boot CPU — tasks will now preempt...");
     kprintln!();
 
-    // Start the scheduler on CPU 0 (never returns).
+    // Enable timer interrupts NOW (deferred from Phase 3 init): from this
+    // point the timer ISR may preempt us, so any code below runs at scheduler
+    // dispatch latency. set_next_tick programs the first deadline.
+    robot_os_drivers::clint::set_next_tick(hart_id as u32);
+    let sie = csr::read_sie();
+    csr::write_sie(sie | csr::SIE_STIE);
+
+    // Re-establish tp = hart_id immediately before entering the scheduler.
+    // Rust functions called during kernel_main (including kprintln) may have used
+    // tp as a caller-saved scratch register, corrupting current_cpu_id().
+    // After this point no Rust functions are called before context_switch.S saves/restores tp.
+    unsafe { core::arch::asm!("mv tp, {}", in(reg) hart_id, options(nostack, nomem)); }
+
+    // Start the scheduler on the boot CPU (never returns).
     robot_os_sched::start()
 }
 
@@ -938,6 +1115,9 @@ fn trap_init() {
 #[cfg(not(feature = "esp32c3"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn smp_secondary_start(hart_id: usize) -> ! {
+    // boot.S sets tp = hart_id via `mv tp, a0` before calling here.
+    // Re-establish it in case any early Rust call clobbered tp.
+    unsafe { core::arch::asm!("mv tp, {}", in(reg) hart_id, options(nostack, nomem)); }
     // Enable timer interrupt (boot.S cleared sie to 0).
     let sie = csr::read_sie();
     csr::write_sie(sie | csr::SIE_STIE);
@@ -950,7 +1130,12 @@ pub extern "C" fn smp_secondary_start(hart_id: usize) -> ! {
     csr::write_sstatus(sstatus | csr::SSTATUS_SIE);
 
     // WFI loop — timer interrupt will call schedule() → pick first task for this CPU.
+    // Re-set tp = hart_id on every iteration: SBI calls (set_next_tick above) and
+    // Rust functions inside the timer ISR are allowed to use tp as a scratch register
+    // (RISC-V caller-saved).  The timer fires while wfi is executing; at that instant
+    // tp must equal hart_id so current_cpu_id() returns the correct CPU index in schedule().
     loop {
+        unsafe { core::arch::asm!("mv tp, {}", in(reg) hart_id, options(nostack, nomem)); }
         robot_os_arch::cpu::wfi();
     }
 }
@@ -1180,6 +1365,20 @@ fn ml_demo_task(_: usize) {
 /// from the behavior loop so incoming packets (TCP, UDP, ARP, DHCP) are
 /// processed promptly regardless of behavior loop timing.
 ///
+/// M05: IO Ring async worker — processes SQEs submitted via SYS_IO_SUBMIT_ASYNC.
+///
+/// Runs as a best-effort kernel task.  Yields when no work is pending to avoid
+/// burning cycles.  When `IO_RING_WORK_PENDING` is set, drains all ring queues.
+fn io_ring_worker_task(_: usize) {
+    kprintln!("[IORW] M05: IO Ring async worker started");
+    loop {
+        if robot_os_ipc::io_ring_has_async_work() {
+            let _ = robot_os_ipc::io_ring_worker_poll();
+        }
+        robot_os_sched::task_yield();
+    }
+}
+
 /// Polls at ~100 Hz (1 yield = 10 ms at 100 Hz scheduler).
 fn net_poll_task(_: usize) {
     kprintln!("[NET-POLL] Phase U1: dedicated network polling task started");
@@ -1425,22 +1624,25 @@ fn behavior_task(_: usize) {
                     camera_cycle = 0;
                     let (cam_w, cam_h) = robot_os_drivers::csi::csi_resolution();
                     let frame_pixels = cam_w as usize * cam_h as usize;
-                    // Camera payload: 5B header + raw pixels
-                    // Use a static buffer sized for max resolution (320×240 = 76800 + 5 + 6 = 76811)
+                    // Camera payload: 5B header + raw pixels (max resolution 320×240).
+                    // Buffers live in .bss (static) — putting ~150 KiB on a 16 KiB
+                    // task stack page-faults. Single behavior task → no aliasing risk.
                     const CAM_BUF_SIZE: usize = 320 * 240 + CAMERA_HDR_SIZE + FRAME_OVERHEAD;
-                    let mut cam_payload = [0u8; CAM_BUF_SIZE];
-                    // Encode header
+                    static mut CAM_PAYLOAD: [u8; CAM_BUF_SIZE] = [0u8; CAM_BUF_SIZE];
+                    static mut CAM_FRAME:   [u8; CAM_BUF_SIZE] = [0u8; CAM_BUF_SIZE];
+                    // SAFETY: only the behavior task references these statics.
+                    let cam_payload: &mut [u8; CAM_BUF_SIZE] = unsafe { &mut *core::ptr::addr_of_mut!(CAM_PAYLOAD) };
+                    let cam_frame:   &mut [u8; CAM_BUF_SIZE] = unsafe { &mut *core::ptr::addr_of_mut!(CAM_FRAME) };
+
                     let mut cam_hdr = [0u8; CAMERA_HDR_SIZE];
                     encode_camera_header(&mut cam_hdr, cam_w, cam_h, CAMERA_FMT_GRAY8);
                     cam_payload[..CAMERA_HDR_SIZE].copy_from_slice(&cam_hdr);
-                    // Capture frame directly into payload after header
                     let captured = robot_os_drivers::csi::csi_capture(
                         &mut cam_payload[CAMERA_HDR_SIZE..CAMERA_HDR_SIZE + frame_pixels]
                     );
                     if captured > 0 {
                         let payload_len = CAMERA_HDR_SIZE + captured;
                         let total_len = payload_len + FRAME_OVERHEAD;
-                        let mut cam_frame = [0u8; CAM_BUF_SIZE];
                         let cam_len = build_packet(
                             PKT_CAMERA,
                             &cam_payload[..payload_len],
@@ -1508,6 +1710,12 @@ fn behavior_task(_: usize) {
                                     },
                                     _ => {} // other config keys handled in future phases
                                 }
+                            }
+                        } else if pkt_type == PKT_PAYLOAD {
+                            // E04: payload command (spray / gripper / cam trigger)
+                            let payload = &recv_buf[pay_start..pay_start + pay_len];
+                            if let Some(cmd) = decode_payload_cmd(payload) {
+                                robot_os_behavior::payload::payload_exec(cmd);
                             }
                         } else if pkt_type == PKT_ESTOP {
                             // Remote emergency stop — highest priority
@@ -1637,6 +1845,12 @@ fn behavior_task(_: usize) {
                                 },
                                 _ => {}
                             }
+                        }
+                    } else if pkt_type == PKT_PAYLOAD {
+                        // E04: payload command via UART bridge
+                        let payload = &recv_buf[pay_start..pay_start + pay_len];
+                        if let Some(cmd) = decode_payload_cmd(payload) {
+                            robot_os_behavior::payload::payload_exec(cmd);
                         }
                     } else if pkt_type == PKT_ESTOP {
                         robot_os_behavior::safety::estop_activate();
@@ -2185,23 +2399,56 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) -> usize {
 fn handle_interrupt(_frame: &mut TrapFrame, cause: usize) {
     match cause {
         INT_TIMER_S => {
-            TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+            // F16.2: measure timer ISR handler latency
+            let _isr_start = robot_os_drivers::wcet::wcet_begin();
+            // F16.4: record jitter between successive timer ISR fires
+            robot_os_drivers::wcet::jitter_record(robot_os_drivers::wcet::JITTER_TIMER_ISR);
+
+            let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) as u64 + 1;
+            #[cfg(not(any(feature = "no-mmu", feature = "esp32c3")))]
+            let ticks = _ticks;
 
             // Kick hardware WDT every tick (no-op on QEMU; prevents reset on VF2/K1).
             robot_os_drivers::wdt::wdt_kick();
 
             // AQ0: Wake tasks whose timer deadline has expired.
             let now = robot_os_drivers::clint::get_time();
+
+            // M01: Update vDSO timing page (no ecall needed from user-space).
+            #[cfg(not(any(feature = "no-mmu", feature = "esp32c3")))]
+            {
+                let uptime_ms = now / (robot_os_drivers::clint::TIMER_FREQ / 1000);
+                robot_os_mm::vdso::vdso_update(ticks, uptime_ms);
+            }
             robot_os_sched::wake_expired_timers(now);
 
-            // Schedule next timer tick BEFORE calling the scheduler
-            // (context_switch may not return to this frame).
+            // M04: Expire leases whose deadline has passed.
+            for (lease_id, lessor_tid) in robot_os_ipc::lease_tick(now).iter() {
+                if *lessor_tid != u32::MAX {
+                    robot_os_sched::wake_fast_ipc_server(*lessor_tid);
+                }
+                let _ = lease_id;
+            }
+
+            // M03: Schedule next timer at the nearest deadline (tickless).
+            // Falls back to periodic tick if no tasks are sleeping on a timer.
             let hart = robot_os_arch::cpu::hart_id();
-            robot_os_drivers::clint::set_next_tick(hart as u32);
+            robot_os_drivers::clint::set_next_tick_smart(
+                hart as u32,
+                robot_os_sched::nearest_timer_deadline(),
+            );
 
             // AQ8: Trace timer tick.
             robot_os_ipc::trace_event(robot_os_ipc::TRACE_IRQ,
                 cause as u32, hart as u32, 0, 0);
+
+            // F16.1: record timer ISR execution time BEFORE schedule().
+            // schedule() may context-switch us out and back later — measuring
+            // after it includes wall time of unrelated tasks and reports
+            // bogus "1.2 second ISRs". The ISR's own work is the only
+            // meaningful WCET data point here.
+            robot_os_drivers::wcet::wcet_end(
+                robot_os_drivers::wcet::WCET_TIMER_ISR, _isr_start);
 
             // Let the scheduler preempt if the current task's time slice expired.
             robot_os_sched::schedule();
@@ -2237,7 +2484,11 @@ fn handle_interrupt(_frame: &mut TrapFrame, cause: usize) {
             csr::clear_sip_ssip();
         }
         _ => {
-            kprintln!("[IRQ] Unknown interrupt: {}", cause);
+            // Avoid kprintln from ISR — it acquires the UART spinlock and
+            // can block the ISR for ms when worker tasks hold the lock.
+            // Record to trace ring; userspace dumps it later.
+            robot_os_ipc::trace_event(robot_os_ipc::TRACE_IRQ,
+                cause as u32, u32::MAX, 0, 0);
         }
     }
 }

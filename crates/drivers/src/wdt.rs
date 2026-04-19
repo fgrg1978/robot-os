@@ -150,3 +150,46 @@ pub fn wdt_counter() -> u32 {
 
 #[cfg(not(any(feature = "vf2", feature = "k1")))]
 pub fn wdt_counter() -> u32 { 0 }
+
+// ── F11.3: Crash counter (persistent boot-loop detection) ────────────────────
+//
+// The crash counter lives in the kernel's in-memory config (AtomicU32).
+// It is incremented on panic and decremented (to zero) on clean boot.
+// When it reaches CRASH_BOOT_LOOP_THRESHOLD successive crashes, the kernel
+// enters "safe mode" (minimal init, no drivers, shell only) to prevent
+// hardware damage from a driver that is repeatedly crashing on boot.
+//
+// The counter is preserved across soft-reboots because it lives in a
+// well-known config key that the config crate saves to FAT32 on every write.
+// On hard power-cycle it resets to 0 (this is expected and correct).
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// In-memory crash counter — incremented on panic, reset on clean boot.
+pub static CRASH_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Number of consecutive crashes that trigger safe mode.
+const CRASH_BOOT_LOOP_THRESHOLD: u32 = 3;
+
+/// Increment the crash counter. Called from the panic handler.
+///
+/// Returns the new counter value. If it equals or exceeds
+/// `CRASH_BOOT_LOOP_THRESHOLD`, the caller should enter safe mode.
+pub fn crash_counter_increment() -> u32 {
+    CRASH_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Reset the crash counter. Called after successful late-init (clean boot).
+pub fn crash_counter_reset() {
+    CRASH_COUNTER.store(0, Ordering::Relaxed);
+}
+
+/// Read the current crash counter value.
+pub fn crash_counter_get() -> u32 {
+    CRASH_COUNTER.load(Ordering::Relaxed)
+}
+
+/// Returns true if the boot-loop threshold has been reached.
+pub fn crash_counter_is_boot_loop() -> bool {
+    CRASH_COUNTER.load(Ordering::Relaxed) >= CRASH_BOOT_LOOP_THRESHOLD
+}

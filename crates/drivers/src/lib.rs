@@ -98,3 +98,16 @@ pub mod lidar;
 
 // INA219 I2C current/voltage sensor — battery monitoring, sag detection.
 pub mod ina219;
+
+// SpacemiT K1 NPU (Neural Processing Unit) — ~2 TOPS INT8 inference engine.
+// F14: compiled for all builds; MMIO-mapped only on k1 feature.
+pub mod npu;
+
+// Optical flow sensor driver (F26): PMW3901 / PAA5100JE via SPI.
+// Used for velocity estimation on drones and slip detection on wheeled robots.
+#[allow(dead_code)]
+pub mod optical_flow;
+
+// F16: WCET (Worst-Case Execution Time) instrumentation — cycle-accurate
+// timing using rdcycle CSR + atomic statistics per named measurement point.
+pub mod wcet;

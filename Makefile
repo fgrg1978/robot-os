@@ -70,11 +70,11 @@ ESP32C3_RUSTFLAGS := -C link-arg=-T$(ESP32C3_LINKER)
 all: build
 
 build:
-	$(CARGO) build $(CARGO_FLAGS)
+	$(CARGO) build $(CARGO_FLAGS) --features qemu
 
 # Build kernel with RVV 1.0 support (requires QEMU with -cpu rv64,v=true).
 build-rvv:
-	$(CARGO) build $(CARGO_FLAGS) --features rvv
+	$(CARGO) build $(CARGO_FLAGS) --features rvv,qemu
 
 # Build the minimal hello.elf user-space test binary.
 userspace: $(HELLO_ELF) $(SYSTEST_ELF)

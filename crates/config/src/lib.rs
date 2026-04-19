@@ -104,6 +104,10 @@ pub static CFG_PANIC_REBOOT_DELAY_MS: AtomicU32 = AtomicU32::new(0);
 /// Runtime: GPIO pin for hardware kill-switch (255 = disabled).
 pub static CFG_ESTOP_GPIO_PIN: AtomicU32 = AtomicU32::new(255);
 
+/// Runtime: if non-zero, kernel spawns an OTA listener on this port at boot
+/// (without needing a shell command).  0 = disabled.
+pub static CFG_OTA_AUTO_RECV_PORT: AtomicU32 = AtomicU32::new(0);
+
 /// Unpack an IP from packed u32 to `[u8; 4]`.
 pub fn unpack_ip(packed: u32) -> [u8; 4] {
     [
@@ -173,6 +177,9 @@ pub fn cfg_apply() {
     // Panic + safety
     CFG_PANIC_REBOOT_DELAY_MS.store(cfg_get_u32(b"panic_reboot_ms", 0), Ordering::Release);
     CFG_ESTOP_GPIO_PIN.store(cfg_get_u32(b"estop_gpio_pin", 255), Ordering::Release);
+
+    // OTA auto-recv (0 = disabled)
+    CFG_OTA_AUTO_RECV_PORT.store(cfg_get_u32(b"ota_auto_recv_port", 0), Ordering::Release);
 }
 
 /// Parse "a.b.c.d" into packed u32 `(a<<24)|(b<<16)|(c<<8)|d`.

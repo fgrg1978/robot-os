@@ -29,6 +29,20 @@ pub const SYS_IPC_REPLY:   u64 = 104;
 pub const SYS_IPC_SHARE:   u64 = 105;
 pub const SYS_IPC_UNSHARE: u64 = 106;
 pub const SYS_IPC_DESTROY: u64 = 107;
+/// Map a shared memory region (created by SYS_IPC_SHARE) into the calling
+/// process's address space.  a0 = shm_id → returns VA base or -1.
+pub const SYS_IPC_MAP:     u64 = 115;
+
+// Fast-path IPC (M02): register-passing, ≤32 bytes, zero-copy
+pub const SYS_IPC_FAST_CALL:   u64 = 108; // client: a0=server_tid, a1..a4=data words
+pub const SYS_IPC_FAST_REPLY:  u64 = 109; // server: a0=slot_idx, a1..a4=reply words
+pub const SYS_IPC_FAST_ACCEPT: u64 = 110; // server: blocks until FAST_CALL arrives
+
+// Lease-based IPC (M04): zero-copy large transfer via SHM time-bounded grant
+pub const SYS_IPC_LEASE_GRANT:  u64 = 111; // a0=shm_id, a1=lessee_tid, a2=expire_ticks (0=∞)
+pub const SYS_IPC_LEASE_ACCEPT: u64 = 112; // a0=lessor_tid → returns lease_id,shm_id
+pub const SYS_IPC_LEASE_RETURN: u64 = 113; // a0=lease_id
+pub const SYS_IPC_LEASE_FREE:   u64 = 114; // a0=lease_id (lessor cleanup)
 
 // GPIO
 pub const SYS_GPIO_READ:   u64 = 200;
@@ -167,6 +181,14 @@ pub const SYS_GETPEERNAME: u64 = 381;
 pub const SYS_BRK:    u64 = 400;
 pub const SYS_MMAP:   u64 = 401;
 pub const SYS_MUNMAP: u64 = 402;
+// E11 / AQ9 — explicit Copy-on-Write fork.  Semantically identical to
+// SYS_FORK today (SYS_FORK already uses fork_cow under the hood), but
+// exposed separately so userspace can opt-in or probe for COW support.
+pub const SYS_FORK_COW: u64 = 403;
+// E11 / AQ10 — reserve a virtual range without allocating physical pages.
+// a0 = size in bytes; returns base VA or -1.  Pages materialize on first
+// access via the demand-paging fault handler.
+pub const SYS_ALLOC_DEMAND: u64 = 404;
 
 // ADC
 pub const SYS_ADC_READ: u64 = 410;
@@ -179,10 +201,11 @@ pub const SYS_BUZZER_OFF:  u64 = 421;
 /// Activate syscall filter for current task (one-way — cannot be disabled).
 pub const SYS_SECCOMP: u64 = 430;
 
-// IO Ring (AQ1)
-pub const SYS_IO_SETUP:  u64 = 503;
-pub const SYS_IO_SUBMIT: u64 = 504;
-pub const SYS_IO_WAIT:   u64 = 505;
+// IO Ring (AQ1 + M05)
+pub const SYS_IO_SETUP:        u64 = 503;
+pub const SYS_IO_SUBMIT:       u64 = 504; // synchronous: process SQEs in syscall
+pub const SYS_IO_WAIT:         u64 = 505;
+pub const SYS_IO_SUBMIT_ASYNC: u64 = 519; // M05: non-blocking submit, worker processes
 
 // Channels (AQ1)
 pub const SYS_CHAN_CREATE: u64 = 506;
@@ -216,3 +239,13 @@ pub const SYS_SERVICE_LIST:       u64 = 394;
 pub const SYS_SERVICE_INFO:       u64 = 395;
 pub const SYS_SERVICE_START:      u64 = 396;
 pub const SYS_SERVICE_STOP:       u64 = 397;
+
+// E11.AQ3 — userspace driver framework (520+ — above existing handle/port range).
+pub const SYS_DRIVER_REGISTER:    u64 = 520;
+pub const SYS_DRIVER_UNREGISTER:  u64 = 521;
+pub const SYS_DRIVER_POLL_EVENT:  u64 = 522;
+pub const SYS_DRIVER_FETCH_REQ:   u64 = 523;
+pub const SYS_DRIVER_REPLY:       u64 = 524;
+pub const SYS_DRIVER_REQUEST:     u64 = 525;
+pub const SYS_DRIVER_TRY_REPLY:   u64 = 526;
+pub const SYS_DRIVER_STATS:       u64 = 527;

@@ -16,13 +16,35 @@ pub mod layers;
 pub mod arbiter;
 pub mod remote;
 pub mod brain_protocol;
+pub mod auth_envelope;
 pub mod offline;
 pub mod safety;
 pub mod balance;
 pub mod sensor_bus;
+pub mod skill_profile;
+pub mod world_state;
+pub mod habit;
+pub mod payload;
+pub mod logger;
 
 // Re-export public API
 pub use types::*;
+pub use skill_profile::{
+    SkillId, SkillProfile, SKILL_PROFILES, MAX_SKILLS,
+    CPU_BUDGET_TOTAL, SKILL_MAX_CPU_UNITS,
+    skill_admit, skill_start, skill_end, skill_profile,
+    skill_set_battery_pct, skill_battery_pct, skill_budget_info,
+};
+
+pub use world_state::{
+    WorldState, WorldSnapshot, WORLD_STATE,
+    world_state_read, world_state_write_begin, world_state_write_end,
+};
+
+pub use habit::{
+    Habit, HabitTrigger, HABIT_PROMOTE_THRESHOLD, MAX_HABITS, HABIT_MAX_SEQ,
+    habit_record, habit_match, habit_prune, habit_stats,
+};
 pub use arbiter::{
     arbitrate, layer_set_enabled, layer_is_enabled, last_winner,
     layer_statuses, LAYER_NAMES,
@@ -45,7 +67,7 @@ pub use brain_protocol::{
     ActuatorCmd as BrainActuatorCmd,
     ModeCmd, WaypointCmd, ConfigCmd,
     PKT_SENSOR, PKT_CAMERA, PKT_STATUS, PKT_OTA_ACK,
-    PKT_ACTUATOR, PKT_MODE, PKT_WAYPOINT, PKT_CONFIG,
+    PKT_ACTUATOR, PKT_MODE, PKT_WAYPOINT, PKT_CONFIG, PKT_PAYLOAD,
     PKT_OTA_BEGIN, PKT_OTA_CHUNK, PKT_OTA_END, PKT_ESTOP,
     ESTOP_REASON_OPERATOR, ESTOP_REASON_SAFETY, ESTOP_REASON_GEOFENCE,
     OTA_ACK_OK, OTA_ACK_ERROR,
@@ -54,6 +76,10 @@ pub use brain_protocol::{
     CAMERA_HDR_SIZE, CAMERA_FMT_GRAY8, CAMERA_FMT_JPEG,
     SENSOR_PAYLOAD_SIZE, STATUS_PAYLOAD_SIZE,
     MODE_PAYLOAD_SIZE, WAYPOINT_PAYLOAD_SIZE, CONFIG_PAYLOAD_SIZE,
+    PAYLOAD_PAYLOAD_SIZE, PayloadCmd,
+    decode_payload_cmd,
+    PAYLOAD_TYPE_SPRAY, PAYLOAD_TYPE_GRIPPER, PAYLOAD_TYPE_CAM_TRIGGER,
+    PAYLOAD_OFF, PAYLOAD_ON, GRIPPER_OPEN, GRIPPER_CLOSED,
     SENSOR_FRAME_SIZE, STATUS_FRAME_SIZE, FRAME_OVERHEAD,
     // Config keys + values
     CFG_KEY_LED, CFG_KEY_POWER, CFG_KEY_CAMERA, CFG_KEY_WIFI,

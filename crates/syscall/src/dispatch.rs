@@ -97,6 +97,16 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         SYS_SERVICE_UNREGISTER | SYS_SERVICE_LIST |
         SYS_SERVICE_INFO | SYS_SERVICE_START => sys_stub(),
 
+        // E11.AQ3 — userspace driver framework.
+        SYS_DRIVER_REGISTER   => sys_driver_register(a0, a1, a2, a3),
+        SYS_DRIVER_UNREGISTER => sys_driver_unregister(a0),
+        SYS_DRIVER_POLL_EVENT => sys_driver_poll_event(a0, a1),
+        SYS_DRIVER_FETCH_REQ  => sys_driver_fetch_request(a0, a1),
+        SYS_DRIVER_REPLY      => sys_driver_reply(a0, a1),
+        SYS_DRIVER_REQUEST    => sys_driver_request(a0, a1, a2, a3, a4),
+        SYS_DRIVER_TRY_REPLY  => sys_driver_try_reply(a0, a1, a2),
+        SYS_DRIVER_STATS      => sys_driver_stats(a0),
+
         // GPIO
         SYS_GPIO_READ  => sys_gpio_read(a0),
         SYS_GPIO_WRITE => sys_gpio_write(a0, a1),
@@ -127,6 +137,10 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         SYS_BRK    => sys_brk(a0),
         SYS_MMAP   => sys_mmap(a0, a1, a2, a3, a4, _a5),
         SYS_MUNMAP => sys_munmap(a0, a1),
+        // E11/AQ9: explicit COW fork (equivalent to SYS_FORK today).
+        SYS_FORK_COW    => sys_fork_cow(),
+        // E11/AQ10: reserve a virtual range without physical backing.
+        SYS_ALLOC_DEMAND => sys_alloc_demand(a0),
 
         // ADC
         SYS_ADC_READ => sys_adc_read(a0),
@@ -210,6 +224,160 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
             robot_os_ipc::shm_release(a0 as u32);
             0
         }
+        // IPC_MAP (F00.4): map a shared memory region into caller's address space.
+        // a0 = shm_id → returns VA base (user pointer), or -1 on failure.
+        // Increments shm ref_count; caller must IPC_UNSHARE when done.
+        SYS_IPC_MAP => {
+            let shm_id = a0 as u32;
+            // Acquire ref and get page count + perms.
+            match robot_os_ipc::shm_acquire(shm_id) {
+                Some((page_count, perms)) => {
+                    // Collect physical page addresses.
+                    let mut pages = [0usize; robot_os_ipc::MAX_SHM_PAGES];
+                    let mut ok = true;
+                    for i in 0..page_count {
+                        match robot_os_ipc::shm_page_phys(shm_id, i) {
+                            Some(p) => pages[i] = p,
+                            None    => { ok = false; break; }
+                        }
+                    }
+                    if ok {
+                        let rw = perms == robot_os_ipc::ShmPerms::ReadWrite;
+                        match robot_os_sched::process::shm_map_user(&pages[..page_count], rw) {
+                            Some(va) => va as i64,
+                            None     => { robot_os_ipc::shm_release(shm_id); -1 }
+                        }
+                    } else {
+                        robot_os_ipc::shm_release(shm_id);
+                        -1
+                    }
+                }
+                None => -1,
+            }
+        }
+
+        // M02: Fast-path IPC — register-passing, ≤32 bytes, zero-copy.
+
+        // SYS_IPC_FAST_CALL: client side.
+        // a0 = server_tid, a1..a4 = data words (up to 4 × u64 = 32 bytes).
+        // Blocks until server replies.  Returns: d0 in a0 on wake (words in caller context).
+        SYS_IPC_FAST_CALL => {
+            let server_tid = a0 as u32;
+            let caller_tid = robot_os_sched::current_task_tid();
+            let words = [a1 as u64, a2 as u64, a3 as u64, a4 as u64];
+            match robot_os_ipc::fast_ipc_call(caller_tid, server_tid, words) {
+                Some(slot_idx) => {
+                    // Wake server if it is blocked in FAST_ACCEPT.
+                    robot_os_sched::wake_fast_ipc_server(server_tid);
+                    // Block caller until server replies.
+                    robot_os_sched::task_block(
+                        robot_os_sched::WaitReason::FastIpcClient(slot_idx as u32)
+                    );
+                    // After wake: collect reply words.
+                    match robot_os_ipc::fast_ipc_collect(caller_tid) {
+                        Some(reply) => reply[0] as i64, // a0 = first word; rest via frame
+                        None        => -1,
+                    }
+                }
+                None => -1, // no free slots — fall back to channel IPC
+            }
+        }
+
+        // SYS_IPC_FAST_ACCEPT: server side.
+        // Blocks until a client calls FAST_CALL targeting this TID.
+        // Returns caller_tid in a0; data words in a1..a4 (written via TrapFrame by waker).
+        SYS_IPC_FAST_ACCEPT => {
+            let server_tid = robot_os_sched::current_task_tid();
+            // Check if a call is already waiting.
+            match robot_os_ipc::fast_ipc_accept(server_tid) {
+                Some((slot_idx, _caller_tid, _words)) => {
+                    // Return slot_idx as the "handle" for the subsequent FAST_REPLY.
+                    slot_idx as i64
+                }
+                None => {
+                    // No call pending — block until one arrives.
+                    robot_os_sched::task_block(
+                        robot_os_sched::WaitReason::FastIpcServer(server_tid)
+                    );
+                    // After wake: accept the call that just arrived.
+                    match robot_os_ipc::fast_ipc_accept(server_tid) {
+                        Some((slot_idx, _caller_tid, _words)) => slot_idx as i64,
+                        None => -1,
+                    }
+                }
+            }
+        }
+
+        // SYS_IPC_FAST_REPLY: server side.
+        // a0 = slot_idx (from FAST_ACCEPT return value).
+        // a1..a4 = reply data words.
+        // Wakes the client. Returns 0 on success.
+        SYS_IPC_FAST_REPLY => {
+            let slot_idx = a0 as usize;
+            let words = [a1 as u64, a2 as u64, a3 as u64, a4 as u64];
+            match robot_os_ipc::fast_ipc_reply(slot_idx, words) {
+                Some(_caller_tid) => {
+                    robot_os_sched::wake_fast_ipc_client(slot_idx as u32);
+                    0
+                }
+                None => -1,
+            }
+        }
+
+        // M04: Lease-based IPC — zero-copy large transfer via time-bounded SHM grant.
+
+        // SYS_IPC_LEASE_GRANT: lessor grants a SHM region to lessee.
+        // a0=shm_id, a1=lessee_tid, a2=expire_ticks (0=no expiry).
+        // Returns lease_id on success, -1 on error.
+        SYS_IPC_LEASE_GRANT => {
+            let lessor = robot_os_sched::current_task_tid();
+            match robot_os_ipc::lease_grant(a0 as usize, lessor, a1 as u32, a2) {
+                Some(lease_id) => lease_id as i64,
+                None           => -1,
+            }
+        }
+
+        // SYS_IPC_LEASE_ACCEPT: lessee accepts a pending lease from lessor_tid.
+        // a0=lessor_tid. Blocks until a lease arrives.
+        // Returns lease_id (shm_id can be queried separately).
+        SYS_IPC_LEASE_ACCEPT => {
+            let lessee = robot_os_sched::current_task_tid();
+            match robot_os_ipc::lease_accept(lessee) {
+                Some((lease_id, _shm_id)) => lease_id as i64,
+                None => {
+                    // No lease pending — block on a timer (caller should retry).
+                    // Use FastIpcServer wait as a generic "lease wait" reason.
+                    robot_os_sched::task_block(
+                        robot_os_sched::WaitReason::FastIpcServer(lessee)
+                    );
+                    // After wake: try again
+                    match robot_os_ipc::lease_accept(lessee) {
+                        Some((lease_id, _)) => lease_id as i64,
+                        None => -1,
+                    }
+                }
+            }
+        }
+
+        // SYS_IPC_LEASE_RETURN: lessee returns the lease buffer to lessor.
+        // a0=lease_id. Wakes the lessor.
+        SYS_IPC_LEASE_RETURN => {
+            match robot_os_ipc::lease_return(a0 as usize) {
+                Some(lessor_tid) => {
+                    // Wake the lessor (may be blocked in lease_wait_return).
+                    robot_os_sched::wake_fast_ipc_server(lessor_tid);
+                    0
+                }
+                None => -1,
+            }
+        }
+
+        // SYS_IPC_LEASE_FREE: lessor frees the lease entry after reclaiming buffer.
+        // a0=lease_id.
+        SYS_IPC_LEASE_FREE => {
+            robot_os_ipc::lease_free(a0 as usize);
+            0
+        }
 
         // Network
         SYS_NET_INFO   => sys_net_info(),
@@ -239,12 +407,129 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
                 None => -1,
             }
         }
-        SYS_NTP_SYNC ..= SYS_MCAST_JOIN => sys_stub(),  // 267..=269
+        // F05.2: NTP — a0 unused for SYNC; OFFSET returns Unix seconds
+        SYS_NTP_SYNC   => robot_os_net::ntp::ntp_sync() as i64,
+        SYS_NTP_OFFSET => robot_os_net::ntp::ntp_offset() as i64,
+        SYS_MCAST_JOIN => sys_stub(),
         // SYS_SHUTDOWN (270) and SYS_REBOOT (271) handled above
         SYS_MCAST_LEAVE ..= SYS_SECURE_RECV => sys_stub(),  // 272..=276
 
         SYS_FDT_INFO   ..= SYS_FDT_DUMP      => sys_stub(),
-        SYS_DRV_REGISTER ..= SYS_DRV_GET_DEVICE => sys_stub(),
+
+        // ── F06: Driver server syscalls ─────────────────────────────────────
+        // F06.1: SYS_DRV_REGISTER — a0=name_ptr, a1=name_len → drv_id or -1
+        SYS_DRV_REGISTER => {
+            let mut name = [0u8; 32];
+            let name_len = (a1 as usize).min(32);
+            if robot_os_sched::copy_from_user(name.as_mut_ptr(), a0 as usize, name_len) {
+                match robot_os_sched::driver_register(&name[..name_len]) {
+                    Some(id) => id as i64,
+                    None     => -1,
+                }
+            } else { -1 }
+        }
+
+        // F06.1: SYS_DRV_UNREGISTER — a0=drv_id (mark as Stopped)
+        SYS_DRV_UNREGISTER => sys_stub(),
+
+        // F06.2: SYS_DRV_MMAP — a0=drv_id, a1=mmio_idx → user VA or -1
+        #[cfg(target_pointer_width = "64")]
+        SYS_DRV_MMAP => {
+            let drv_id   = a0 as usize;
+            let mmio_idx = a1 as usize;
+            match robot_os_sched::driver_info(drv_id) {
+                Some(info) if mmio_idx < info.mmio_count as usize => {
+                    let region = info.mmio[mmio_idx];
+                    // Map the MMIO region into the calling process's page table.
+                    match robot_os_sched::mmio_map_user(region.base, region.size) {
+                        Some(va) => va as i64,
+                        None     => -1,
+                    }
+                }
+                _ => -1,
+            }
+        }
+
+        #[cfg(target_pointer_width = "32")]
+        SYS_DRV_MMAP => -1,  // No MMU on RV32
+
+        // F06.2: SYS_DRV_MUNMAP — a0=va (stub: full unmap not yet supported)
+        SYS_DRV_MUNMAP => sys_stub(),
+
+        // F06.3: SYS_DRV_IRQ_WAIT — a0=irq_num → blocks until IRQ fires, returns 0
+        SYS_DRV_IRQ_WAIT => {
+            let irq = a0 as u32;
+            robot_os_sched::task_block(robot_os_sched::WaitReason::Irq(irq));
+            0
+        }
+
+        // F06.3: SYS_DRV_IRQ_ACK — a0=irq_num → acknowledge PLIC
+        SYS_DRV_IRQ_ACK => {
+            // PLIC is only present on 64-bit platforms (not ESP32-C3 / no-mmu).
+            #[cfg(target_pointer_width = "64")]
+            {
+                let hart = robot_os_arch::cpu::hart_id() as u32;
+                robot_os_drivers::plic::complete(hart, a0 as u32);
+            }
+            0
+        }
+
+        // F06.4: SYS_DRV_DMA_ALLOC — a0=size_bytes → phys addr or -1
+        // Allocates one physically contiguous page (4 KiB minimum unit).
+        // Drivers requesting larger DMA buffers should call multiple times.
+        SYS_DRV_DMA_ALLOC => {
+            const DMA_MAX_SINGLE_ALLOC: usize = 65536; // 64 KiB = 16 pages
+            let size = a0 as usize;
+            if size == 0 || size > DMA_MAX_SINGLE_ALLOC {
+                -1
+            } else {
+                match robot_os_mm::pmm::alloc_page() {
+                    Ok(phys) => phys.0 as i64,
+                    Err(_)   => -1,
+                }
+            }
+        }
+
+        // F06.4: SYS_DRV_DMA_FREE — a0=phys_addr
+        SYS_DRV_DMA_FREE => {
+            use robot_os_mm::addr::PhysAddr;
+            let _ = robot_os_mm::pmm::free_page(PhysAddr(a0 as usize));
+            0
+        }
+
+        // F06.4: SYS_DRV_DMA_SYNC — a0=phys_addr, a1=size (cache flush — no-op on QEMU)
+        SYS_DRV_DMA_SYNC => {
+            // On VF2/K1 hardware this would issue a RISC-V fence instruction.
+            // QEMU has coherent caches so no action is needed.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            0
+        }
+
+        // F06.5: SYS_DRV_HEARTBEAT — a0=drv_id → 0
+        SYS_DRV_HEARTBEAT => {
+            let now_ms = robot_os_drivers::clint::get_time()
+                / (robot_os_drivers::clint::TIMER_FREQ / 1000);
+            robot_os_sched::driver_heartbeat_with_time(a0 as usize, now_ms);
+            0
+        }
+
+        // F06.6: SYS_DRV_GET_DEVICE — a0=drv_id, a1=out_ptr, a2=out_len → bytes written or -1
+        SYS_DRV_GET_DEVICE => {
+            match robot_os_sched::driver_info(a0 as usize) {
+                Some(info) => {
+                    // Copy driver name to userspace (out_ptr, out_len bytes)
+                    let name_len = info.name.iter().position(|&b| b == 0)
+                        .unwrap_or(info.name.len());
+                    let copy_len = name_len.min(a2 as usize);
+                    if robot_os_sched::copy_to_user(
+                        a1 as usize, info.name.as_ptr(), copy_len)
+                    {
+                        copy_len as i64
+                    } else { -1 }
+                }
+                None => -1,
+            }
+        }
         SYS_ROBOT_INIT ..= SYS_SENSOR_ADD     => sys_stub(),
         SYS_SENSOR_READ => sys_sensor_read(a0, a1, a2),
         SYS_PLATFORM_INFO ..= SYS_PLATFORM_TYPE => sys_stub(),
@@ -280,6 +565,14 @@ pub fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _
         SYS_IO_WAIT => {
             // a0 = ring_id — return number of pending completions.
             robot_os_ipc::io_ring_pending(a0 as u32) as i64
+        }
+
+        // M05: Async IO Ring submit — non-blocking, worker task processes SQEs.
+        // a0 = ring_id (currently unused — worker polls all rings).
+        // Returns 0 immediately; completions appear in CQ when worker runs.
+        SYS_IO_SUBMIT_ASYNC => {
+            robot_os_ipc::io_ring_signal_async();
+            0
         }
 
         // Channels (AQ1)

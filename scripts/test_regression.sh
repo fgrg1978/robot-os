@@ -1,0 +1,15 @@
+#!/bin/zsh
+# Run host-side regression tests.
+# Each module locks down a specific bug previously fixed.
+set -e
+
+REPO="/Users/azor/Library/Mobile Documents/com~apple~CloudDocs/Development/ia/robot-os"
+CARGO="$HOME/.cargo/bin/cargo"
+XCRUN="/usr/bin/xcrun"
+TOOLCHAIN_BIN="/Library/Developer/CommandLineTools/usr/bin"
+
+export PATH="$TOOLCHAIN_BIN:$PATH"
+export SDKROOT="$($XCRUN --show-sdk-path)"
+
+cd "$REPO/crates/regression-tests"
+"$CARGO" +stable test --target aarch64-apple-darwin "$@"

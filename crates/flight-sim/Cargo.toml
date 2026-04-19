@@ -1,0 +1,9 @@
+[package]
+name = "robot_os_flight_sim"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side simulation and unit tests for drone flight algorithms (D07)."
+
+# No workspace deps — pure std Rust so `cargo test -p robot_os_flight_sim`
+# runs on the development machine without the RISC-V toolchain.
+[dependencies]

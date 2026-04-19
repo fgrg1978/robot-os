@@ -3,6 +3,16 @@ resolver = "2"
 exclude = [
     "userspace/brain_client",
     "userspace/reflex",
+    # flight-sim is a host-side (std) test crate — run separately:
+    #   cargo test --target aarch64-apple-darwin -p robot_os_flight_sim
+    # It cannot be a workspace member because the workspace target is riscv64-none-elf.
+    "crates/flight-sim",
+    # ota-tests is a host-side test crate for the pure OTA logic (OT01).
+    # Run with:  cd crates/ota-tests && cargo test
+    "crates/ota-tests",
+    # regression-tests pins specific bug fixes so future refactors can't
+    # silently reintroduce them. Run with:  /bin/zsh scripts/test_regression.sh
+    "crates/regression-tests",
 ]
 members = [
     "kernel",
@@ -36,6 +46,9 @@ members = [
     "crates/ota",
     "crates/pubsub",
     "crates/crypto",
+    "crates/trace",
+    "crates/efi",
+    "crates/driver_server",
 ]
 
 [workspace.dependencies]
@@ -74,6 +87,9 @@ robot_os_nav       = { path = "crates/nav" }
 robot_os_libsys    = { path = "crates/libsys" }
 robot_os_ota       = { path = "crates/ota" }
 robot_os_pubsub    = { path = "crates/pubsub" }
+robot_os_trace     = { path = "crates/trace" }
+robot_os_efi       = { path = "crates/efi" }
+robot_os_driver_server = { path = "crates/driver_server" }
 
 [profile.release]
 opt-level = 2

@@ -47,6 +47,16 @@ pub fn wake_by_rpc(caller_tid: u32) {
     wake_matching(|r| matches!(r, WaitReason::Rpc(tid) if *tid == caller_tid));
 }
 
+/// Wake the server task blocked waiting for a fast IPC call (by server TID).
+pub fn wake_fast_ipc_server(server_tid: u32) {
+    wake_matching(|r| matches!(r, WaitReason::FastIpcServer(tid) if *tid == server_tid));
+}
+
+/// Wake the client task blocked waiting for a fast IPC reply (by slot index).
+pub fn wake_fast_ipc_client(slot_idx: u32) {
+    wake_matching(|r| matches!(r, WaitReason::FastIpcClient(s) if *s == slot_idx));
+}
+
 /// Internal: scan all tasks and wake those matching the predicate.
 fn wake_matching(pred: impl Fn(&WaitReason) -> bool) {
     for i in 0..MAX_TASKS {

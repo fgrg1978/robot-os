@@ -30,6 +30,7 @@
 .equ CTX_S10, 96
 .equ CTX_S11, 104
 .equ CTX_PC,  112
+.equ CTX_TP,  120
 
 # Task struct offset — auto-generated from offset_of!(Task, task_satp)
 .equ TASK_SATP_OFFSET, {task_satp_off}
@@ -58,6 +59,7 @@ save_old_task:
     sd s9,  CTX_S9(a0)
     sd s10, CTX_S10(a0)
     sd s11, CTX_S11(a0)
+    sd tp,  CTX_TP(a0)
 
     # Save PC: when old is rescheduled, execution resumes after this call.
     sd ra,  CTX_PC(a0)
@@ -78,6 +80,7 @@ restore_new_task:
     ld s9,  CTX_S9(a1)
     ld s10, CTX_S10(a1)
     ld s11, CTX_S11(a1)
+    ld tp,  CTX_TP(a1)
 
     # Load PC
     ld t0,  CTX_PC(a1)

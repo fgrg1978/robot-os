@@ -8,3 +8,4 @@ robot_os_channel = { workspace = true }
 robot_os_gps     = { workspace = true }
 robot_os_flight  = { workspace = true }
 robot_os_drivers = { workspace = true }
+robot_os_sync    = { workspace = true }

@@ -202,10 +202,17 @@ struct Walker {
     in_uart: bool,
     /// True when we are inside an interrupt-controller node.
     in_intc: bool,
-    /// #address-cells in the current context (default 2).
+    /// #address-cells in the current context (default 2 at root).
+    /// Stack is indexed by `depth`; index 0 is the implicit pre-root default.
+    /// `/cpus` typically declares `#address-cells=1, #size-cells=0`, which
+    /// must NOT bleed into a sibling `/memory` reg parse — hence per-scope
+    /// tracking.
     address_cells: u32,
-    /// #size-cells in the current context (default 1).
+    /// #size-cells in the current context (default 1 at root).
     size_cells: u32,
+    /// Saved (address_cells, size_cells) per nesting depth, restored on
+    /// FDT_END_NODE. Up to 8 levels deep is plenty for any realistic FDT.
+    cells_stack: [(u32, u32); 8],
 
     /// Depth at which the current "interesting" node was entered,
     /// so we know when we leave it.
@@ -261,8 +268,20 @@ impl Walker {
         self.cursor += align4(name_len + 1);
         self.depth += 1;
 
+        // Push the parent's (address_cells, size_cells) so any override
+        // in this child node can be popped on FDT_END_NODE without leaking
+        // into siblings (e.g. /cpus declares 1/0, /memory must still see 2/2).
+        if self.depth < self.cells_stack.len() {
+            self.cells_stack[self.depth] = (self.address_cells, self.size_cells);
+        }
+
         // Detect which node we entered.
-        if self.depth == 1 {
+        // NOTE: walk() starts at depth=0; entering the FDT_BEGIN_NODE for the
+        // (anonymous) root takes depth → 1. Root's direct children are
+        // therefore at depth 2 (not 1, as an earlier version assumed —
+        // that mistake silently zeroed `mem_base`, `num_cpus`, `timer_freq`
+        // because /memory and /cpus were never recognised).
+        if self.depth == 2 {
             // Root-level children.
             if streq(self.base, name_off, b"memory")
                 || starts_with(self.base, name_off, b"memory@")
@@ -273,7 +292,7 @@ impl Walker {
             }
         }
 
-        if self.depth == 2 && self.in_cpus {
+        if self.depth == 3 && self.in_cpus {
             if starts_with(self.base, name_off, b"cpu@") {
                 self.in_cpu_child = true;
                 self.info.num_cpus += 1;
@@ -302,11 +321,13 @@ impl Walker {
     }
 
     unsafe fn handle_end_node(&mut self) {
-        if self.depth == 1 {
+        // Mirrors the depth correction in handle_begin_node: root children
+        // live at depth 2, /cpus/cpu@N at depth 3.
+        if self.depth == 2 {
             self.in_memory = false;
             self.in_cpus = false;
         }
-        if self.depth == 2 {
+        if self.depth == 3 {
             self.in_cpu_child = false;
         }
         if self.in_uart && self.depth == self.uart_depth {
@@ -314,6 +335,13 @@ impl Walker {
         }
         if self.in_intc && self.depth == self.intc_depth {
             self.in_intc = false;
+        }
+        // Restore parent's (address_cells, size_cells) — critical so a
+        // /cpus override of 1/0 doesn't leak into the sibling /memory parse.
+        if self.depth > 0 && self.depth < self.cells_stack.len() {
+            let (ac, sc) = self.cells_stack[self.depth];
+            self.address_cells = ac;
+            self.size_cells    = sc;
         }
         if self.depth > 0 {
             self.depth -= 1;
@@ -468,6 +496,7 @@ pub unsafe fn dtb_parse(ptr: *const u8) -> Option<DtbInfo> {
         in_intc: false,
         address_cells: 2,
         size_cells: 1,
+        cells_stack: [(2, 1); 8],
         uart_depth: 0,
         intc_depth: 0,
     };

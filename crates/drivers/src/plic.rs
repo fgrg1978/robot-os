@@ -84,12 +84,36 @@ pub fn enable_irq(hart: u32, irq: u32) {
     mmio_write32(addr, current | bit);
 }
 
+/// Disable a specific IRQ for a hart.
+pub fn disable_irq(hart: u32, irq: u32) {
+    if irq == 0 || irq >= MAX_IRQS { return; }
+    let addr = enable_addr(hart, irq);
+    let bit = 1u32 << (irq % 32);
+    let current = mmio_read32(addr);
+    mmio_write32(addr, current & !bit);
+}
+
 /// Claim the highest-priority pending interrupt. Returns 0 if none.
 pub fn claim(hart: u32) -> u32 {
     mmio_read32(claim_addr(hart))
 }
 
 /// Signal completion of interrupt handling.
+///
+/// # SMP safety (CVE-2026-23287 / Linux 7.0 irqchip fix)
+///
+/// Per PLIC spec: "If the completion ID does not match an interrupt source
+/// that is currently enabled for the target, the completion is silently
+/// ignored." On SMP, if another hart disables this IRQ between the `claim`
+/// and this `complete`, the completion is dropped and the IRQ freezes
+/// permanently. Fix: read the hardware enable register and only complete
+/// when the bit is still set.
 pub fn complete(hart: u32, irq: u32) {
-    mmio_write32(claim_addr(hart), irq);
+    if irq == 0 || irq >= MAX_IRQS { return; }
+    let addr = enable_addr(hart, irq);
+    let bit  = 1u32 << (irq % 32);
+    // Re-read enable register from hardware (not a cached software flag).
+    if mmio_read32(addr) & bit != 0 {
+        mmio_write32(claim_addr(hart), irq);
+    }
 }

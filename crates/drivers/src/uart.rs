@@ -55,6 +55,20 @@ pub fn acquire() -> UartGuard {
     UartGuard
 }
 
+/// Try to acquire the UART lock without blocking.
+/// Returns `None` if the lock is already held (e.g. called from ISR context).
+pub fn try_acquire() -> Option<UartGuard> {
+    if SMP_ACTIVE.load(Ordering::Relaxed) {
+        if UART_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+    }
+    Some(UartGuard)
+}
+
 /// Enable the SMP UART lock.
 pub fn enable_smp_lock() {
     SMP_ACTIVE.store(true, Ordering::SeqCst);

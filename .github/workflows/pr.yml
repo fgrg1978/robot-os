@@ -1,0 +1,49 @@
+# PR / push CI — fast checks only (under 5 minutes).
+# Heavy soak runs nightly (see nightly.yml).
+
+name: pr
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: Builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: 5 configs build clean
+        run: bash scripts/build.sh
+
+  test:
+    name: Host regression + OTA suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Regression
+        run: |
+          cd crates/regression-tests
+          cargo +stable test
+      - name: OTA
+        run: |
+          cd crates/ota-tests
+          cargo +stable test
+
+  clippy:
+    name: clippy on safety crates (SC01.B)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rust-src
+      - name: ota crate clippy
+        run: cargo clippy -p robot_os_ota --release --features qemu -- -D warnings
+      - name: behavior crate clippy
+        run: cargo clippy -p robot_os_behavior --release --features qemu -- -D warnings

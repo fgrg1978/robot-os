@@ -213,6 +213,8 @@ pub fn close(sock: i32) {
 /// Dispatches payload to the correct bound socket's ring buffer.
 /// DNS client port — intercept DNS responses before socket dispatch.
 const DNS_CLIENT_PORT: u16 = 5353;
+/// NTP client source port — intercept NTP responses before socket dispatch.
+const NTP_CLIENT_PORT: u16 = 1123;
 
 pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
     if data.len() < UDP_HDR_SIZE { return; }
@@ -227,10 +229,40 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
         return;
     }
 
+    // F05.2: Intercept NTP responses
+    if dst_port == NTP_CLIENT_PORT {
+        super::ntp::handle_response(payload);
+        return;
+    }
+
     let mut socks = UDP_SOCKETS.lock();
     for i in 0..UDP_MAX_SOCKETS {
         if socks[i].bound && socks[i].local_port == dst_port {
             socks[i].rx.push(*src_ip, src_port, payload);
+            return;
+        }
+    }
+}
+
+/// Receive a UDP-over-IPv6 datagram.
+///
+/// Called from `ipv6::ipv6_rx` when `next_hdr == NEXTHDR_UDP`.
+/// Routes the payload to the matching bound socket (port match only;
+/// IPv6 source address is not yet checked for socket filtering).
+pub fn udpv6_rx(src_ipv6: &[u8; 16], _dst_ipv6: &[u8; 16], data: &[u8]) {
+    if data.len() < UDP_HDR_SIZE { return; }
+    let hdr = unsafe { &*(data.as_ptr() as *const UdpHdr) };
+    let dst_port = u16::from_be_bytes(hdr.dst_port);
+    let src_port = u16::from_be_bytes(hdr.src_port);
+    let payload  = &data[UDP_HDR_SIZE..];
+
+    // Map IPv6 source to a synthetic IPv4 for socket RX (link-local last 4 bytes).
+    let src_ip4: [u8; 4] = [src_ipv6[12], src_ipv6[13], src_ipv6[14], src_ipv6[15]];
+
+    let mut socks = UDP_SOCKETS.lock();
+    for i in 0..UDP_MAX_SOCKETS {
+        if socks[i].bound && socks[i].local_port == dst_port {
+            socks[i].rx.push(src_ip4, src_port, payload);
             return;
         }
     }

@@ -195,6 +195,11 @@ const SYS_PORT_BIND: u64 = 512;
 const SYS_PORT_WAIT: u64 = 513;
 const SYS_PORT_UNBIND: u64 = 514;
 
+// Fast-path IPC (M02)
+const SYS_IPC_FAST_CALL:   u64 = 108;
+const SYS_IPC_FAST_REPLY:  u64 = 109;
+const SYS_IPC_FAST_ACCEPT: u64 = 110;
+
 // Trace (AQ8)
 const SYS_TRACE_DUMP: u64 = 518;
 
@@ -217,6 +222,81 @@ pub fn seccomp(profile_id: u64) -> isize {
 // Platform
 const SYS_PLATFORM_INFO: u64 = 340;
 const SYS_PLATFORM_TYPE: u64 = 341;
+
+// ---------------------------------------------------------------------------
+// M01: vDSO — zero-ecall kernel time queries
+// ---------------------------------------------------------------------------
+
+/// User-space virtual address of the vDSO page (must match mm/vdso.rs).
+const VDSO_USER_BASE: usize = 0x5000_0000;
+
+/// Expected magic value in the vDSO page header.
+const VDSO_MAGIC: u32 = 0x5644_534F;
+
+/// Read the monotonic uptime tick counter from the vDSO page without issuing
+/// an ecall.  Falls back to 0 if the vDSO page is not present or has bad magic.
+///
+/// # Safety
+/// Reads from a read-only page mapped by the kernel into every user process.
+pub fn vdso_uptime_ticks() -> u64 {
+    unsafe { vdso_read_u64(8) } // uptime_ticks at byte offset 8 (after magic+version+seq+_pad)
+}
+
+/// Read the uptime in milliseconds from the vDSO page without issuing an ecall.
+pub fn vdso_uptime_ms() -> u64 {
+    unsafe { vdso_read_u64(24) } // uptime_ms at byte offset 24
+}
+
+/// Read the kernel version from the vDSO page.
+pub fn vdso_kernel_version() -> u32 {
+    unsafe { vdso_read_u32(4) } // kernel_version at byte offset 4
+}
+
+/// Internal seqlock-aware u64 read from vDSO page at given byte offset.
+///
+/// # Safety
+/// `offset` must be within the vDSO page (< 4096).
+#[inline]
+unsafe fn vdso_read_u64(offset: usize) -> u64 {
+    // Verify magic before trusting any data.
+    let magic_ptr = (VDSO_USER_BASE) as *const u32;
+    if core::ptr::read_volatile(magic_ptr) != VDSO_MAGIC {
+        return 0;
+    }
+    // VdsoData layout (matches mm/vdso.rs):
+    //   +0  magic:          u32
+    //   +4  kernel_version: u32
+    //   +8  seq:            u32  (seqlock counter)
+    //   +12 _pad:           u32
+    //   +16 uptime_ticks:   u64
+    //   +24 uptime_ms:      u64
+    let seq_ptr   = (VDSO_USER_BASE + 8)      as *const u32;
+    let data_ptr  = (VDSO_USER_BASE + offset)  as *const u64;
+
+    loop {
+        let seq1 = core::ptr::read_volatile(seq_ptr);
+        if seq1 & 1 != 0 {
+            // Write in progress — spin.
+            core::hint::spin_loop();
+            continue;
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let val = core::ptr::read_volatile(data_ptr);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let seq2 = core::ptr::read_volatile(seq_ptr);
+        if seq1 == seq2 {
+            return val;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Internal u32 read from vDSO page at given byte offset (no seqlock — fields
+/// written once at init time so always consistent).
+#[inline]
+unsafe fn vdso_read_u32(offset: usize) -> u32 {
+    core::ptr::read_volatile((VDSO_USER_BASE + offset) as *const u32)
+}
 
 // ---------------------------------------------------------------------------
 // Well-known file descriptors
@@ -1098,4 +1178,48 @@ pub fn port_unbind(port: u64, source_id: u64) -> isize {
 /// Returns 0 on success or negative on error.
 pub fn trace_dump() -> isize {
     unsafe { syscall0(SYS_TRACE_DUMP) }
+}
+
+// ===========================================================================
+//  Fast-path IPC (M02) — seL4-style register-passing, ≤32 bytes
+// ===========================================================================
+
+/// Maximum number of 64-bit words in a fast IPC message.
+pub const FAST_IPC_MAX_WORDS: usize = 4;
+
+/// Send a fast IPC message to `server_tid` and block until the reply arrives.
+///
+/// `words` contains up to 4 × u64 of request data (≤ 32 bytes).
+/// Returns the reply words on success, or `None` on error (no free slots).
+///
+/// No user-space memory is accessed by the kernel — data travels in registers.
+pub fn fast_ipc_call(server_tid: u32, words: [u64; FAST_IPC_MAX_WORDS]) -> Option<[u64; FAST_IPC_MAX_WORDS]> {
+    let ret = unsafe {
+        syscall5(SYS_IPC_FAST_CALL,
+            server_tid as u64,
+            words[0], words[1], words[2], words[3])
+    };
+    if ret < 0 { return None; }
+    // The kernel deposits reply in the slot; syscall returns words[0].
+    // For simplicity we return the syscall result as word 0.
+    Some([ret as u64, 0, 0, 0])
+}
+
+/// Server: block until a client sends a fast IPC call to this TID.
+///
+/// Returns `Some(slot_idx)` — pass to `fast_ipc_reply()`.
+pub fn fast_ipc_accept() -> Option<usize> {
+    let ret = unsafe { syscall0(SYS_IPC_FAST_ACCEPT) };
+    if ret < 0 { None } else { Some(ret as usize) }
+}
+
+/// Server: reply to a fast IPC call (non-blocking).
+///
+/// `slot_idx` must be the value returned by `fast_ipc_accept()`.
+pub fn fast_ipc_reply(slot_idx: usize, words: [u64; FAST_IPC_MAX_WORDS]) -> isize {
+    unsafe {
+        syscall5(SYS_IPC_FAST_REPLY,
+            slot_idx as u64,
+            words[0], words[1], words[2], words[3])
+    }
 }

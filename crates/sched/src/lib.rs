@@ -20,6 +20,8 @@ pub use scheduler::{
     current_syscall_filter, set_current_syscall_filter,
     set_task_syscall_filter, task_create_filtered,
     task_set_deadline, deadline_admission_check,
+    nearest_timer_deadline,
+    preempt_disable, preempt_enable, preempt_disabled,
 };
 
 #[cfg(not(any(feature = "no-mmu", feature = "esp32c3")))]
@@ -52,13 +54,14 @@ pub use wait::{
     task_block,
     wake_by_irq, wake_by_channel, wake_by_ring, wake_by_port,
     wake_expired_timers, wake_by_rpc,
+    wake_fast_ipc_server, wake_fast_ipc_client,
 };
 
 #[cfg(target_pointer_width = "64")]
 pub use process::{
     exec_user, take_pending_exec, sret_to_user, ExecContext,
     copy_from_user, copy_to_user, copy_cstr_from_user, sys_brk_impl,
-    set_ecall_context, mmio_map_user,
+    set_ecall_context, mmio_map_user, shm_map_user,
 };
 
 // ── RV32 stubs for process functions ────────────────────────────────────────

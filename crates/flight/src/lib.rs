@@ -1,6 +1,6 @@
 #![no_std]
 
-//! Flight controller — mixer, PID, modes (Phases J + K).
+//! Flight controller — mixer, PID, modes (Phases J + K) + drone phases D01-D06.
 //!
 //! Provides the core flight control components for multirotor drones:
 //! - **Mixer**: converts roll/pitch/yaw/throttle commands into per-motor throttle
@@ -14,6 +14,13 @@
 //!
 //! - `CH_FLIGHT_TARGET` — desired attitude/throttle (from RC or server)
 //! - `CH_RC_INPUT`      — raw RC receiver channels
+
+// D01-D06: drone-critical modules
+pub mod ekf;
+pub mod sitl;
+pub mod path3d;
+pub mod terrain;
+pub mod slam;
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use robot_os_channel::Channel;
@@ -124,6 +131,15 @@ pub enum FrameType {
     QuadPlus,
     Hex,
     Octo,
+    // D04: extended configurations
+    /// Tricopter: 2 front motors + 1 rear with servo yaw.
+    Tri,
+    /// Y6: 6-motor Y layout (3 arms, co-axial pairs — top CW, bottom CCW).
+    Y6,
+    /// Hex-X (60° arm offsets, alternating CW/CCW).
+    HexX,
+    /// Co-axial quad (4 arms, 2 motors each: top CW, bottom CCW).
+    Coax,
 }
 
 /// Flight mode.
@@ -332,6 +348,87 @@ pub fn mixer_compute(
             for (i, &(cr, cp, cy)) in corrections.iter().enumerate() {
                 let m = throttle + roll * cr / 1000 + pitch * cp / 1000 + yaw * cy;
                 out.motors[i] = clamp_throttle(m);
+            }
+        }
+        // D04: Tricopter (2 front + 1 rear; yaw via rear servo — approximated here
+        // as yaw authority split across front motors with opposite signs).
+        FrameType::Tri => {
+            out.count = 3;
+            // Motor 1 (front-right, CW): +T -R +P
+            // Motor 2 (front-left, CCW): +T +R +P
+            // Motor 3 (rear, CW/servo): +T -P ; yaw via tilt servo (not modeled)
+            out.motors[0] = clamp_throttle(throttle - roll + pitch - yaw / 2);
+            out.motors[1] = clamp_throttle(throttle + roll + pitch + yaw / 2);
+            out.motors[2] = clamp_throttle(throttle - pitch);
+        }
+
+        // D04: Y6 — 3-arm Y, co-axial pairs.
+        // Arms at 0°(front), 120°(rear-left), 240°(rear-right).
+        // Top motors (CW): M1, M3, M5.  Bottom motors (CCW): M2, M4, M6.
+        // sin(120°)=866/1000, cos(120°)=-500/1000.
+        FrameType::Y6 => {
+            out.count = 6;
+            const S120: i32 = 866;
+            const C120: i32 = -500;
+            // Arm force contributions (×1000 normalized):
+            // Front arm:     roll_factor=0,     pitch_factor=1000
+            // Rear-left arm: roll_factor=-S120, pitch_factor=C120
+            // Rear-right arm:roll_factor=+S120, pitch_factor=C120
+            let t = throttle / 2; // split evenly across top+bottom per arm
+            // Front top/bottom:
+            out.motors[0] = clamp_throttle(t + pitch - yaw); // front top
+            out.motors[1] = clamp_throttle(t + pitch + yaw); // front bottom
+            // Rear-left top/bottom:
+            out.motors[2] = clamp_throttle(t - roll * S120/1000 + pitch * C120/1000 - yaw);
+            out.motors[3] = clamp_throttle(t - roll * S120/1000 + pitch * C120/1000 + yaw);
+            // Rear-right top/bottom:
+            out.motors[4] = clamp_throttle(t + roll * S120/1000 + pitch * C120/1000 - yaw);
+            out.motors[5] = clamp_throttle(t + roll * S120/1000 + pitch * C120/1000 + yaw);
+        }
+
+        // D04: HexX — 6 motors at 30/90/150/210/270/330° (hex-X layout).
+        // Motors alternate CW/CCW starting with CW at 30°.
+        // sin/cos values for 30° multiples (×1000):
+        // 30°: s=500 c=866; 90°: s=1000 c=0; 150°: s=500 c=-866
+        FrameType::HexX => {
+            out.count = 6;
+            // Arm angles (cdeg) for hex-X: 30, 90, 150, 210, 270, 330
+            // Roll contribution: sin(angle), Pitch: cos(angle), Yaw: alternating ±1
+            const ARMS: [(i32, i32, i32); 6] = [
+                ( 500,  866, -1), //  30°: right-front   CW
+                ( 1000, 0,    1), //  90°: right          CCW
+                ( 500, -866, -1), // 150°: right-rear    CW
+                (-500, -866,  1), // 210°: left-rear     CCW
+                (-1000, 0,   -1), // 270°: left           CW
+                (-500,  866,  1), // 330°: left-front    CCW
+            ];
+            for (i, &(sr, cp, cy)) in ARMS.iter().enumerate() {
+                let m = throttle
+                    + roll  * sr / 1000
+                    + pitch * cp / 1000
+                    + yaw   * cy;
+                out.motors[i] = clamp_throttle(m);
+            }
+        }
+
+        // D04: Co-axial quad (X layout, each arm has top CW + bottom CCW).
+        // 4 arms (45°/135°/225°/315°), 2 motors per arm = 8 motors total.
+        FrameType::Coax => {
+            out.count = 8;
+            let s45: i32 = 707;
+            // Arms: FR, FL, RL, RR
+            let arms: [(i32, i32); 4] = [
+                (-s45,  s45), // front-right: -R +P
+                ( s45,  s45), // front-left:  +R +P
+                ( s45, -s45), // rear-left:   +R -P
+                (-s45, -s45), // rear-right:  -R -P
+            ];
+            for (i, &(ar, ap)) in arms.iter().enumerate() {
+                let t = throttle / 2;
+                let m_top = t + roll * ar / 1000 + pitch * ap / 1000 - yaw;
+                let m_bot = t + roll * ar / 1000 + pitch * ap / 1000 + yaw;
+                out.motors[i * 2]     = clamp_throttle(m_top);
+                out.motors[i * 2 + 1] = clamp_throttle(m_bot);
             }
         }
     }

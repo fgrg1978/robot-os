@@ -17,3 +17,4 @@ robot_os_drivers = { workspace = true }
 robot_os_imu = { workspace = true }
 robot_os_gps = { workspace = true }
 robot_os_common = { workspace = true }
+robot_os_driver_server = { workspace = true }

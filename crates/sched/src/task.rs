@@ -95,13 +95,14 @@ pub struct TaskContext {
     pub s10: CtxReg,
     pub s11: CtxReg,
     pub pc:  CtxReg,
+    pub tp:  CtxReg,  // preserved across context switches so current_cpu_id() stays correct
 }
 
-// Compile-time check: TaskContext is 15 fields × register_width
+// Compile-time check: TaskContext is 16 fields × register_width (ra,sp,s0-s11,pc,tp)
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(core::mem::size_of::<TaskContext>() == 120);
+const _: () = assert!(core::mem::size_of::<TaskContext>() == 128);
 #[cfg(target_pointer_width = "32")]
-const _: () = assert!(core::mem::size_of::<TaskContext>() == 60);
+const _: () = assert!(core::mem::size_of::<TaskContext>() == 64);
 
 // ---- Task state ----
 
@@ -137,6 +138,12 @@ pub enum WaitReason {
     WaitQueue,
     /// Waiting for an RPC reply (woken by IPC_REPLY with matching caller TID).
     Rpc(u32),
+    /// Waiting for a fast IPC call to arrive (server side).
+    /// u32 = this server's own TID (for targeted wake).
+    FastIpcServer(u32),
+    /// Waiting for a fast IPC reply from the server (client side).
+    /// u32 = slot_idx used to collect the reply.
+    FastIpcClient(u32),
 }
 
 // ---- Deadline scheduling params (AQ7) ----
@@ -247,9 +254,9 @@ pub struct Task {
 
 // TaskContext at offset 0; tid follows immediately after
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(core::mem::offset_of!(Task, tid) == 120);
+const _: () = assert!(core::mem::offset_of!(Task, tid) == 128);
 #[cfg(target_pointer_width = "32")]
-const _: () = assert!(core::mem::offset_of!(Task, tid) == 60);
+const _: () = assert!(core::mem::offset_of!(Task, tid) == 64);
 
 // task_satp offset MUST match TASK_SATP_OFFSET in context_switch.S.
 // If this assert fails, update .equ TASK_SATP_OFFSET in context_switch.S.
@@ -259,4 +266,4 @@ pub const TASK_SATP_OFFSET: usize = core::mem::offset_of!(Task, task_satp);
 // If fields are added/removed above task_satp, update TASK_SATP_OFFSET in both .S files.
 #[cfg(target_pointer_width = "64")]
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(TASK_SATP_OFFSET == 328, "Update TASK_SATP_OFFSET in context_switch.S to 328");
+const _: () = assert!(TASK_SATP_OFFSET == 336, "Update TASK_SATP_OFFSET in context_switch.S to 336");

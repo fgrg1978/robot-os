@@ -1,0 +1,103 @@
+# Nightly CI — TS02 soak test + full regression suite.
+#
+# Triggers:
+#   - Schedule: 02:00 UTC daily
+#   - Manual:   workflow_dispatch
+#
+# Jobs:
+#   build    — 5 kernel configs (qemu/vf2/k1/no-ml/no-mmu) clean
+#   tests    — host OTA tests + regression tests + flight-sim
+#   brain    — Python 1115 tests
+#   soak     — 30 minute QEMU soak (truncated from 24h for CI budget;
+#              the full soak runs locally via scripts/soak_qemu.sh)
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: 5 kernel configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Build qemu
+        run: cargo build --release --features qemu
+      - name: Build vf2
+        run: cargo build --release --features vf2
+      - name: Build k1
+        run: cargo build --release --features k1
+      - name: Build no-ml
+        run: cargo build --release --features no-ml
+      - name: Build no-mmu
+        run: cargo build --release --features no-mmu
+
+  tests:
+    name: Host tests (OTA + regression + flight-sim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: OTA pure tests
+        run: |
+          cd crates/ota-tests
+          cargo +stable test
+      - name: Regression suite (97+ tests)
+        run: |
+          cd crates/regression-tests
+          cargo +stable test
+      - name: flight-sim tests
+        run: |
+          cd crates/flight-sim
+          cargo +stable test
+
+  brain:
+    name: Brain Python tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ../robot-brain
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/robot-brain
+          path: robot-brain
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install brain deps
+        run: pip install -r ../robot-brain/requirements.txt 2>/dev/null || true
+      - name: Run pytest
+        run: cd ../robot-brain && python3 -m pytest tests/ -q
+
+  soak:
+    name: QEMU soak (30 min)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+      - name: Build kernel
+        run: cargo build --release --features qemu
+      - name: Soak (30 min)
+        env:
+          DURATION_S: "1800"   # 30 minutes (CI budget; locally runs 24h)
+          CHECKPOINT_S: "60"
+        run: bash scripts/soak_qemu.sh
+        timeout-minutes: 35
+      - name: Upload kernel log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-kernel-log
+          path: build/soak/kernel.log

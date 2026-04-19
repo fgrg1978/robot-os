@@ -9,12 +9,19 @@ edition = "2021"
 # vf2 and rvv are mutually exclusive (VF2 has no V extension).
 # k1 includes rvv because the K1 has native RVV 1.0 (VLEN=256).
 [features]
-vf2 = ["robot_os_drivers/vf2", "robot_os_ota/vf2"]
-k1  = ["robot_os_drivers/k1", "robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv", "robot_os_ota/k1"]
-rvv = ["robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv"]
-no-ml   = ["robot_os_shell/no-ml", "robot_os_behavior/no-ml"]
-no-mmu  = ["robot_os_shell/no-mmu", "robot_os_sched/no-mmu"]
+vf2  = ["robot_os_drivers/vf2", "robot_os_ota/vf2"]
+k1   = ["robot_os_drivers/k1", "robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv", "robot_os_ota/k1"]
+rvv  = ["robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv"]
+# Relaxed timing bounds for QEMU emulation (timer ISR ~100x slower than hardware).
+qemu = ["robot_os_drivers/qemu"]
+no-ml       = ["robot_os_shell/no-ml", "robot_os_behavior/no-ml"]
+no-mmu      = ["robot_os_shell/no-mmu", "robot_os_sched/no-mmu"]
+# Boot directly from a ROM/firmware without OpenSBI.
+# The kernel starts in M-mode; boot_noopensbi.S configures PMP then mrets to S-mode.
+no-opensbi  = []
 esp32c3 = ["no-mmu", "no-ml", "robot_os_drivers/esp32c3", "robot_os_shell/esp32c3", "robot_os_mm/small-mem", "robot_os_mm/esp32c3", "robot_os_arch/esp32c3", "robot_os_sched/esp32c3", "robot_os_ota/esp32c3"]
+# UEFI boot path — links in crates/efi stub + boot_efi.S.  Opt-in only.
+uefi = ["robot_os_efi"]
 
 [[bin]]
 name = "kernel"
@@ -48,3 +55,5 @@ robot_os_telemetry = { workspace = true }
 robot_os_nav       = { workspace = true }
 robot_os_ota       = { workspace = true }
 robot_os_pubsub    = { workspace = true }
+robot_os_trace     = { workspace = true }
+robot_os_efi       = { workspace = true, optional = true }

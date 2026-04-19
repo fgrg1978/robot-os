@@ -60,6 +60,18 @@ impl PmpPerm {
     pub const RX:    Self = Self { r: true,  w: false, x: true  };
     pub const RWX:   Self = Self { r: true,  w: true,  x: true  };
     pub const MMIO:  Self = Self { r: true,  w: true,  x: false }; // alias for RW
+
+    /// Encode permission bits + address-matching mode into one pmpcfg byte.
+    #[inline]
+    pub fn cfg_with_mode(self, mode: PmpMode, locked: bool) -> u8 {
+        let mut c = 0u8;
+        if self.r { c |= 1 << 0; }
+        if self.w { c |= 1 << 1; }
+        if self.x { c |= 1 << 2; }
+        c |= (mode as u8) << 3;
+        if locked { c |= 1 << 7; }
+        c
+    }
 }
 
 /// One PMP region descriptor.
@@ -219,6 +231,46 @@ pub unsafe fn pmp_configure(
     }
     // Entry 6: deny everything — A=TOR, R=W=X=0.
     cfg0 |= (PmpMode::Tor as u64) << (6 * 8 + 3);
+
+    write_pmpcfg0(cfg0);
+}
+
+// ── No-OpenSBI early boot entry ───────────────────────────────────────────────
+
+/// Permissive boot PMP policy for no-OpenSBI M-mode startup.
+///
+/// Called from `boot_noopensbi.S` before `mret` into S-mode.  Configures
+/// a minimal policy that lets the S-mode kernel access all RAM (RWX) while
+/// denying execute on MMIO.  The full stricter policy is enforced later
+/// by the VMM W^X page-table remapping once `kernel_main` has parsed the DTB
+/// and determined the actual heap layout.
+///
+/// | Entry | Region                         | Perm |
+/// |-------|--------------------------------|------|
+/// |  0    | MMIO window [0, MMIO_END)      | RW   |
+/// |  1    | All RAM  [MMIO_END, ram_end)   | RWX  |
+/// |  2    | Catch-all deny                 | ---  |
+///
+/// # Safety
+/// Must be called from M-mode exactly once, before `mret` into S-mode.
+/// Calling from S-mode raises an illegal-instruction exception.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmp_early_init(ram_base: usize, ram_size: usize) {
+    let mmio_end = MMIO_BASE + MMIO_SIZE;
+    let ram_end  = ram_base + ram_size;
+
+    // pmpaddr0: top of MMIO window (TOR exclusive upper bound >> 2)
+    write_pmpaddr(0, mmio_end >> 2);
+    // pmpaddr1: end of RAM
+    write_pmpaddr(1, ram_end >> 2);
+    // pmpaddr2: catch-all deny sentinel
+    write_pmpaddr(2, usize::MAX >> 2);
+
+    // pmpcfg0: pack three 1-byte entries into low 24 bits of the u64 register
+    let cfg_mmio  = PmpPerm::MMIO.cfg_with_mode(PmpMode::Tor, false) as u64;
+    let cfg_ram   = PmpPerm::RWX .cfg_with_mode(PmpMode::Tor, false) as u64;
+    let cfg_deny  = PmpPerm::NONE.cfg_with_mode(PmpMode::Tor, false) as u64;
+    let cfg0 = cfg_mmio | (cfg_ram << 8) | (cfg_deny << 16);
 
     write_pmpcfg0(cfg0);
 }

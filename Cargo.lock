@@ -45,7 +45,9 @@ dependencies = [
 name = "robot_os_behavior"
 version = "0.1.0"
 dependencies = [
+ "robot_os_crypto",
  "robot_os_drivers",
+ "robot_os_fs",
  "robot_os_sync",
 ]
 
@@ -77,6 +79,13 @@ name = "robot_os_crypto"
 version = "0.1.0"
 
 [[package]]
+name = "robot_os_driver_server"
+version = "0.1.0"
+dependencies = [
+ "robot_os_sync",
+]
+
+[[package]]
 name = "robot_os_drivers"
 version = "0.1.0"
 dependencies = [
@@ -91,6 +100,10 @@ name = "robot_os_dtb"
 version = "0.1.0"
 
 [[package]]
+name = "robot_os_efi"
+version = "0.1.0"
+
+[[package]]
 name = "robot_os_flight"
 version = "0.1.0"
 dependencies = [
@@ -98,6 +111,7 @@ dependencies = [
  "robot_os_channel",
  "robot_os_drivers",
  "robot_os_gps",
+ "robot_os_sync",
 ]
 
 [[package]]
@@ -151,6 +165,7 @@ dependencies = [
  "robot_os_config",
  "robot_os_drivers",
  "robot_os_dtb",
+ "robot_os_efi",
  "robot_os_flight",
  "robot_os_fs",
  "robot_os_gps",
@@ -169,6 +184,7 @@ dependencies = [
  "robot_os_sync",
  "robot_os_syscall",
  "robot_os_telemetry",
+ "robot_os_trace",
 ]
 
 [[package]]
@@ -200,6 +216,7 @@ dependencies = [
  "robot_os_drivers",
  "robot_os_flight",
  "robot_os_gps",
+ "robot_os_sync",
 ]
 
 [[package]]
@@ -216,6 +233,7 @@ name = "robot_os_ota"
 version = "0.1.0"
 dependencies = [
  "robot_os_config",
+ "robot_os_crypto",
  "robot_os_drivers",
  "robot_os_fs",
 ]
@@ -297,6 +315,7 @@ version = "0.1.0"
 dependencies = [
  "robot_os_arch",
  "robot_os_common",
+ "robot_os_driver_server",
  "robot_os_drivers",
  "robot_os_fs",
  "robot_os_gps",
@@ -320,4 +339,13 @@ dependencies = [
  "robot_os_gps",
  "robot_os_imu",
  "robot_os_net",
+]
+
+[[package]]
+name = "robot_os_trace"
+version = "0.1.0"
+dependencies = [
+ "robot_os_drivers",
+ "robot_os_fs",
+ "robot_os_sync",
 ]

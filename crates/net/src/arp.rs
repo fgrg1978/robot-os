@@ -96,6 +96,13 @@ pub fn insert(ip: [u8; 4], mac: [u8; 6]) {
 
 /// Handle an incoming ARP packet (called after stripping ETH header).
 /// `our_mac` and `our_ip` are this host's addresses.
+///
+/// Cache-poisoning hardening: only learn (spa→sha) if the packet is
+/// genuinely related to us — either a request asking about our IP
+/// (legitimate neighbour discovery) or a reply we will actually use.
+/// The previous version unconditionally inserted into the cache, so a
+/// gratuitous ARP from any attacker on the segment could poison the
+/// gateway entry and redirect every TCP/UDP packet.
 pub fn handle(payload: &[u8], our_mac: &[u8; 6], our_ip: &[u8; 4]) {
     if payload.len() < ARP_PKT_SIZE { return; }
     let pkt = unsafe { &*(payload.as_ptr() as *const ArpPkt) };
@@ -105,13 +112,30 @@ pub fn handle(payload: &[u8], our_mac: &[u8; 6], our_ip: &[u8; 4]) {
     let spa  = &pkt.spa;
     let sha  = &pkt.sha;
 
-    // Learn sender IP→MAC
-    ARP_TABLE.lock().insert(*spa, *sha);
+    // Reject obviously bogus senders: 0.0.0.0 and 255.255.255.255 must
+    // never be cached, and the broadcast/multicast MAC bits must be 0
+    // (an ARP source-MAC with the multicast bit is RFC-illegal).
+    let zero_ip       = [0u8; 4];
+    let broadcast_ip  = [0xff; 4];
+    let mcast_mac_bit = sha[0] & 0x01;
+    if *spa == zero_ip || *spa == broadcast_ip || mcast_mac_bit != 0 {
+        return;
+    }
+
+    // Only learn the sender if:
+    //   - they're requesting OUR IP (legitimate question — we'll reply,
+    //     so we want their MAC to send the reply), OR
+    //   - they're replying to a request we sent (tpa == our_ip).
+    // Gratuitous ARPs and replies for IPs we never queried are ignored.
+    let is_request_for_us = op == ARP_OP_REQUEST && tpa == our_ip;
+    let is_reply_to_us    = op == ARP_OP_REPLY   && tpa == our_ip;
+    if is_request_for_us || is_reply_to_us {
+        ARP_TABLE.lock().insert(*spa, *sha);
+    }
 
     if tpa != our_ip { return; }  // Not for us
 
     if op == ARP_OP_REQUEST {
-        // Send ARP reply
         send_reply(our_mac, our_ip, sha, spa);
     }
 }

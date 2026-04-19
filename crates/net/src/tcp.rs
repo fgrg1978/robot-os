@@ -20,7 +20,11 @@ pub const TCP_MAX_CONNS: usize = 8;
 
 /// Per-connection receive ring buffer size (bytes).
 /// Must be a power of two for efficient modular arithmetic.
-const TCP_BUF_SIZE: usize = 4096;
+/// Sized to keep OTA / large transfers flowing without window-stalls: a
+/// 4 KB buffer fills in ~3 segments at MSS=1460 and stalls the sender if
+/// the consumer task can't drain instantly. 128 KB gives the OTA recv task
+/// generous breathing room across FAT32 write latencies and burst arrivals.
+const TCP_BUF_SIZE: usize = 131072;
 
 /// Ring buffer index mask — used instead of modulo for power-of-two buffers.
 const TCP_BUF_MASK: usize = TCP_BUF_SIZE - 1;
@@ -32,9 +36,21 @@ const TCP_MSS: usize = 1460;
 /// Maximum TCP segment buffer size (MSS + max TCP header with options).
 const TCP_SEGMENT_BUF_SIZE: usize = TCP_MSS + TCP_HDR_MAX;
 
-/// TCP advertised receive window size (bytes).
-/// Matches TCP_BUF_SIZE so the peer doesn't overrun our ring buffer.
-const TCP_WINDOW_SIZE: u16 = TCP_BUF_SIZE as u16;
+/// TCP advertised receive window size (bytes), capped at u16::MAX since
+/// the TCP header window field is 16 bits and we don't implement window
+/// scaling (RFC 7323). With a buffer ≥ 64 KiB we always advertise the max
+/// 65535-byte window; the actual free-space ACK on each segment then
+/// reflects the live free count saturated to u16.
+const TCP_WINDOW_SIZE: u16 = if TCP_BUF_SIZE > u16::MAX as usize {
+    u16::MAX
+} else {
+    TCP_BUF_SIZE as u16
+};
+
+/// Cap any advertised free-space value at u16::MAX without window scaling.
+const fn window_clamp(free: usize) -> u16 {
+    if free > u16::MAX as usize { u16::MAX } else { free as u16 }
+}
 
 // ---------------------------------------------------------------------------
 // TCP header constants
@@ -271,6 +287,13 @@ pub struct TcpConn {
     // --- MSS negotiation ---
     remote_mss:       u16,            // MSS advertised by remote peer
 
+    // --- Peer's advertised receive window (RFC 793 SND.WND) ---
+    /// Last advertised receive window from the peer. Bound on how many
+    /// bytes we can have in flight. Updated on every inbound ACK.
+    /// Pre-fix: not stored at all; sender ignored the peer's window
+    /// and could overshoot it, causing the peer to drop segments.
+    remote_window:    u16,
+
     // --- Out-of-order reassembly (F01) ---
     ooo_buf:          [OooSegment; OOO_MAX_SEGMENTS],
     ooo_count:        u8,
@@ -314,6 +337,8 @@ impl TcpConn {
             last_ack_recv: 0,
 
             remote_mss:    TCP_DEFAULT_REMOTE_MSS,
+            remote_window: TCP_WINDOW_SIZE,  // assume peer's window = ours
+
 
             ooo_buf:       [OooSegment::empty(); OOO_MAX_SEGMENTS],
             ooo_count:     0,
@@ -603,16 +628,28 @@ pub fn connect(dst_ip: [u8; 4], dst_port: u16, src_port: u16) -> i32 {
 /// Send data on an established connection.
 pub fn send_data(idx: usize, data: &[u8]) -> i32 {
     if idx >= TCP_MAX_CONNS { return -1; }
-    let (mac, ip, seq, ack_val, dst_ip, src_port, dst_port, state, cwnd, remote_mss) = {
+    let (mac, ip, seq, ack_val, dst_ip, src_port, dst_port,
+         state, cwnd, remote_mss, remote_window) = {
         let t = TCP.lock();
         let c = &t.conns[idx];
         (t.our_mac, t.our_ip, c.seq, c.ack, c.remote_ip, c.local_port, c.remote_port,
-         c.state, c.cwnd, c.remote_mss)
+         c.state, c.cwnd, c.remote_mss, c.remote_window)
     };
     if state != TcpState::Established { return -1; }
 
-    // Limit send size by congestion window and remote MSS
-    let max_send = (cwnd as usize).min(remote_mss as usize).min(data.len());
+    // Limit send size by congestion window, remote MSS, AND the peer's
+    // advertised receive window. Without the third bound the kernel could
+    // overshoot the peer's window, the peer drops the segments, and we
+    // burn round-trips retransmitting until cwnd catches up to reality.
+    if remote_window == 0 {
+        // Peer's window is closed — caller should retry later.
+        return 0;
+    }
+    let max_send = (cwnd as usize)
+        .min(remote_mss as usize)
+        .min(remote_window as usize)
+        .min(data.len());
+    if max_send == 0 { return 0; }
     let send_data_slice = &data[..max_send];
 
     let result = send_segment(&mac, &ip, &dst_ip, src_port, dst_port,
@@ -643,14 +680,47 @@ pub fn send_data(idx: usize, data: &[u8]) -> i32 {
 /// Read received data from a connection.  Returns bytes read, 0 if none.
 pub fn recv(idx: usize, buf: &mut [u8]) -> i32 {
     if idx >= TCP_MAX_CONNS { return -1; }
-    let mut t = TCP.lock();
-    let c = &mut t.conns[idx];
-    let avail = c.rx_available();
-    if avail == 0 { return 0; }
-    let n = avail.min(buf.len());
-    for i in 0..n {
-        buf[i] = c.rx_buf[c.rx_head & TCP_BUF_MASK];
-        c.rx_head = (c.rx_head + 1) & TCP_BUF_MASK;
+    let (n, send_window_update, params) = {
+        let mut t = TCP.lock();
+        let c = &mut t.conns[idx];
+        let avail = c.rx_available();
+        if avail == 0 {
+            if matches!(c.state, TcpState::CloseWait | TcpState::LastAck
+                        | TcpState::TimeWait | TcpState::Closed) {
+                return -1;
+            }
+            return 0;
+        }
+        let n = avail.min(buf.len());
+        for i in 0..n {
+            buf[i] = c.rx_buf[c.rx_head & TCP_BUF_MASK];
+            c.rx_head = (c.rx_head + 1) & TCP_BUF_MASK;
+        }
+        // Send a window-update ACK on every successful read. Without this,
+        // after the peer fills our window it stalls forever — there's no
+        // other trigger to advertise the now-free space (the only ACK path
+        // is on inbound segments, but the peer stops sending when window=0).
+        let free_after  = rx_free_space(c);
+        let send_update = n > 0;
+        let remote_ip   = c.remote_ip;
+        let local_port  = c.local_port;
+        let remote_port = c.remote_port;
+        let seq         = c.seq;
+        let ack         = c.ack;
+        let our_mac     = t.our_mac;
+        let our_ip      = t.our_ip;
+        let params = if send_update {
+            Some((our_mac, our_ip, remote_ip,
+                  local_port, remote_port,
+                  seq, ack, window_clamp(free_after)))
+        } else { None };
+        (n, send_update, params)
+    };
+    if send_window_update {
+        if let Some((mac, ip, dst_ip, sp, dp, seq, ack, win)) = params {
+            send_segment_with_window(&mac, &ip, &dst_ip, sp, dp,
+                                     TCP_ACK, seq, ack, &[], win);
+        }
     }
     n as i32
 }
@@ -715,6 +785,9 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
     let seq       = u32::from_be_bytes(hdr.seq);
     let ack_num   = u32::from_be_bytes(hdr.ack);
     let flags     = hdr.flags;
+    // Peer's advertised receive window — we cap our outbound size by
+    // this so we don't overshoot and force the peer to drop segments.
+    let peer_win  = u16::from_be_bytes(hdr.window);
     let off       = ((hdr.data_off >> 4) as usize) * 4;
     // TCP header is at least 20 bytes (data_off >= 5); reject malformed segments.
     let off       = if off < TCP_HDR_MIN { TCP_HDR_MIN } else { off };
@@ -727,6 +800,23 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
     let idx_opt = { TCP.lock().find_conn(dst_port, src_ip, src_port) };
 
     if let Some(idx) = idx_opt {
+        // RFC 793 §3.4 — RST handling: in any synchronised state, a valid
+        // RST closes the connection immediately. We must release retx
+        // state and free the slot so resources don't leak. Without this
+        // an attacker that sees a flow can inject one RST and the kernel
+        // keeps the slot allocated forever (resource-exhaustion DoS), and
+        // the unacked retx_buf keeps the bogus RTT samples driving cwnd.
+        if flags & TCP_RST != 0 {
+            let mut t = TCP.lock();
+            let c = &mut t.conns[idx];
+            c.state          = TcpState::Closed;
+            c.unacked        = false;
+            c.retx_len       = 0;
+            c.retx_count     = 0;
+            c.dup_ack_count  = 0;
+            c.was_accepted   = false;
+            return;
+        }
         let state = { TCP.lock().conns[idx].state };
         match state {
             TcpState::SynSent if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 => {
@@ -738,6 +828,7 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                     c.ack   = seq.wrapping_add(1);
                     c.state = TcpState::Established;
                     c.remote_mss    = remote_mss;
+                    c.remote_window = peer_win;
                     c.last_activity = now;
                     c.keepalive_probes = 0;
                 }
@@ -750,6 +841,7 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                 let c = &mut t.conns[idx];
                 c.seq   = c.seq.wrapping_add(1);
                 c.state = TcpState::Established;
+                c.remote_window = peer_win;
                 c.last_activity = now;
                 c.keepalive_probes = 0;
             }
@@ -769,6 +861,10 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                     let c = &mut t.conns[idx];
                     c.last_activity = now;
                     c.keepalive_probes = 0;
+                    // Track the peer's advertised window — every ACK
+                    // carries an updated value, used by send_data() to
+                    // avoid overshooting the peer's receive buffer.
+                    c.remote_window = peer_win;
 
                     if c.unacked && is_ack_advancing(ack_num, c.retx_seq, c.retx_len) {
                         // New ACK — data acknowledged
@@ -841,17 +937,28 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                 // --- Payload processing with OOO reassembly (F01) ---
                 if !payload.is_empty() {
                     if seq == expected_ack {
-                        // In-order segment — write to rx_buf directly
+                        // In-order segment — write to rx_buf directly.
+                        // CRITICAL: we MUST only ACK bytes we actually stored.
+                        // The previous version ACKed `payload.len()` even when
+                        // the rx ring was full, silently dropping bytes —
+                        // the sender then advanced its window thinking the
+                        // data arrived, causing the connection to "complete"
+                        // with missing bytes and OTA payload CRC mismatch.
                         let mut t = TCP.lock();
                         let c = &mut t.conns[idx];
+                        let mut stored: u32 = 0;
                         for &b in payload {
                             let next = (c.rx_tail + 1) & TCP_BUF_MASK;
-                            if next != c.rx_head {
-                                c.rx_buf[c.rx_tail] = b;
-                                c.rx_tail = next;
+                            if next == c.rx_head {
+                                // Ring full — stop here, do NOT ACK the rest.
+                                // Peer will retransmit once we drain + open the window.
+                                break;
                             }
+                            c.rx_buf[c.rx_tail] = b;
+                            c.rx_tail = next;
+                            stored += 1;
                         }
-                        c.ack = seq.wrapping_add(payload.len() as u32);
+                        c.ack = seq.wrapping_add(stored);
                         c.last_activity = now;
 
                         // Flush any OOO segments that are now contiguous
@@ -862,7 +969,7 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                         let (seq_n, ack_n) = (c.seq, c.ack);
                         drop(t);
                         send_segment_with_window(&mac, &ip, src_ip, dst_port, src_port,
-                                                 TCP_ACK, seq_n, ack_n, &[], free as u16);
+                                                 TCP_ACK, seq_n, ack_n, &[], window_clamp(free));
                     } else if seq.wrapping_sub(expected_ack) < TCP_WINDOW_SIZE as u32 {
                         // Out-of-order but within window — buffer it (F01)
                         let mut t = TCP.lock();
@@ -957,6 +1064,29 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
     let listener_idx = { TCP.lock().find_listener(dst_port) };
     if let Some(listen_idx) = listener_idx {
         if flags & TCP_SYN != 0 {
+            // Anti-SYN-flood: cap the number of half-open connections
+            // (SynRcvd) per listener at half the connection table. With
+            // TCP_MAX_CONNS=8 we allow at most 4 half-open SYNs at any
+            // time; further SYNs are silently dropped. Without this an
+            // attacker could fill the table with SYN_RECV slots in a few
+            // packets and starve legitimate clients.
+            const MAX_HALF_OPEN_PER_LISTENER: usize = TCP_MAX_CONNS / 2;
+            let half_open = {
+                let t = TCP.lock();
+                let mut n = 0usize;
+                for c in t.conns.iter() {
+                    if c.state == TcpState::SynRcvd && c.local_port == dst_port {
+                        n += 1;
+                    }
+                }
+                n
+            };
+            if half_open >= MAX_HALF_OPEN_PER_LISTENER {
+                // Drop the SYN — the peer will retransmit. If they were
+                // legitimate, eventually one of the half-open slots will
+                // either complete or be reaped on RTO.
+                return;
+            }
             // Accept: create new connection for this peer
             let new_idx_opt = { TCP.lock().alloc() };
             if let Some(new_idx) = new_idx_opt {
@@ -1045,19 +1175,32 @@ fn flush_ooo_segments(c: &mut TcpConn) {
         for i in 0..OOO_MAX_SEGMENTS {
             if !c.ooo_buf[i].valid { continue; }
             if c.ooo_buf[i].seq == c.ack {
-                // This segment is now contiguous — write to rx_buf
+                // This segment is now contiguous — write to rx_buf.
+                // Same correctness rule as the in-order path: only advance
+                // c.ack by the bytes we actually stored. If the ring fills
+                // mid-segment, leave the OOO entry valid so the peer is
+                // forced to retransmit (or we re-flush after a drain).
                 let len = c.ooo_buf[i].len as usize;
+                let mut stored: u32 = 0;
+                let mut full = false;
                 for j in 0..len {
                     let next = (c.rx_tail + 1) & TCP_BUF_MASK;
-                    if next != c.rx_head {
-                        c.rx_buf[c.rx_tail] = c.ooo_buf[i].data[j];
-                        c.rx_tail = next;
-                    }
+                    if next == c.rx_head { full = true; break; }
+                    c.rx_buf[c.rx_tail] = c.ooo_buf[i].data[j];
+                    c.rx_tail = next;
+                    stored += 1;
                 }
-                c.ack = c.ack.wrapping_add(len as u32);
-                c.ooo_buf[i].valid = false;
-                c.ooo_count = c.ooo_count.saturating_sub(1);
-                flushed = true;
+                c.ack = c.ack.wrapping_add(stored);
+                if !full {
+                    // Whole segment landed — retire the OOO slot.
+                    c.ooo_buf[i].valid = false;
+                    c.ooo_count = c.ooo_count.saturating_sub(1);
+                    flushed = true;
+                } else {
+                    // Couldn't fit the rest. Don't loop again or we'd spin.
+                    flushed = false;
+                    break;
+                }
                 break; // restart scan since ack changed
             }
         }

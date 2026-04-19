@@ -356,28 +356,45 @@ pub fn sys_reboot() -> i64 {
 
 // ── Disk ─────────────────────────────────────────────────────────────────────
 
+/// Maximum sectors per disk syscall (= 64 KiB at 512 B/sector).
+/// Sized to fit the kernel-stack bounce buffer below.
+const DISK_MAX_SECTORS: u64 = 128;
+const DISK_BOUNCE_BYTES: usize = (DISK_MAX_SECTORS as usize) * 512;
+
 pub fn sys_disk_read(sector: u64, count: u64, buf: u64) -> i64 {
-    // Validate: null pointer, sane count (max 256 sectors = 128 KiB), overflow.
-    if buf == 0 || count == 0 || count > 256 { return -1; }
+    // Validate: null pointer, sane count, overflow.
+    if buf == 0 || count == 0 || count > DISK_MAX_SECTORS { return -1; }
     let byte_len = (count as usize).checked_mul(512).unwrap_or(0);
-    if byte_len == 0 { return -1; }
-    let buf_slice = unsafe {
-        core::slice::from_raw_parts_mut(buf as *mut u8, byte_len)
-    };
-    match robot_os_drivers::virtio::blk::read(sector, count as u32, buf_slice) {
-        Ok(()) => 0,
+    if byte_len == 0 || byte_len > DISK_BOUNCE_BYTES { return -1; }
+    // Bounce: read into kernel stack first, copy_to_user validates user ptr.
+    // Without this, a malicious user could pass a kernel address and the
+    // VirtIO driver would DMA-write into kernel memory.
+    static mut DISK_RD_BUF: [u8; DISK_BOUNCE_BYTES] = [0u8; DISK_BOUNCE_BYTES];
+    // SAFETY: serialised by the disk subsystem's own lock; only one
+    // disk syscall in flight per CPU (syscalls run with preemption
+    // disabled in the kernel half).
+    let kbuf = unsafe { &mut *core::ptr::addr_of_mut!(DISK_RD_BUF) };
+    match robot_os_drivers::virtio::blk::read(sector, count as u32, &mut kbuf[..byte_len]) {
+        Ok(()) => {
+            if !robot_os_sched::copy_to_user(buf as usize, kbuf.as_ptr(), byte_len) {
+                return -1;
+            }
+            0
+        }
         Err(()) => -1,
     }
 }
 
 pub fn sys_disk_write(sector: u64, count: u64, buf: u64) -> i64 {
-    if buf == 0 || count == 0 || count > 256 { return -1; }
+    if buf == 0 || count == 0 || count > DISK_MAX_SECTORS { return -1; }
     let byte_len = (count as usize).checked_mul(512).unwrap_or(0);
-    if byte_len == 0 { return -1; }
-    let buf_slice = unsafe {
-        core::slice::from_raw_parts(buf as *const u8, byte_len)
-    };
-    match robot_os_drivers::virtio::blk::write(sector, count as u32, buf_slice) {
+    if byte_len == 0 || byte_len > DISK_BOUNCE_BYTES { return -1; }
+    static mut DISK_WR_BUF: [u8; DISK_BOUNCE_BYTES] = [0u8; DISK_BOUNCE_BYTES];
+    let kbuf = unsafe { &mut *core::ptr::addr_of_mut!(DISK_WR_BUF) };
+    if !robot_os_sched::copy_from_user(kbuf.as_mut_ptr(), buf as usize, byte_len) {
+        return -1;
+    }
+    match robot_os_drivers::virtio::blk::write(sector, count as u32, &kbuf[..byte_len]) {
         Ok(()) => 0,
         Err(()) => -1,
     }
@@ -532,23 +549,41 @@ pub fn sys_pwm_info() -> i64 {
 // ── I2C ───────────────────────────────────────────────────────────────────────
 
 /// SYS_I2C_READ: a0=bus, a1=addr, a2=reg, a3=buf_ptr, a4=len.
+///
+/// User-supplied buffer is bounced through a kernel-stack temp via
+/// copy_to_user so a malicious user pointer (kernel or unmapped VA)
+/// cannot make the I2C driver write into kernel memory.
 pub fn sys_i2c_read(bus: u64, addr: u64, reg: u64, buf_ptr: u64, len: u64) -> i64 {
     if !cap_check(robot_os_ipc::HandleKind::I2c(bus as u8, addr as u8), false) { return E_PERM; }
     if buf_ptr == 0 || len == 0 { return -1; }
-    let buf = unsafe {
-        core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize)
-    };
-    i2c_read(bus as u8, addr as u8, reg as u8, buf) as i64
+    /// Largest single I2C read — caps stack usage and bounds attacker scope.
+    const I2C_MAX_XFER: usize = 256;
+    let n = (len as usize).min(I2C_MAX_XFER);
+    let mut tmp = [0u8; I2C_MAX_XFER];
+    let r = i2c_read(bus as u8, addr as u8, reg as u8, &mut tmp[..n]);
+    if r < 0 { return r as i64; }
+    if !robot_os_sched::copy_to_user(buf_ptr as usize, tmp.as_ptr(), n) {
+        return -1;
+    }
+    r as i64
 }
 
 /// SYS_I2C_WRITE: a0=bus, a1=addr, a2=data_ptr, a3=len.
 /// data[0] = register address, data[1..] = bytes to write.
+///
+/// SC-1 capability check (was missing); user data bounced through
+/// kernel temp via copy_from_user so an unmapped/kernel src pointer
+/// cannot make the driver read kernel memory or page-fault.
 pub fn sys_i2c_write(bus: u64, addr: u64, data_ptr: u64, len: u64) -> i64 {
+    if !cap_check(robot_os_ipc::HandleKind::I2c(bus as u8, addr as u8), true) { return E_PERM; }
     if data_ptr == 0 || len == 0 { return -1; }
-    let data = unsafe {
-        core::slice::from_raw_parts(data_ptr as *const u8, len as usize)
-    };
-    i2c_write(bus as u8, addr as u8, data) as i64
+    const I2C_MAX_XFER: usize = 256;
+    let n = (len as usize).min(I2C_MAX_XFER);
+    let mut tmp = [0u8; I2C_MAX_XFER];
+    if !robot_os_sched::copy_from_user(tmp.as_mut_ptr(), data_ptr as usize, n) {
+        return -1;
+    }
+    i2c_write(bus as u8, addr as u8, &tmp[..n]) as i64
 }
 
 pub fn sys_i2c_scan(bus: u64) -> i64 {
@@ -790,6 +825,71 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
 
 #[cfg(target_pointer_width = "32")]
 pub fn sys_munmap(_addr: u64, _length: u64) -> i64 { -1 }
+
+// ── E11 / AQ10: Demand-paging allocator ─────────────────────────────────────
+//
+// SYS_ALLOC_DEMAND reserves a user virtual range without consuming any
+// physical memory up front; the pages materialize on first access.
+//
+// a0 = size in bytes (rounded up to PAGE_SIZE).  Returns base VA or -1.
+
+/// Minimum size a demand allocation must request (one page).
+#[cfg(target_pointer_width = "64")]
+const DEMAND_ALLOC_MIN_BYTES: usize = 1;
+
+#[cfg(target_pointer_width = "64")]
+pub fn sys_alloc_demand(size: u64) -> i64 {
+    let user_pt = robot_os_sched::current_user_pt();
+    if user_pt == 0 { return -1; } // kernel task
+
+    let size = size as usize;
+    if size < DEMAND_ALLOC_MIN_BYTES {
+        return -1;
+    }
+    if size > robot_os_mm::demand::MAX_DEMAND_ALLOC_BYTES {
+        return -1;
+    }
+
+    let page_size = robot_os_arch::mmu::PAGE_SIZE;
+    let num_pages = (size + page_size - 1) / page_size;
+
+    // Use the user brk as the allocation base (same convention as sys_mmap),
+    // page-aligned upward.
+    let base = robot_os_sched::update_user_brk(0) as usize;
+    let aligned_base = (base + page_size - 1) & !(page_size - 1);
+
+    // Reserve the range.  map_demand_range returns on first failure; any
+    // partially-installed demand PTEs stay in the page table (harmless: they
+    // are invalid, so a stray access just traps and is rejected).
+    if robot_os_mm::demand::map_demand_range(user_pt, aligned_base, num_pages).is_err() {
+        return -1;
+    }
+
+    // Advance brk past the reservation so subsequent sys_mmap / sys_brk
+    // calls don't collide.
+    let end_va = aligned_base + num_pages * page_size;
+    robot_os_sched::update_user_brk(end_va as u64);
+
+    aligned_base as i64
+}
+
+#[cfg(target_pointer_width = "32")]
+pub fn sys_alloc_demand(_size: u64) -> i64 { -1 }
+
+// ── E11 / AQ9: COW fork (alias) ─────────────────────────────────────────────
+//
+// SYS_FORK_COW is semantically identical to SYS_FORK — the existing
+// SYS_FORK implementation already forwards to `vmm::fork_cow` internally
+// (see `sched::process::sys_fork_impl`).  Exposed separately so userspace
+// can probe for COW support or request it explicitly.
+
+#[cfg(target_pointer_width = "64")]
+pub fn sys_fork_cow() -> i64 {
+    sys_fork()
+}
+
+#[cfg(target_pointer_width = "32")]
+pub fn sys_fork_cow() -> i64 { -1 }
 
 // ── DUP / DUP2 ──────────────────────────────────────────────────────────────
 
@@ -1117,6 +1217,122 @@ pub fn sys_buzzer_tone(freq_hz: u64, duration_ms: u64) -> i64 {
 /// Stop buzzer.
 pub fn sys_buzzer_off() -> i64 {
     robot_os_drivers::buzzer::buzzer_off();
+    0
+}
+
+// ── E11.AQ3 — Userspace driver framework ─────────────────────────────────────
+//
+// Each syscall forwards to crates/driver_server. The caller_tid is the
+// current task id (from sched), used to route replies and block the
+// right waiter.
+
+fn driver_caller_tid() -> u32 {
+    robot_os_sched::current_task_tid()
+}
+
+/// Register as a driver for `kind` with MMIO/IRQ resources.
+/// a0=kind, a1=mmio_base, a2=mmio_size, a3=irq.
+pub fn sys_driver_register(kind: u64, mmio_base: u64, mmio_size: u64, irq: u64) -> i64 {
+    let ok = robot_os_driver_server::driver_register(
+        kind as u32,
+        driver_caller_tid(),
+        mmio_base,
+        mmio_size,
+        irq as u32,
+    );
+    if ok { 0 } else { -1 }
+}
+
+pub fn sys_driver_unregister(kind: u64) -> i64 {
+    if robot_os_driver_server::driver_unregister(kind as u32) { 0 } else { -1 }
+}
+
+/// Poll for the next event for this driver kind. a0=kind, a1=user_out_ptr.
+pub fn sys_driver_poll_event(kind: u64, user_out_ptr: u64) -> i64 {
+    let (evt, payload) = robot_os_driver_server::driver_poll_event(kind as u32);
+    if user_out_ptr != 0 {
+        unsafe { core::ptr::write_volatile(user_out_ptr as *mut u64, payload); }
+    }
+    evt as i64
+}
+
+/// Fetch the next pending DriverRequest. a0=kind, a1=user_buf_ptr.
+pub fn sys_driver_fetch_request(kind: u64, user_buf_ptr: u64) -> i64 {
+    if user_buf_ptr == 0 { return -1; }
+    match robot_os_driver_server::driver_fetch_request(kind as u32) {
+        Some(req) => {
+            unsafe {
+                core::ptr::write_volatile(
+                    user_buf_ptr as *mut robot_os_driver_server::DriverRequest,
+                    req,
+                );
+            }
+            robot_os_driver_server::TOTAL_REQUESTS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Publish a DriverReply. a0=kind, a1=user_reply_ptr.
+pub fn sys_driver_reply(kind: u64, user_reply_ptr: u64) -> i64 {
+    if user_reply_ptr == 0 { return -1; }
+    let reply = unsafe {
+        core::ptr::read_volatile(
+            user_reply_ptr as *const robot_os_driver_server::DriverReply,
+        )
+    };
+    if robot_os_driver_server::driver_reply(kind as u32, reply) { 0 } else { -1 }
+}
+
+/// Client issues a request to a userspace driver.
+/// a0=kind, a1=op, a2=input_ptr, a3=input_len, a4=out_cap. Returns token (0=fail).
+pub fn sys_driver_request(
+    kind: u64, op: u64, input_ptr: u64, input_len: u64, out_cap: u64,
+) -> i64 {
+    let len = (input_len as usize)
+        .min(robot_os_driver_server::DRIVER_REQUEST_PAYLOAD_BYTES);
+    let slice = if input_ptr != 0 && len > 0 {
+        unsafe { core::slice::from_raw_parts(input_ptr as *const u8, len) }
+    } else {
+        &[]
+    };
+    let cap = (out_cap as u16)
+        .min(robot_os_driver_server::DRIVER_REPLY_PAYLOAD_BYTES as u16);
+    let tok = robot_os_driver_server::driver_submit_request(
+        kind as u32,
+        driver_caller_tid(),
+        op as u32,
+        slice,
+        cap,
+    );
+    tok as i64
+}
+
+/// Try to take a reply for a token. a0=kind, a1=token, a2=user_out_ptr.
+pub fn sys_driver_try_reply(kind: u64, token: u64, user_out_ptr: u64) -> i64 {
+    if user_out_ptr == 0 { return -1; }
+    let mut r = robot_os_driver_server::DriverReply::zeroed();
+    if robot_os_driver_server::driver_try_take_reply(kind as u32, token, &mut r) {
+        unsafe {
+            core::ptr::write_volatile(
+                user_out_ptr as *mut robot_os_driver_server::DriverReply, r,
+            );
+        }
+        0
+    } else { -1 }
+}
+
+/// Copy DriverServerStats into user buffer.
+pub fn sys_driver_stats(user_out_ptr: u64) -> i64 {
+    if user_out_ptr == 0 { return -1; }
+    let s = robot_os_driver_server::stats();
+    unsafe {
+        core::ptr::write_volatile(
+            user_out_ptr as *mut robot_os_driver_server::DriverServerStats, s,
+        );
+    }
     0
 }
 
