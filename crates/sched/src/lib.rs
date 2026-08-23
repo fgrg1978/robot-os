@@ -1,20 +1,36 @@
 #![no_std]
 
+// PHANES Phase 1 W4 — multi-policy scheduler scaffolding.
+// New code lives alongside the existing scheduler; integration into
+// the live dispatch path is a separate wave.
+pub mod aps_state;
+pub mod class;
+pub mod partitions;
+pub mod policies;
+// RFC-0002 runtime layer for the scheduler subsystem. Phase 1: typed
+// wrapper over the existing legacy/APS toggle; reserved enum slots
+// for the per-policy standalone backends that land in Phase 2+.
+pub mod runtime;
+
 pub mod task;
 pub mod scheduler;
 pub mod smp;
 pub mod wait;
 pub mod seccomp;
 pub mod driver;
-#[cfg(target_pointer_width = "64")]
 pub mod process;
 
 pub use scheduler::{
-    init, start, schedule, task_create, task_create_affinity, task_yield, task_exit,
-    current_task_name, current_task_tid,
+    init, start, schedule, task_create, task_create_affinity, try_task_create_affinity,
+    task_yield, task_exit, set_task_exit_hook,
+    task_create_with_class, task_set_class, idx_for_tid, tid_for_idx,
+    aps_dispatch_enabled, use_aps_dispatch,
+    current_task_name, current_task_tid, current_task_stack_top,
     current_user_pt,
     stack_canary_check, MAX_CPUS, STACK_CANARY,
-    pi_boost_task, pi_restore_task,
+    pi_boost_task, pi_restore_task, boost_ready_task, restore_ready_task, task_priority,
+    task_census, wake_counters, blocked_fastipc_ids, ready_unqueued_ids,
+    reap_stamped_sleepers, current_snapshot,
     alloc_asid,
     wq_block_current, wq_wake_by_tid,
     current_syscall_filter, set_current_syscall_filter,
@@ -22,12 +38,12 @@ pub use scheduler::{
     task_set_deadline, deadline_admission_check,
     nearest_timer_deadline,
     preempt_disable, preempt_enable, preempt_disabled,
+    rebalance_from_offline_cpus,
 };
 
-#[cfg(not(any(feature = "no-mmu", feature = "esp32c3")))]
+#[cfg(not(feature = "no-mmu"))]
 pub use scheduler::setup_stack_guard_pages;
 
-#[cfg(target_pointer_width = "64")]
 pub use scheduler::{
     set_current_user_info, set_task_user_info, update_user_brk,
 };
@@ -42,7 +58,8 @@ pub use task::{
 
 pub use driver::{
     driver_register, driver_set_mmio, driver_set_irq,
-    driver_start, driver_heartbeat, driver_heartbeat_with_time,
+    // `driver_heartbeat` (no timestamp) was removed — see driver.rs for why.
+    driver_start, driver_heartbeat_with_time,
     driver_on_crash, driver_on_crash_with_time, driver_check_health,
     driver_info, driver_count,
     driver_add_spawn_descriptor, driver_spawn_count, driver_spawn_descriptor,
@@ -57,64 +74,8 @@ pub use wait::{
     wake_fast_ipc_server, wake_fast_ipc_client,
 };
 
-#[cfg(target_pointer_width = "64")]
 pub use process::{
-    exec_user, take_pending_exec, sret_to_user, ExecContext,
+    exec_user, take_current_task_exec_ctx, sret_to_user, ExecHandoff,
     copy_from_user, copy_to_user, copy_cstr_from_user, sys_brk_impl,
-    set_ecall_context, mmio_map_user, shm_map_user,
+    mmio_map_user, shm_map_user,
 };
-
-// ── RV32 stubs for process functions ────────────────────────────────────────
-// On RV32 (ESP32-C3), there is no MMU — copy_from/to_user do identity copies,
-// and mmap/brk/exec functions are no-ops or return errors.
-
-#[cfg(target_pointer_width = "32")]
-pub struct ExecContext {
-    pub satp: u64,
-    pub entry: u64,
-    pub user_sp: u64,
-    pub sstatus: u64,
-    pub user_pt: u64,
-    pub brk: u64,
-}
-
-#[cfg(target_pointer_width = "32")]
-pub fn copy_from_user(kernel_dst: *mut u8, user_src: usize, len: usize) -> bool {
-    unsafe { core::ptr::copy_nonoverlapping(user_src as *const u8, kernel_dst, len); }
-    true
-}
-
-#[cfg(target_pointer_width = "32")]
-pub fn copy_to_user(user_dst: usize, kernel_src: *const u8, len: usize) -> bool {
-    unsafe { core::ptr::copy_nonoverlapping(kernel_src, user_dst as *mut u8, len); }
-    true
-}
-
-#[cfg(target_pointer_width = "32")]
-pub fn copy_cstr_from_user(buf: &mut [u8], user_ptr: usize) -> Option<usize> {
-    let src = user_ptr as *const u8;
-    for i in 0..buf.len() {
-        let c = unsafe { core::ptr::read_volatile(src.add(i)) };
-        buf[i] = c;
-        if c == 0 { return Some(i); }
-    }
-    None
-}
-
-#[cfg(target_pointer_width = "32")]
-pub fn update_user_brk(_addr: u64) -> u64 { 0 }
-
-#[cfg(target_pointer_width = "32")]
-pub fn sys_brk_impl(_addr: u64) -> i64 { -1 }
-
-#[cfg(target_pointer_width = "32")]
-pub fn set_ecall_context(_sepc: impl Into<u64>, _user_sp: impl Into<u64>) {}
-
-#[cfg(target_pointer_width = "32")]
-pub fn take_pending_exec() -> Option<ExecContext> { None }
-
-#[cfg(target_pointer_width = "32")]
-pub fn sret_to_user(_ctx: &ExecContext) {}
-
-#[cfg(target_pointer_width = "32")]
-pub fn exec_user(_path: &[u8]) -> Result<ExecContext, ()> { Err(()) }

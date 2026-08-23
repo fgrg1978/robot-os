@@ -1,0 +1,15 @@
+[package]
+name = "robot_os_cam_ring_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for robot_os_cam_ring (S1/S6 SPSC frame ring). Excluded from workspace."
+
+# Same pattern as dfu-tests / ota-tests / tftp-tests.
+# Run with:  cd crates/cam-ring-tests && cargo +stable test
+
+[dependencies]
+robot_os_cam_ring = { path = "../cam-ring" }
+
+# Prevents Cargo from merging this crate into the workspace above.
+[workspace]

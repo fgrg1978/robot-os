@@ -55,8 +55,12 @@ pub fn conv2d(
     if in_h > MAX_SPATIAL || in_w > MAX_SPATIAL { return; }
     if k_h * k_w > MAX_KERNEL_AREA { return; }
 
-    let out_h = (in_h + 2 * pad - k_h) / stride + 1;
-    let out_w = (in_w + 2 * pad - k_w) / stride + 1;
+    let padded_h = in_h.saturating_add(pad.saturating_mul(2));
+    let padded_w = in_w.saturating_add(pad.saturating_mul(2));
+    if k_h > padded_h || k_w > padded_w { return; }
+
+    let out_h = (padded_h - k_h) / stride + 1;
+    let out_w = (padded_w - k_w) / stride + 1;
     let patch_size = in_c * k_h * k_w;
 
     if patch_size > MAX_PATCH_SIZE { return; }
@@ -110,8 +114,12 @@ pub fn depthwise_conv2d(
     if stride == 0 || channels > MAX_CHANNELS { return; }
     if in_h > MAX_SPATIAL || in_w > MAX_SPATIAL { return; }
 
-    let out_h = (in_h + 2 * pad - k_h) / stride + 1;
-    let out_w = (in_w + 2 * pad - k_w) / stride + 1;
+    let padded_h = in_h.saturating_add(pad.saturating_mul(2));
+    let padded_w = in_w.saturating_add(pad.saturating_mul(2));
+    if k_h > padded_h || k_w > padded_w { return; }
+
+    let out_h = (padded_h - k_h) / stride + 1;
+    let out_w = (padded_w - k_w) / stride + 1;
     let k_area = k_h * k_w;
 
     for c in 0..channels {
@@ -283,10 +291,7 @@ fn im2col_patch(
 /// Dot product (uses RVV SIMD if available).
 #[inline(always)]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(feature = "rvv")]
-    { robot_os_arch::rvv::dot_f32_rvv(a, b) }
-    #[cfg(not(feature = "rvv"))]
-    { robot_os_arch::rvv::dot_f32_scalar(a, b) }
+    robot_os_arch::vector::dot_f32_best(a, b)
 }
 
 /// Apply activation function.

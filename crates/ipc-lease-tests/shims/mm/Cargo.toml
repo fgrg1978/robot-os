@@ -1,0 +1,8 @@
+[package]
+name = "ipc_lease_test_mm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host stand-in for robot_os_mm (page allocator only), used only by crates/ipc-lease-tests. NOT part of the kernel."
+
+[dependencies]

@@ -2,8 +2,17 @@
 name = "robot_os_net"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+
+[features]
+# Enables `[TCP-RX]` / `[TCP-TX]` per-segment trace probes in `tcp.rs`.
+# Propagated from the kernel's `qemu` feature.  Free in production builds.
+qemu = []
 
 [dependencies]
 robot_os_drivers = { workspace = true }
 robot_os_sync = { workspace = true }
 robot_os_common = { workspace = true }
+robot_os_tftp = { workspace = true }
+robot_os_limits = { workspace = true }
+wcet-macro = { path = "../wcet-macro" }

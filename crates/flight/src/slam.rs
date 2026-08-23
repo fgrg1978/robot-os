@@ -83,46 +83,9 @@ static SLAM_ODO_Y: AtomicI64 = AtomicI64::new(0);
 /// Update counter (number of map updates performed).
 static SLAM_UPDATES: AtomicI32 = AtomicI32::new(0);
 
-// ── Integer trig (lookup table) ───────────────────────────────────────────────
-
-/// Sine of angle in centi-degrees, scaled × 1000.
-///
-/// Uses a 90-entry first-quadrant table and the identity
-/// sin(90°+α) = cos(α) = sin(90°−α) to cover all four quadrants correctly.
-fn sin1000(cdeg: i32) -> i32 {
-    // Reduce to [0, 36000) and map to quadrant.
-    let cdeg = ((cdeg % 36_000) + 36_000) % 36_000;
-    let q = cdeg / 9_000;
-    let r = cdeg % 9_000;
-    // Lookup table: sin(0°..89°) in 1° steps, scaled × 1000.
-    // Entry 89 = sin(89°) ≈ 1000 serves as the sin(90°) boundary value.
-    const SIN_LUT: [i32; 90] = [
-        0,17,35,52,70,87,105,122,139,156,174,191,208,225,242,259,276,292,309,
-        326,342,358,375,391,407,423,438,454,469,485,500,515,530,545,559,574,
-        588,602,616,629,643,656,669,682,695,707,719,731,743,755,766,777,788,
-        799,809,819,829,839,848,857,866,875,883,891,899,906,914,921,927,934,
-        940,946,951,956,961,966,970,974,978,982,985,988,990,993,995,996,998,
-        999,999,1000,
-    ];
-
-    // Evaluate sin(r) for first-quadrant angle r (0 ≤ r < 9000 cdeg).
-    let sin_q0 = |r: i32| -> i32 {
-        let deg  = (r / 100).clamp(0, 89) as usize;
-        let frac = r % 100;
-        let s0 = SIN_LUT[deg];
-        let s1 = SIN_LUT[(deg + 1).min(89)];
-        s0 + (s1 - s0) * frac / 100
-    };
-
-    match q {
-        0 =>  sin_q0(r),            // sin(r)
-        1 =>  sin_q0(9_000 - r),    // sin(90°+r) = cos(r) = sin(90°−r)
-        2 => -sin_q0(r),            // sin(180°+r) = −sin(r)
-        _ => -sin_q0(9_000 - r),    // sin(270°+r) = −cos(r)
-    }
-}
-
-fn cos1000(cdeg: i32) -> i32 { sin1000(cdeg + 9_000) }
+// ── Integer trig (shared lookup table) ────────────────────────────────────────
+// sin1000 / cos1000 live in `crate::trig` so slam and wind share one table.
+use crate::trig::{cos1000, sin1000};
 
 // ── Map utilities ──────────────────────────────────────────────────────────────
 

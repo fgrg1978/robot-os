@@ -69,6 +69,25 @@ pub fn esc_disarm() {
     crate::kprintln!("[ESC] Disarmed");
 }
 
+/// Emergency ESC disarm for the panic handler.
+///
+/// Identical to `esc_disarm()` except it drops the trailing
+/// `kprintln!("[ESC] Disarmed")`. The throttle/armed state here is all
+/// atomics, so it was already lock-free — but `kprintln!` acquires the
+/// UART spinlock (`uart::acquire()`), and if another hart holds it at
+/// panic time this call would spin forever and the actual panic message
+/// (printed afterward via lock-free `uart::puts`) would never come out.
+/// Deliberately dropping this print is a conscious trade-off for the
+/// panic path, not an oversight — the panic handler reports its own
+/// summary right after this returns.
+pub fn esc_disarm_panic() {
+    let count = ESC_COUNT.load(Ordering::Relaxed) as usize;
+    for i in 0..count {
+        ESC_THROTTLE[i].store(0, Ordering::Relaxed);
+    }
+    ESC_ARMED.store(false, Ordering::Release);
+}
+
 /// Set throttle for a single ESC channel.
 ///
 /// - `ch`: channel index (0-based)
@@ -76,6 +95,8 @@ pub fn esc_disarm() {
 ///
 /// Only works when armed.  If not armed, silently ignored.
 pub fn esc_set_throttle(ch: u8, pct: u16) {
+    // Never spin an ESC after a panic — esc_disarm_panic() already stopped it.
+    if robot_os_common::is_panicked() { return; }
     if !ESC_ARMED.load(Ordering::Acquire) { return; }
     let ch = ch as usize;
     if ch >= ESC_MAX_CH { return; }

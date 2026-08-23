@@ -1,0 +1,14 @@
+[package]
+name = "latbench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Ring-3 syscall latency microbenchmark: isolates the syscall floor, the cap_check scan and the copy_to_user cost using rdtime."
+
+[dependencies]
+robot_os_libsys = { path = "../../crates/libsys" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

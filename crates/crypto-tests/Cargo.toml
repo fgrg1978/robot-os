@@ -1,0 +1,13 @@
+[package]
+name = "robot_os_crypto_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side unit tests for robot_os_crypto. Excluded from workspace. Uses NIST FIPS / RFC test vectors for SHA-256, AES-128, X25519. Ed25519 path tests the current HMAC-SHA256 stub (real ed25519 verify is a known gap — see task #212)."
+
+# Run with:  cd crates/crypto-tests && cargo test
+# Same nightly-build-std workaround as the other *-tests crates —
+# rust-toolchain.toml pins stable, .cargo/config.toml targets the host.
+
+[dependencies]
+robot_os_crypto = { path = "../crypto" }

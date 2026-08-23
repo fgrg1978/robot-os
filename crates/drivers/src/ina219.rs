@@ -7,7 +7,7 @@
 //! Registers: config(0x00), shunt_voltage(0x01), bus_voltage(0x02),
 //!            power(0x03), current(0x04), calibration(0x05).
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -41,6 +41,12 @@ pub const VOLTAGE_SAG_WINDOW: u8 = 10;
 /// Battery nominal capacity (mAh) — 2S3P = 3600mAh.
 pub const BATTERY_NOMINAL_MAH: u32 = 3600;
 
+/// Expected `ina219_poll()` call rate. mAh integration assumes polls
+/// arrive at this cadence (see the doc comment on `ina219_poll`) — if
+/// the real caller, once wired up, polls at a different rate, this
+/// constant must be updated to match.
+pub const INA219_POLL_HZ: u32 = 10;
+
 // Failsafe levels (percentage of capacity)
 /// Warning level (%).
 pub const FAILSAFE_WARNING_PCT: u8 = 25;
@@ -58,7 +64,11 @@ pub const FAILSAFE_KILL_PCT: u8 = 5;
 static INA_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static VOLTAGE_MV: AtomicU16 = AtomicU16::new(0);
 static CURRENT_MA: AtomicU16 = AtomicU16::new(0);  // unsigned, stored as u16
-static MAH_USED_X10: AtomicU32 = AtomicU32::new(0); // mAh × 10 for precision
+// Raw sum of current_ma across all polls (mA, not yet time-scaled).
+// Division into mAh is deferred to read time (ina219_mah_used) instead
+// of done per-poll, because per-poll division by (3600 * INA219_POLL_HZ)
+// truncates to 0 for any realistic current draw.
+static MA_POLL_SUM: AtomicU64 = AtomicU64::new(0);
 static PREV_VOLTAGE_MV: AtomicU16 = AtomicU16::new(0);
 static SAG_DETECTED: AtomicBool = AtomicBool::new(false);
 static SAMPLE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -116,15 +126,11 @@ pub fn ina219_poll() {
     }
     PREV_VOLTAGE_MV.store(voltage_mv, Ordering::Relaxed);
 
-    // Update mAh counter (integrate current over time)
-    // At 10Hz: mAh_increment = current_ma / 3600 / 10
-    // Using ×10 precision: mah_x10 += current_ma * 10 / 36000
-    // Simplified: mah_x10 += current_ma / 3600
+    // Update mAh accumulator (integrate current over time).
+    // Raw current_ma is summed here; division into mAh is deferred to
+    // read time (see ina219_mah_used) to avoid per-poll truncation.
     if current_ma > 0 {
-        let increment = (current_ma as u32).max(1);
-        // At 10Hz sample rate: mAh = I(mA) × (1/10s) / 3600
-        // mah_x10 += I * 10 / 36000 = I / 3600
-        MAH_USED_X10.fetch_add(increment, Ordering::Relaxed);
+        MA_POLL_SUM.fetch_add(current_ma as u64, Ordering::Relaxed);
     }
 
     VOLTAGE_MV.store(voltage_mv, Ordering::Relaxed);
@@ -144,7 +150,9 @@ pub fn ina219_current_ma() -> u16 {
 
 /// Get total mAh consumed since init.
 pub fn ina219_mah_used() -> u32 {
-    MAH_USED_X10.load(Ordering::Relaxed) / 10
+    // mAh = (sum of current_ma over all polls) / (3600 * INA219_POLL_HZ):
+    // each poll represents 1/INA219_POLL_HZ seconds of current draw.
+    (MA_POLL_SUM.load(Ordering::Relaxed) / (3600 * INA219_POLL_HZ as u64)) as u32
 }
 
 /// Get estimated remaining capacity (%).

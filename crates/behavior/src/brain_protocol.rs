@@ -47,6 +47,12 @@
 //!   value:      u8   — command value
 //!   reserved:   u16  — reserved for future use
 
+// RFC-0027 — `#[wcet(...)]` instrumentation.  The macro emits calls gated
+// `cfg(target_os = "none")`; under host-test builds (regression-tests pulls
+// this file via `#[path]`) those calls disappear, so the macro is safe to
+// apply here.
+use wcet_macro::wcet;
+
 pub const MAGIC: [u8; 2]       = *b"BR";
 
 // Packet types — Robot → Server
@@ -56,6 +62,23 @@ pub const PKT_STATUS:  u8 = 0x03;
 
 // Packet types — Robot → Server (OTA)
 pub const PKT_OTA_ACK:  u8 = 0x04;
+
+/// Compact 20-byte sensor frame for E02 LoRa / low-bandwidth links.
+/// Must stay in lockstep with `protocol.SensorCompact` in robot-brain.
+/// Wire layout (`<iiHHBBHH>` = 20 bytes, little-endian):
+///   - `lat_deg7`:     i32  — latitude × 1e7
+///   - `lon_deg7`:     i32  — longitude × 1e7
+///   - `alt_cm`:       u16  — altitude in cm
+///   - `battery_mv`:   u16  — battery voltage in mV
+///   - `mode`:         u8   — robot mode byte
+///   - `gps_fix`:      u8   — GPS fix quality
+///   - `speed_cms`:    u16  — ground speed in cm/s
+///   - `heading_cdeg`: u16  — heading in centi-degrees
+/// (A previous comment here mis-documented the layout as
+/// pos_x_mm/pos_y_mm/dist_front/batt_pct/flags/ts_ms — that was wrong and
+/// would mislead any future LoRa encoder; this is the authoritative layout
+/// matching `robot-brain/protocol.py:361`.)
+pub const PKT_SENSOR_COMPACT: u8 = 0x05;
 
 // Packet types — Server → Robot
 pub const PKT_ACTUATOR:  u8 = 0x80;
@@ -68,6 +91,26 @@ pub const PKT_OTA_END:   u8 = 0x86;
 /// E04: Brain → Robot: control an attached payload (spray, gripper, cam trigger).
 pub const PKT_PAYLOAD:   u8 = 0x87;
 pub const PKT_ESTOP:     u8 = 0x88;
+/// RFC-0034: Brain → Robot speculative-actuation prediction. Carries the brain's
+/// predicted NEXT actuator command + a confidence byte, so the kernel can act on
+/// it ahead of the confirmed command (gated by the Fase-1 safety envelope and the
+/// `SPECULATIVE_ACTUATION` config, default off). Payload = ActuatorCmd bytes
+/// followed by one confidence byte (0..=255; 255 = certain).
+pub const PKT_PREDICT:   u8 = 0x89;
+/// RFC-0036: Brain → Robot degraded-mode trigger. The brain arms degraded mode
+/// when it detects a situational hazard only it can perceive (most concretely:
+/// perception has failed for several cycles — it has gone blind). In degraded
+/// mode the kernel contains the userspace blast radius (every write/actuation
+/// through a user-task capability is denied at the `CapTable::get` chokepoint),
+/// while the in-kernel control loop keeps running and safe-stops as normal.
+/// Payload = 1 reason byte (`DEGRADE_*`); reason 0 = clear.
+pub const PKT_DEGRADE:         u8 = 0x8A;
+/// RFC-0037: Brain → Robot graded semantic-level command. Selects an ordered
+/// restriction level (0 = FULL / normal … 3 = CONTAINED / stop + cap-denial).
+/// Payload = 1 byte: the level index. Out-of-range index → kernel clamps to
+/// CONTAINED (fail-closed). The level is sticky until changed; comms-loss
+/// safe-stop is provided by the existing motor watchdog (500 ms).
+pub const PKT_SEMANTIC_LEVEL: u8 = 0x8B;
 
 // Robot types
 pub const ROBOT_WHEELED:   u8 = 0;
@@ -78,11 +121,22 @@ pub const ROBOT_ACKERMANN: u8 = 3;
 // ActuatorCmd flags
 pub const FLAG_EMERGENCY: u8 = 0x01;
 pub const FLAG_ALERT:     u8 = 0x02;
+/// RFC-0035: the brain marks a command as low-confidence (e.g. a reactive-LLM
+/// action vs a deterministic scripted/plan step). The kernel tightens the motor
+/// envelope for low-confidence commands (confidence-aware real-time).
+pub const FLAG_LOW_CONFIDENCE: u8 = 0x04;
 
 // ESTOP reason codes (PKT_ESTOP payload byte 0)
 pub const ESTOP_REASON_OPERATOR:  u8 = 0;
 pub const ESTOP_REASON_SAFETY:    u8 = 1;
 pub const ESTOP_REASON_GEOFENCE:  u8 = 2;
+
+// DEGRADE reason codes (PKT_DEGRADE payload byte 0). Reason 0 clears degraded
+// mode (brain recovered); any non-zero reason arms it. RFC-0036.
+pub const DEGRADE_CLEAR:                  u8 = 0;
+pub const DEGRADE_REASON_PERCEPTION_BLIND: u8 = 1;
+pub const DEGRADE_REASON_SENSOR_INCOHERENT: u8 = 2;
+pub const DEGRADE_REASON_UNMODELLED_HAZARD: u8 = 3;
 
 // OTA ACK status codes (PKT_OTA_ACK payload byte 0)
 pub const OTA_ACK_OK:    u8 = 0;
@@ -215,6 +269,12 @@ impl ActuatorCmd {
         self.flags & FLAG_EMERGENCY != 0
     }
 
+    /// RFC-0035: whether the brain marked this command low-confidence (the kernel
+    /// tightens the motor envelope when set).
+    pub fn is_low_confidence(&self) -> bool {
+        self.flags & FLAG_LOW_CONFIDENCE != 0
+    }
+
     /// For differential drive: (speed_l, speed_r) as i32, clamped -100..100.
     pub fn diff_drive(&self) -> (i32, i32) {
         if self.n_channels >= 2 {
@@ -272,6 +332,7 @@ pub fn build_packet(pkt_type: u8, payload: &[u8], out: &mut [u8]) -> usize {
 ///
 /// Returns `Some((pkt_type, payload_start, payload_len, total_consumed))`
 /// or `None` if the buffer is incomplete or corrupt.
+#[wcet(50_us)]
 pub fn parse_packet(buf: &[u8]) -> Option<(u8, usize, usize, usize)> {
     if buf.len() < 6 { return None; }
     if buf[0] != MAGIC[0] || buf[1] != MAGIC[1] { return None; }
@@ -366,6 +427,29 @@ pub fn decode_actuator_cmd(payload: &[u8]) -> Option<ActuatorCmd> {
         flags,
         channels,
     })
+}
+
+// ── PredictCmd decoder (RFC-0034 speculative actuation) ───────────────────────
+
+/// A predicted next actuator command plus the brain's confidence in it.
+#[derive(Clone, Copy)]
+pub struct PredictCmd {
+    /// The predicted next command.
+    pub cmd: ActuatorCmd,
+    /// Confidence 0..=255 (255 = certain; e.g. a deterministic scripted step).
+    pub confidence: u8,
+}
+
+/// Decode a `PKT_PREDICT` payload = `ActuatorCmd` bytes followed by one
+/// confidence byte. Returns `None` if malformed. The kernel uses this only as a
+/// hint, gated by the safety envelope and `SPECULATIVE_ACTUATION` (default off);
+/// a malformed or absent prediction simply means no speculation.
+pub fn decode_predict_cmd(payload: &[u8]) -> Option<PredictCmd> {
+    if payload.is_empty() { return None; }
+    // The confidence byte is the last byte; the rest is the ActuatorCmd.
+    let (cmd_bytes, conf) = payload.split_at(payload.len() - 1);
+    let cmd = decode_actuator_cmd(cmd_bytes)?;
+    Some(PredictCmd { cmd, confidence: conf[0] })
 }
 
 // ── Camera frame encoder ─────────────────────────────────────────────────

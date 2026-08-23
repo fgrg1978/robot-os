@@ -1,0 +1,15 @@
+[package]
+name = "robot_os_multi_stream_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for robot_os_multi_stream (RFC-0021 wire format). Excluded from workspace."
+
+# Same pattern as dfu-tests / ota-tests / tftp-tests.
+# Run with:  cd crates/multi-stream-tests && cargo +stable test
+
+[dependencies]
+robot_os_multi_stream = { path = "../multi-stream" }
+
+# Prevents Cargo from merging this crate into the workspace above.
+[workspace]

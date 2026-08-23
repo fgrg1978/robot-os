@@ -1,0 +1,24 @@
+[book]
+authors = ["Fernando Rodriguez"]
+language = "en"
+src = "src"
+title = "PHANES — The Book"
+description = "An introduction and reference for the PHANES robotics OS."
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/phanes-project/phanes"
+edit-url-template = "https://github.com/phanes-project/phanes/edit/main/book/{path}"
+mathjax-support = false
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+
+[output.html.fold]
+enable = true
+level = 1
+
+[preprocessor.links]

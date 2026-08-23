@@ -316,10 +316,37 @@ fn apply_actuator_cmd(payload: &[u8]) {
 
     let ch_data = &payload[ACT_HDR_SIZE..];
     if n_channels >= 2 && ch_data.len() >= 4 {
-        let speed_l = get_i16_le(ch_data, 0) as u64;
-        let speed_r = get_i16_le(ch_data, 2) as u64;
-        sys::motor_speed(MOTOR_LEFT, speed_l);
-        sys::motor_speed(MOTOR_RIGHT, speed_r);
+        // The brain sends signed i16 speeds; the kernel cannot take one.
+        //
+        // `sys_motor_speed` (crates/syscall/src/handlers.rs:753) reads an
+        // UNSIGNED percentage and hard-codes `MotorDir::Forward`;
+        // `motor_set` then clamps with `speed_pct.min(100)`. The old code
+        // was `get_i16_le(..) as u64`, so a brain command of -50 ("back
+        // up") sign-extended to 0xFFFF...CE and clamped to 100 — the robot
+        // drove FULL SPEED FORWARD on a reverse command. Same defect as
+        // `userspace/reflex`'s motor_backup(); both trusted a libsys doc
+        // that claimed the kernel interpreted the sign.
+        //
+        // Split the sign off explicitly. Direction and speed cannot be sent
+        // in one syscall (see the ABI audit report), so a reverse command
+        // becomes `motor_set_direction(BACKWARD)` at the kernel's fixed 50%
+        // and the brain's magnitude is not honoured on that path. A forward
+        // command keeps its exact magnitude.
+        apply_motor_cmd(MOTOR_LEFT, get_i16_le(ch_data, 0));
+        apply_motor_cmd(MOTOR_RIGHT, get_i16_le(ch_data, 2));
+    }
+}
+
+/// Drive one motor from a signed brain command, without ever handing the
+/// kernel a sign-extended negative. See `apply_actuator_cmd`.
+fn apply_motor_cmd(motor: u64, speed: i16) {
+    if speed < 0 {
+        // Reverse: only reachable through SYS_MOTOR_ENABLE, which fixes the
+        // speed at 50% in the kernel.
+        sys::motor_set_direction(motor, sys::MOTOR_DIR_BACKWARD);
+    } else {
+        // Forward at the requested percentage; the kernel clamps to 100.
+        sys::motor_speed(motor, speed as u64);
     }
 }
 
@@ -331,12 +358,11 @@ fn connect_to_brain(ip: [u8; 4], port: u16) -> isize {
         return -1;
     }
 
+    // `sys::connect` now takes `&[u8; 16]` directly: the kernel's
+    // `read_sockaddr` copies exactly 16 bytes and never reads the `addrlen`
+    // argument, so the length is not the caller's to get wrong.
     let addr = SockAddr::new(ip, port);
-    let ret = sys::connect(
-        fd as u64,
-        addr.as_bytes().as_ptr() as u64,
-        16,
-    );
+    let ret = sys::connect(fd as u64, addr.as_bytes());
     if ret < 0 {
         sys::close(fd as u64);
         return -1;
@@ -390,13 +416,155 @@ fn brain_client_loop(sock_fd: u64) {
     }
 }
 
+/// Parse `behavior_server_ip` / `behavior_server_port` out of
+/// `/fat/CONFIG.INI`. Returns `None` if the file cannot be read or the keys
+/// are absent, so the caller can keep its compiled-in default.
+/// Format `[brain_client] Brain server A.B.C.D:PORT (CONFIG.INI|default)\n`
+/// into `out`, returning the byte count. Built as one buffer so it can go out
+/// in a single `write()` and cannot be interleaved mid-line.
+fn fmt_addr_line(out: &mut [u8; 96], ip: [u8; 4], port: u16, from_cfg: bool) -> usize {
+    let mut n = 0usize;
+    let push = |b: u8, n: &mut usize, out: &mut [u8; 96]| {
+        if *n < out.len() { out[*n] = b; *n += 1; }
+    };
+    for &b in b"[brain_client] Brain server " { push(b, &mut n, out); }
+    for (i, o) in ip.iter().enumerate() {
+        if i > 0 { push(b'.', &mut n, out); }
+        let mut v = *o as u32;
+        let mut d = [0u8; 3];
+        let mut k = 0;
+        if v == 0 { d[0] = b'0'; k = 1; }
+        while v > 0 { d[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
+        while k > 0 { k -= 1; push(d[k], &mut n, out); }
+    }
+    push(b':', &mut n, out);
+    let mut v = port as u32;
+    let mut d = [0u8; 5];
+    let mut k = 0;
+    if v == 0 { d[0] = b'0'; k = 1; }
+    while v > 0 { d[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
+    while k > 0 { k -= 1; push(d[k], &mut n, out); }
+    let tag: &[u8] = if from_cfg { b" (from CONFIG.INI)\n" } else { b" (compiled-in default)\n" };
+    for &b in tag { push(b, &mut n, out); }
+    n
+}
+
+fn read_brain_addr() -> Option<([u8; 4], u16)> {
+    // The trailing NUL is load-bearing: the kernel reads this path with
+    // copy_cstr_from_user, i.e. it scans for a terminator rather than using
+    // the slice length. Without one the kernel walks past the literal into
+    // whatever the linker put next.
+    //
+    // `sys::cstr!` appends it at compile time so it cannot be forgotten
+    // again; `sys::open` also now rejects an unterminated slice outright
+    // instead of letting the kernel scan.
+    let fd = sys::open(sys::cstr!(b"/fat/CONFIG.INI"), 0);
+    if fd < 0 { return None; }
+    let mut buf = [0u8; 1024];
+    let n = sys::read(fd as u64, &mut buf);
+    sys::close(fd as u64);
+    if n <= 0 { return None; }
+    let data = &buf[..n as usize];
+
+    let ip = find_value(data, b"behavior_server_ip").and_then(parse_ipv4)?;
+    // A missing port is not fatal: the IP is the part that was wrong.
+    let port = find_value(data, b"behavior_server_port")
+        .and_then(parse_u16)
+        .unwrap_or(9000);
+    Some((ip, port))
+}
+
+/// Value of `key=` on its own line, up to end-of-line. Whitespace-trimmed.
+fn find_value<'a>(data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut i = 0usize;
+    while i < data.len() {
+        // Start of a line.
+        let line_start = i;
+        while i < data.len() && data[i] != b'\n' { i += 1; }
+        let mut line_end = i;
+        if i < data.len() { i += 1; } // step over the newline
+        // Trim trailing CR/space.
+        while line_end > line_start
+            && (data[line_end - 1] == b'\r' || data[line_end - 1] == b' ')
+        {
+            line_end -= 1;
+        }
+        let line = &data[line_start..line_end];
+        if line.len() > key.len()
+            && &line[..key.len()] == key
+            && line[key.len()] == b'='
+        {
+            return Some(&line[key.len() + 1..]);
+        }
+    }
+    None
+}
+
+fn parse_ipv4(v: &[u8]) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut octet = 0usize;
+    let mut acc: u32 = 0;
+    let mut digits = 0;
+    for &b in v {
+        if b == b'.' {
+            if digits == 0 || octet >= 3 { return None; }
+            out[octet] = acc as u8;
+            octet += 1; acc = 0; digits = 0;
+        } else if b.is_ascii_digit() {
+            acc = acc * 10 + (b - b'0') as u32;
+            if acc > 255 { return None; }
+            digits += 1;
+        } else {
+            break;
+        }
+    }
+    if octet != 3 || digits == 0 { return None; }
+    out[3] = acc as u8;
+    Some(out)
+}
+
+fn parse_u16(v: &[u8]) -> Option<u16> {
+    let mut acc: u32 = 0;
+    let mut digits = 0;
+    for &b in v {
+        if b.is_ascii_digit() {
+            acc = acc * 10 + (b - b'0') as u32;
+            if acc > 65535 { return None; }
+            digits += 1;
+        } else { break; }
+    }
+    if digits == 0 { None } else { Some(acc as u16) }
+}
+
+
+
 fn run() {
     sys::println(b"[brain_client] Starting brain protocol client");
 
-    // Brain server address: 192.168.1.x:9000
-    // TODO: read from CONFIG.INI via filesystem or IPC
-    let brain_ip: [u8; 4] = [192, 168, 1, 2];
-    let brain_port: u16 = 9000;
+    // Brain server address, read from /fat/CONFIG.INI.
+    //
+    // This used to be a hardcoded 192.168.1.2 with a "TODO: read from
+    // CONFIG.INI" beside it, which meant the client could never reach
+    // anything under QEMU (SLIRP puts the host at 10.0.2.2) and silently
+    // burned its retry loop against an address that does not exist. The
+    // symptom was misleading in a specific way: the log said "Connected!"
+    // and then "Send failed", which reads like a transport bug rather than
+    // a client aimed at the wrong place.
+    //
+    // Falls back to the old literal if the file is missing or unparseable,
+    // so a deployment that relied on the compiled-in default still behaves
+    // as before.
+    let from_cfg = read_brain_addr();
+    let (brain_ip, brain_port) = from_cfg.unwrap_or(([192, 168, 1, 2], 9000));
+    // One write() for the whole line. The UART guard the kernel takes covers
+    // a single write; a line assembled from several print calls can still be
+    // sliced by another hart's kprintln between them, which is exactly how
+    // this line first came out as "Brain server [IPC] service_heartbeat = 0".
+    {
+        let mut line = [0u8; 96];
+        let n = fmt_addr_line(&mut line, brain_ip, brain_port, from_cfg.is_some());
+        sys::print(&line[..n]);
+    }
 
     loop {
         sys::print(b"[brain_client] Connecting to brain server...\n");

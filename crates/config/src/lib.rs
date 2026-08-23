@@ -56,6 +56,47 @@ pub static BEHAVIOR_L2_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Runtime: behavior layer 3 (explore) enabled.
 pub static BEHAVIOR_L3_ENABLED: AtomicBool = AtomicBool::new(true);
 
+/// Runtime: RFC-0019 forward-secret link enabled.  When set, behavior_task
+/// runs a Noise_XXpsk0 handshake immediately after TCP `Established` and
+/// wraps every subsequent frame in the X25519+AES-CTR+HMAC AEAD layer
+/// from `crates/behavior::encrypt_link`.  Both sides MUST agree on this
+/// flag — kernel and brain.  See RFC-0019 § "Opt-in flags".
+///
+/// CONFIG.INI key: `link_encrypt=0` to disable.  **Default ON since
+/// 2026-08-23 (decisión del usuario, cierre del atasco HMAC-only+reboot):**
+/// with a LINK.KEY provisioned the link always runs AEAD — which also makes
+/// the brain's per-connection Receiver reset apply, so a kernel reboot no
+/// longer wedges the link as replay. Without a key the brain connection is
+/// closed rather than downgraded (fail-closed, same K-C5 posture; smoke
+/// scenarios without a brain listener are unaffected).
+///
+/// This is the RUNTIME default and CONFIG.INI can still turn it off — the
+/// FAT volume is USB-exposed, so this knob is deliberately not a security
+/// boundary. The non-overridable version is the `link-encrypt-enforced`
+/// build feature, whose gate ORs over this flag and ignores the INI.
+pub static CFG_LINK_ENCRYPT: AtomicBool = AtomicBool::new(true);
+
+/// Runtime: RFC-0021 multi-stream link framing enabled.  When set, every
+/// brain↔kernel frame is prefixed with a 1-byte stream-id + 2-byte length
+/// (`crates/multi-stream`), the OUTERMOST wire layer — control traffic rides
+/// `STREAM_CONTROL`, camera/lidar get their own stream-ids.  Composes outside
+/// the RFC-0019 AEAD layer.  Both sides MUST agree.
+///
+/// CONFIG.INI key: `multi_stream=1`.  Default off.
+pub static CFG_MULTI_STREAM: AtomicBool = AtomicBool::new(false);
+
+/// Runtime: run the synthetic microbench suite ONCE during early boot, then
+/// halt.  The early-boot window (after subsystem init, before the scheduler
+/// + secondary harts start and before the timer ISR is enabled) is a
+/// quiescent single-active-hart context — no cross-hart `rdcycle` contention
+/// and no timer preemption — giving the cleanest possible measurement under
+/// QEMU TCG (the SMP behavior-task path is too noisy; `-smp 1` full boot
+/// hangs at flight init).  For determinism this is best paired with QEMU
+/// `-icount`.  Used to capture `bench_synth` baselines; NOT for normal boots.
+///
+/// CONFIG.INI key: `bench_boot=1`.  Default off.
+pub static CFG_BENCH_BOOT: AtomicBool = AtomicBool::new(false);
+
 /// Runtime: PID proportional gain (×1000 fixed-point: 1000 = 1.0).
 pub static CFG_PID_KP: AtomicU32 = AtomicU32::new(1);
 
@@ -143,6 +184,14 @@ pub fn cfg_apply() {
     BEHAVIOR_L1_ENABLED.store(cfg_get_u32(b"behavior_l1_enabled", 1) != 0, Ordering::Release);
     BEHAVIOR_L2_ENABLED.store(cfg_get_u32(b"behavior_l2_enabled", 1) != 0, Ordering::Release);
     BEHAVIOR_L3_ENABLED.store(cfg_get_u32(b"behavior_l3_enabled", 1) != 0, Ordering::Release);
+    // RFC-0019 opt-in.  Off by default; both sides must set this together.
+    // Default 1 (see CFG_LINK_ENCRYPT): an INI without the key keeps AEAD
+    // on; only an explicit `link_encrypt=0` turns it off.
+    CFG_LINK_ENCRYPT.store(cfg_get_u32(b"link_encrypt", 1) != 0, Ordering::Release);
+    // RFC-0021 opt-in.  Off by default; both sides must set this together.
+    CFG_MULTI_STREAM.store(cfg_get_u32(b"multi_stream", 0) != 0, Ordering::Release);
+    // Early-boot synthetic bench capture.  Off by default.
+    CFG_BENCH_BOOT.store(cfg_get_u32(b"bench_boot", 0) != 0, Ordering::Release);
 
     // PID tuning
     CFG_PID_KP.store(cfg_get_u32(b"pid_kp", 1), Ordering::Release);
@@ -191,7 +240,8 @@ fn parse_ip_packed(s: &[u8]) -> Option<u32> {
 
     for &b in s {
         if b >= b'0' && b <= b'9' {
-            octet = octet * 10 + (b - b'0') as u32;
+            octet = octet.saturating_mul(10).saturating_add((b - b'0') as u32);
+            if octet > 255 { return None; }
             any = true;
         } else if b == b'.' {
             if !any || idx >= 3 || octet > 255 { return None; }
@@ -219,7 +269,15 @@ pub const MAX_ENTRIES: usize = 32;
 /// Maximum key length in bytes.
 pub const MAX_KEY: usize = 24;
 /// Maximum value length in bytes.
-pub const MAX_VAL: usize = 16;
+///
+/// Was 16 until 2026-08-20, which is exactly the length of
+/// `/fat/GPIODRV.ELF` and `/fat/SYSTEST.ELF` — the two autorun paths in use.
+/// They fit by one byte of luck; `/fat/BRAINCLI.ELF` (17) did not, and the
+/// parser silently cut it to `/fat/BRAINCLI.EL`, so the failure surfaced far
+/// from its cause as "[AUTORUN] File not found". 48 leaves real headroom for
+/// paths, and truncation is now counted rather than silent — see
+/// [`cfg_truncated_count`].
+pub const MAX_VAL: usize = 48;
 
 #[derive(Copy, Clone)]
 struct Entry {
@@ -257,6 +315,9 @@ pub fn cfg_load(data: &[u8]) {
         ENTRIES = [Entry::new(); MAX_ENTRIES];
         COUNT   = 0;
     }
+    // A load replaces the whole configuration, so the truncation tally
+    // belongs to this load and not to whatever was parsed before it.
+    TRUNCATED_VALUES.store(0, Ordering::Relaxed);
     let mut i = 0;
     while i < data.len() {
         // Skip blank lines and leading whitespace.
@@ -288,6 +349,13 @@ pub fn cfg_load(data: &[u8]) {
 
         let klen = (key_end - key_start).min(MAX_KEY);
         let vlen = (val_end - val_start).min(MAX_VAL);
+        // A value cut to fit is a configuration the operator did not write.
+        // Silently honouring the prefix is worse than either honouring the
+        // whole thing or refusing it: the symptom appears somewhere else
+        // entirely. Count it so boot can say so out loud.
+        if val_end - val_start > MAX_VAL {
+            TRUNCATED_VALUES.fetch_add(1, Ordering::Relaxed);
+        }
         if klen == 0 { continue; }
 
         // Safety: single-threaded boot, COUNT < MAX_ENTRIES checked.
@@ -308,6 +376,16 @@ pub fn cfg_load(data: &[u8]) {
 // ── Accessors ─────────────────────────────────────────────────────────────────
 
 /// Return the value bytes for `key`, or `None` if the key is not found.
+/// Number of `CONFIG.INI` values that were longer than [`MAX_VAL`] and got
+/// cut. Non-zero means the running configuration is not the one on disk.
+static TRUNCATED_VALUES: AtomicU32 = AtomicU32::new(0);
+
+/// How many values the parser had to truncate. Boot prints a warning when
+/// this is non-zero; see `kernel/src/main.rs`.
+pub fn cfg_truncated_count() -> u32 {
+    TRUNCATED_VALUES.load(Ordering::Relaxed)
+}
+
 pub fn cfg_get(key: &[u8]) -> Option<&'static [u8]> {
     unsafe {
         for i in 0..COUNT {

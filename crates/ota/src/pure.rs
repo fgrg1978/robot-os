@@ -28,15 +28,19 @@ pub const OTA_HEADER_VERSION: u32 = 1;
 /// Size of the OTA on-wire header in bytes.
 pub const OTA_HEADER_SIZE: usize = 24;
 
-/// Maximum firmware payload size (2 MiB — kernel rarely exceeds 1 MiB).
-pub const OTA_MAX_IMAGE_SIZE: usize = 2 * 1024 * 1024;
+// NOTE: the acceptance limit itself deliberately does NOT live here.
+//
+// It comes from Kconfig (`OTA_MAX_IMAGE_SIZE_MB`) via `robot_os_limits`, and
+// this module must stay dependency-free so `crates/ota-tests/` can
+// `#[path]`-include it (see the module header). So the limit is defined in
+// `lib.rs` as `OTA_MAX_IMAGE_SIZE` and passed into `ota_validate_header`
+// as a parameter instead of being read from a global here.
 
 // ── Platform IDs ───────────────────────────────────────────────────────────
 
 pub const OTA_PLATFORM_QEMU:    u8 = 0;
 pub const OTA_PLATFORM_VF2:     u8 = 1;
 pub const OTA_PLATFORM_K1:      u8 = 2;
-pub const OTA_PLATFORM_ESP32C3: u8 = 3;
 
 // ── Flags ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +54,14 @@ pub const SLOT_B: u8 = 1;
 /// back to it when both A and B fail to load. Kernel-side helpers can
 /// query it (verify, signature check) but `ota_inactive_slot_pure()`
 /// never returns SLOT_R — OTA writes always target A or B.
+///
+/// `BootMeta::active_slot`/`last_good` CAN hold `SLOT_R` (serialized as
+/// `"r"`) — `kernel/src/main.rs`'s post-boot CRC fallback chain uses this
+/// to steer the *next* boot at R when neither the active slot nor
+/// `last_good` verifies. This only has effect once something populates
+/// `image_size_r`/`image_crc_r` in BOOTMETA (nothing does yet — R is
+/// factory-flashed); until then `ota_verify_slot(SLOT_R)` is always
+/// `false` and this path is dormant.
 pub const SLOT_R: u8 = 2;
 
 // ── Header struct + parse/encode/validate ──────────────────────────────────
@@ -87,14 +99,19 @@ pub fn ota_parse_header(buf: &[u8]) -> Option<OtaHeader> {
 }
 
 /// Validate an OTA header against the running platform.
+///
+/// `max_image_size` is the acceptance ceiling; callers in the kernel pass
+/// `crate::OTA_MAX_IMAGE_SIZE` (from Kconfig `OTA_MAX_IMAGE_SIZE_MB`). It is a
+/// parameter rather than a module constant so this file stays dependency-free
+/// for the host test crate — see the module header.
 #[must_use]
-pub fn ota_validate_header(h: &OtaHeader, platform: u8) -> bool {
+pub fn ota_validate_header(h: &OtaHeader, platform: u8, max_image_size: usize) -> bool {
     if h.platform_id != platform { return false; }
     // Reject zero-size: previously accepted, then the kernel wrote a
     // 0-byte .TMP, computed CRC over nothing (=0) and either silently
     // succeeded with no firmware or left a stale .TMP for next attempt.
     if h.image_size == 0 { return false; }
-    if h.image_size as usize > OTA_MAX_IMAGE_SIZE { return false; }
+    if h.image_size as usize > max_image_size { return false; }
     if h.flags & OTA_FLAG_COMPRESSED != 0 { return false; } // not yet supported
     true
 }
@@ -121,15 +138,29 @@ pub fn ota_encode_header(h: &OtaHeader, out: &mut [u8]) {
 /// The .BIN files on disk are raw kernel binaries (no OTA header).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootMeta {
-    pub active_slot:  u8,    // 0=A, 1=B
+    pub active_slot:  u8,    // 0=A, 1=B, 2=R
     pub boot_count:   u32,
-    pub last_good:    u8,    // 0=A, 1=B
+    pub last_good:    u8,    // 0=A, 1=B, 2=R
     pub fw_version_a: u32,
     pub fw_version_b: u32,
+    /// OT04 — firmware version recorded for the recovery slot. Nothing at
+    /// runtime writes this today (R is factory-flashed, never OTA-written —
+    /// see `SLOT_R` doc above); it stays 0 unless some future factory/
+    /// flashing tool populates it. A 0 value keeps `slot_size`-gated
+    /// verification (`ota_verify_slot`) from ever treating R as a
+    /// candidate — see `image_size_r`.
+    pub fw_version_r: u32,
     pub image_size_a: u32,   // payload size in bytes
     pub image_size_b: u32,
+    /// OT04 — payload size recorded for the recovery slot. `ota_verify_slot`
+    /// short-circuits to `false` whenever this is 0, which is exactly the
+    /// state of every BOOTMETA on disk today (nothing populates it) — R is
+    /// schema-representable but not yet a practical boot candidate.
+    pub image_size_r: u32,
     pub image_crc_a:  u32,   // CRC-32 of raw binary
     pub image_crc_b:  u32,
+    /// OT04 — CRC-32 of `/fat/KERN_R.BIN`, recorded for the recovery slot.
+    pub image_crc_r:  u32,
     /// OT03 anti-rollback floor — incoming firmware whose `fw_version` is
     /// strictly less than this value MUST be rejected. Bumped to
     /// `slot_version(active)` whenever a boot is marked good. Old firmware
@@ -138,7 +169,7 @@ pub struct BootMeta {
 }
 
 impl BootMeta {
-    #[must_use] 
+    #[must_use]
     pub const fn default() -> Self {
         BootMeta {
             active_slot:  SLOT_A,
@@ -146,10 +177,13 @@ impl BootMeta {
             last_good:    SLOT_A,
             fw_version_a: 0,
             fw_version_b: 0,
+            fw_version_r: 0,
             image_size_a: 0,
             image_size_b: 0,
+            image_size_r: 0,
             image_crc_a:  0,
             image_crc_b:  0,
+            image_crc_r:  0,
             min_fw_version: 0,
         }
     }
@@ -157,19 +191,31 @@ impl BootMeta {
     /// Get the stored CRC for a given slot.
     #[must_use]
     pub fn slot_crc(&self, slot: u8) -> u32 {
-        if slot == SLOT_A { self.image_crc_a } else { self.image_crc_b }
+        match slot {
+            SLOT_A => self.image_crc_a,
+            SLOT_R => self.image_crc_r,
+            _      => self.image_crc_b,
+        }
     }
 
     /// Get the stored size for a given slot.
     #[must_use]
     pub fn slot_size(&self, slot: u8) -> u32 {
-        if slot == SLOT_A { self.image_size_a } else { self.image_size_b }
+        match slot {
+            SLOT_A => self.image_size_a,
+            SLOT_R => self.image_size_r,
+            _      => self.image_size_b,
+        }
     }
 
     /// Get the stored firmware version for a given slot.
     #[must_use]
     pub fn slot_version(&self, slot: u8) -> u32 {
-        if slot == SLOT_A { self.fw_version_a } else { self.fw_version_b }
+        match slot {
+            SLOT_A => self.fw_version_a,
+            SLOT_R => self.fw_version_r,
+            _      => self.fw_version_b,
+        }
     }
 }
 
@@ -196,7 +242,24 @@ pub enum BootValidateOutcome {
 /// exceeds `max_attempts`, rolls the active slot back to `last_good`
 /// and resets the count to 1 (this very boot attempt).
 pub fn ota_boot_validate_pure(meta: &mut BootMeta, max_attempts: u32) -> BootValidateOutcome {
-    meta.boot_count += 1;
+    // `saturating_add`, not `+`. `boot_count` is parsed from BOOTMETA by
+    // `parse_u32_simple`, which saturates at `u32::MAX` rather than rejecting
+    // an oversized field — so `boot_count=4294967295` is a value that survives
+    // a round trip through the parser and lands here intact.
+    //
+    // That file lives on the FAT volume, which `msc_gadget.rs` exports over
+    // USB mass storage: writing it is a thing an attacker with the USB port
+    // can do, and `ota_boot_validate()` runs unconditionally on every boot.
+    // With `overflow-checks = true` and `panic = "abort"`, a plain `+= 1`
+    // there is not a wrong number — it is a panic, and a panic on this
+    // codebase is a full board reset. One 12-byte edit would put the robot in
+    // an unrecoverable reset loop that no rollback path ever gets to run.
+    //
+    // Saturating instead keeps the value at `u32::MAX`, which is `>
+    // max_attempts` and therefore takes the rollback branch below — the
+    // correct response to "this slot has failed to boot an absurd number of
+    // times" and the one that actually restores the device.
+    meta.boot_count = meta.boot_count.saturating_add(1);
     if meta.boot_count > max_attempts {
         meta.active_slot = meta.last_good;
         meta.boot_count = 1;
@@ -521,23 +584,29 @@ pub fn parse_boot_meta(data: &[u8]) -> BootMeta {
         let val = &data[val_start..i];
 
         if key == b"active_slot" {
-            meta.active_slot = if val == b"b" || val == b"B" { SLOT_B } else { SLOT_A };
+            meta.active_slot = parse_slot_char(val);
         } else if key == b"boot_count" {
             meta.boot_count = parse_u32_simple(val);
         } else if key == b"last_good" {
-            meta.last_good = if val == b"b" || val == b"B" { SLOT_B } else { SLOT_A };
+            meta.last_good = parse_slot_char(val);
         } else if key == b"fw_version_a" {
             meta.fw_version_a = parse_u32_simple(val);
         } else if key == b"fw_version_b" {
             meta.fw_version_b = parse_u32_simple(val);
+        } else if key == b"fw_version_r" {
+            meta.fw_version_r = parse_u32_simple(val);
         } else if key == b"image_size_a" {
             meta.image_size_a = parse_u32_simple(val);
         } else if key == b"image_size_b" {
             meta.image_size_b = parse_u32_simple(val);
+        } else if key == b"image_size_r" {
+            meta.image_size_r = parse_u32_simple(val);
         } else if key == b"image_crc_a" {
             meta.image_crc_a = parse_u32_simple(val);
         } else if key == b"image_crc_b" {
             meta.image_crc_b = parse_u32_simple(val);
+        } else if key == b"image_crc_r" {
+            meta.image_crc_r = parse_u32_simple(val);
         } else if key == b"min_fw_version" {
             meta.min_fw_version = parse_u32_simple(val);
         }
@@ -550,23 +619,50 @@ pub fn parse_boot_meta(data: &[u8]) -> BootMeta {
 pub fn serialize_boot_meta(meta: &BootMeta, buf: &mut [u8]) -> usize {
     let mut pos = 0;
 
-    pos += write_kv(buf, pos, b"active_slot=",
-                    if meta.active_slot == SLOT_A { b"a" } else { b"b" });
+    pos += write_kv(buf, pos, b"active_slot=", slot_char(meta.active_slot));
     pos += write_kv_u32(buf, pos, b"boot_count=", meta.boot_count);
-    pos += write_kv(buf, pos, b"last_good=",
-                    if meta.last_good == SLOT_A { b"a" } else { b"b" });
+    pos += write_kv(buf, pos, b"last_good=", slot_char(meta.last_good));
     pos += write_kv_u32(buf, pos, b"fw_version_a=", meta.fw_version_a);
     pos += write_kv_u32(buf, pos, b"fw_version_b=", meta.fw_version_b);
+    pos += write_kv_u32(buf, pos, b"fw_version_r=", meta.fw_version_r);
     pos += write_kv_u32(buf, pos, b"image_size_a=", meta.image_size_a);
     pos += write_kv_u32(buf, pos, b"image_size_b=", meta.image_size_b);
+    pos += write_kv_u32(buf, pos, b"image_size_r=", meta.image_size_r);
     pos += write_kv_u32(buf, pos, b"image_crc_a=", meta.image_crc_a);
     pos += write_kv_u32(buf, pos, b"image_crc_b=", meta.image_crc_b);
+    pos += write_kv_u32(buf, pos, b"image_crc_r=", meta.image_crc_r);
     pos += write_kv_u32(buf, pos, b"min_fw_version=", meta.min_fw_version);
 
     pos
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────
+
+/// Encode a `SLOT_*` constant as its one-letter BOOTMETA text form.
+/// Anything that is not `SLOT_A`/`SLOT_R` is written as `"b"` — this
+/// matches the pre-OT04 fallback (only A/B existed) for any value that
+/// isn't one of the three defined slots.
+fn slot_char(slot: u8) -> &'static [u8] {
+    match slot {
+        SLOT_A => b"a",
+        SLOT_R => b"r",
+        _      => b"b",
+    }
+}
+
+/// Parse a one-letter slot code (`"a"`/`"b"`/`"r"`, case-insensitive) into
+/// a `SLOT_*` constant. Anything else (including the field being absent,
+/// which is how every pre-OT04 BOOTMETA reads today) defaults to `SLOT_A`,
+/// exactly as before this field gained a third possible value.
+fn parse_slot_char(val: &[u8]) -> u8 {
+    if val == b"b" || val == b"B" {
+        SLOT_B
+    } else if val == b"r" || val == b"R" {
+        SLOT_R
+    } else {
+        SLOT_A
+    }
+}
 
 #[inline]
 pub(crate) fn get_u32(buf: &[u8], off: usize) -> u32 {

@@ -1,0 +1,79 @@
+# Kconfig.ota — Over-The-Air firmware update configuration
+#
+# RFC-0026 Phase C1.  OTA slot layout, image size limits, signature
+# enforcement, and rollback protection.
+
+menu "OTA Firmware Updates"
+
+config OTA_SLOT_COUNT
+    int "Number of OTA firmware slots (A/B)"
+    range 2 4
+    default 2
+    help
+      Number of active firmware slots.  Standard A/B scheme uses 2.
+      A 3rd slot can be used as a golden fallback in addition to recovery.
+      Changing this requires updating the FAT partition layout.
+
+config OTA_RECOVERY_SLOT
+    bool "Separate recovery slot"
+    default y
+    help
+      Reserve a dedicated read-only recovery slot (KERN_R.BIN) that is
+      never overwritten by normal OTA updates.  Used when both A and B
+      slots fail to boot successfully within OTA_BOOT_COUNT_THRESHOLD.
+
+config OTA_MAX_IMAGE_SIZE_MB
+    int "Maximum OTA image size (MiB)"
+    range 1 64
+    default 8
+    help
+      Hard limit on firmware image size accepted by the OTA receiver.
+      Images larger than this are rejected before writing to FAT.
+      Current secure_boot.rs compile-time limit: 2 MiB; set to 8 MiB
+      as a more generous compile-time cap with the expectation C3 migrates
+      the constant.
+
+choice
+    prompt "OTA signature scheme"
+    default OTA_SIG_ED25519
+    help
+      Cryptographic scheme used to sign and verify OTA firmware images.
+      The brain server and the kernel must use the same scheme.
+
+    config OTA_SIG_ED25519
+        bool "Ed25519 (recommended)"
+        help
+          Ed25519 using the Ed25519-Donna or TweetNaCl backend.
+          Small signatures (64 bytes), fast verification, high security.
+          Current codebase default and the only fully implemented scheme.
+
+    config OTA_SIG_NONE
+        bool "No signature (development / debug only)"
+        help
+          Disables signature verification entirely.  DANGEROUS — allows
+          any image to be flashed.  Use only in an isolated lab environment
+          with no network access to the OTA endpoint.
+
+endchoice
+
+config OTA_BOOT_COUNT_THRESHOLD
+    int "Maximum boot attempts before rollback"
+    range 1 10
+    default 3
+    help
+      If a new firmware fails to call `ota_mark_boot_good()` within this
+      many boot attempts, the bootloader automatically rolls back to the
+      previous slot.  3 is the OT01 tested value.
+      Current codebase: OTA_DEFAULT_MAX_BOOT_ATTEMPTS = 3 (crates/ota).
+
+config OTA_FW_VERSION_MIN
+    int "Minimum allowed firmware version (anti-rollback floor)"
+    range 0 65535
+    default 1
+    help
+      Anti-rollback floor.  OTA updates with a version number less than
+      this value are rejected by the OTA receiver, preventing downgrade
+      attacks.  Increment this after retiring a vulnerable version.
+      Set to 1 initially (version 0 is the factory image).
+
+endmenu # OTA Firmware Updates

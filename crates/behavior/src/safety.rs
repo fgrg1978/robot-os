@@ -167,6 +167,105 @@ pub fn safety_robot_type() -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded runtime safety monitor — output envelope (RFC-0033, RFC-0035)
+// ---------------------------------------------------------------------------
+
+/// Reduced speed cap (% of max) applied to LOW-CONFIDENCE commands (RFC-0035).
+/// When the brain marks a command low-confidence (e.g. a reactive-LLM action vs
+/// a deterministic plan/scripted step), the robot self-limits: act, but cautiously.
+pub const SAFETY_LOW_CONFIDENCE_CAP_PCT: u8 = 40;
+
+// ── RFC-0037: Graded degrade-level speed caps ────────────────────────────────
+//
+// Applied in `motor_envelope` AFTER the low-confidence cap. The level→pct
+// mapping is `robot_os_degrade_policy::level_cap_pct()`, a pure function in
+// the dep-free leaf crate. This keeps motor-actuation policy out of the TCB
+// (`crates/ipc`) while remaining independently host-tested in the leaf.
+//
+// `DEGRADE_LEVEL_CONTAINED` (stop + cap-denial) is also handled in `CapTable::get`
+// for user-task actuation; the 0 % cap here ensures the in-kernel motor loop
+// (which does NOT go through `get()`) also stops. Both layers are required.
+//
+// The re-exports below keep the safety-module naming convention for callers
+// inside behavior that need these values without importing from the leaf directly.
+
+/// Speed ceiling at `DEGRADE_LEVEL_FULL` (RFC-0037): no extra restriction.
+/// Re-exported from `robot_os_degrade_policy::DEGRADE_SPEED_CAP_FULL_PCT`.
+pub const SAFETY_DEGRADE_FULL_CAP_PCT: i32 = robot_os_degrade_policy::DEGRADE_SPEED_CAP_FULL_PCT;
+
+/// Speed ceiling at `DEGRADE_LEVEL_CAUTIOUS` (RFC-0037): 70 % of per-type max.
+/// Re-exported from `robot_os_degrade_policy::DEGRADE_SPEED_CAP_CAUTIOUS_PCT`.
+pub const SAFETY_DEGRADE_CAUTIOUS_CAP_PCT: i32 = robot_os_degrade_policy::DEGRADE_SPEED_CAP_CAUTIOUS_PCT;
+
+/// Speed ceiling at `DEGRADE_LEVEL_SLOW` (RFC-0037): 30 % of per-type max.
+/// Re-exported from `robot_os_degrade_policy::DEGRADE_SPEED_CAP_SLOW_PCT`.
+pub const SAFETY_DEGRADE_SLOW_CAP_PCT: i32 = robot_os_degrade_policy::DEGRADE_SPEED_CAP_SLOW_PCT;
+
+/// Speed ceiling at `DEGRADE_LEVEL_CONTAINED` (RFC-0037): 0 % — full stop.
+/// Re-exported from `robot_os_degrade_policy::DEGRADE_SPEED_CAP_CONTAINED_PCT`.
+pub const SAFETY_DEGRADE_CONTAINED_CAP_PCT: i32 = robot_os_degrade_policy::DEGRADE_SPEED_CAP_CONTAINED_PCT;
+
+/// Whether the most recent brain command was flagged low-confidence (RFC-0035).
+/// Set at command ingest from `FLAG_LOW_CONFIDENCE`; read by `motor_envelope` at
+/// the chokepoint. Conservative on staleness: stays low until a high-confidence
+/// command clears it (and the watchdog safe-stops on comms loss regardless).
+static CMD_LOW_CONF: AtomicBool = AtomicBool::new(false);
+
+/// Record the confidence of the most recent brain command (RFC-0035).
+pub fn cmd_set_low_confidence(low: bool) {
+    CMD_LOW_CONF.store(low, Ordering::Release);
+}
+
+/// Whether the current command context is low-confidence.
+pub fn cmd_low_confidence() -> bool {
+    CMD_LOW_CONF.load(Ordering::Acquire)
+}
+
+/// Bounded runtime safety monitor: the LAST line of defence between any motor
+/// command and PWM, applied at the single `rt_motor_task` MotorCmd→PID→PWM
+/// chokepoint (so it is structurally unbypassable — every command source funnels
+/// through it).
+///
+/// This complements, and does not replace, the sensor-reactive L0 `safety_check`
+/// upstream: L0 reacts to the world (obstacle, tilt, battery); this validates the
+/// command's own MAGNITUDE — a hard ESTOP override, the per-robot-type speed cap
+/// (`SAFETY_*_MAX_SPEED_PCT`), and (RFC-0035) a tighter cap when the brain marked
+/// the command low-confidence. `(speed_l, speed_r)` are percent (±100); returns
+/// the clamped pair.
+///
+/// O(1), no allocation, no I/O — its cost is bounded by construction (a couple of
+/// branches plus two clamps), not by measurement. This is a runtime-assurance
+/// gate, NOT a formally verified component (see RFC-0033; "verified" is reserved
+/// for the Phase-5 horizon).
+pub fn motor_envelope(speed_l: i32, speed_r: i32) -> (i32, i32) {
+    // Hard stop overrides everything — unconditional, highest priority.
+    if estop_is_active() {
+        return (0, 0);
+    }
+    // Per-type magnitude cap. Wheeled/Ackermann share the wheeled cap; drone and
+    // humanoid actuation has its own envelope on its own path, so pass through
+    // here (still clamped to the protocol's ±100 upstream).
+    let mut cap: i32 = match safety_robot_type() {
+        ROBOT_TYPE_WHEELED | ROBOT_TYPE_ACKERMANN => SAFETY_WHEELED_MAX_SPEED_PCT as i32,
+        _ => 100,
+    };
+    // RFC-0035: confidence-aware real-time — act cautiously on uncertain commands.
+    if cmd_low_confidence() {
+        cap = cap.min(SAFETY_LOW_CONFIDENCE_CAP_PCT as i32);
+    }
+    // RFC-0037: graded degrade-level speed ceiling. Applied AFTER the low-confidence
+    // cap so both constraints compose (the tighter one wins). The mapping lives in
+    // the dep-free leaf crate `robot_os_degrade_policy` (level_cap_pct); the
+    // runtime level state stays in `robot_os_ipc::cap::degrade_level()`. Unknown
+    // levels clamp to 0 (fail-closed) inside level_cap_pct.
+    let level_cap: i32 = robot_os_degrade_policy::level_cap_pct(
+        robot_os_ipc::cap::degrade_level(),
+    );
+    cap = cap.min(level_cap);
+    (speed_l.clamp(-cap, cap), speed_r.clamp(-cap, cap))
+}
+
+// ---------------------------------------------------------------------------
 // Main safety check — dispatches by robot type
 // ---------------------------------------------------------------------------
 

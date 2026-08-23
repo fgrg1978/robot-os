@@ -1,0 +1,14 @@
+[package]
+name = "robot_os_aead_link_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side cross-side compat tests for RFC-0019 AEAD link. Pins the wire format produced by robot-brain/secure_channel.py against crates/crypto::secure_channel. Excluded from workspace."
+
+# Run with:
+#   cd crates/aead-link-tests && cargo +stable test --release -- --nocapture
+#
+# Pinned to stable via rust-toolchain.toml.
+
+[dependencies]
+robot_os_crypto = { path = "../crypto" }

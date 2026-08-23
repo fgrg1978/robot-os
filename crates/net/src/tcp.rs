@@ -11,12 +11,12 @@
 
 use robot_os_sync::SpinLock;
 use super::ip;
+pub use robot_os_limits::TCP_MAX_CONNS;
+use wcet_macro::wcet;
 
 // ---------------------------------------------------------------------------
 // Connection limits
 // ---------------------------------------------------------------------------
-
-pub const TCP_MAX_CONNS: usize = 8;
 
 /// Per-connection receive ring buffer size (bytes).
 /// Must be a power of two for efficient modular arithmetic.
@@ -24,7 +24,7 @@ pub const TCP_MAX_CONNS: usize = 8;
 /// 4 KB buffer fills in ~3 segments at MSS=1460 and stalls the sender if
 /// the consumer task can't drain instantly. 128 KB gives the OTA recv task
 /// generous breathing room across FAT32 write latencies and burst arrivals.
-const TCP_BUF_SIZE: usize = 131072;
+const TCP_BUF_SIZE: usize = robot_os_limits::TCP_BUF_SIZE;
 
 /// Ring buffer index mask — used instead of modulo for power-of-two buffers.
 const TCP_BUF_MASK: usize = TCP_BUF_SIZE - 1;
@@ -102,8 +102,24 @@ const TCP_DEFAULT_REMOTE_MSS: u16 = 536;
 // ISN generation (RFC 6528)
 // ---------------------------------------------------------------------------
 
-/// Compile-time secret seed for ISN generation.
-const ISN_SECRET: u32 = 0xA5F0_3C7B;
+/// Runtime-seeded secret for ISN generation. Was previously a compile-time
+/// constant; an attacker with the binary could predict every initial sequence
+/// number and trivially hijack a TCP session (RFC 6528 explicitly warns
+/// against this). Seeded once at `net_init()` from the CLINT cycle counter
+/// (and any other entropy available — the current bare-metal target lacks a
+/// dedicated TRNG crate, so we mix the boot mtime into a static atomic; this
+/// is not strong randomness but it is unpredictable from a static analysis of
+/// the binary alone, which is the immediate threat).
+static ISN_SECRET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xA5F0_3C7B);
+
+/// Seed the ISN secret from a runtime entropy source. Called once during
+/// `net_init`. Safe to call multiple times — last seed wins.
+pub fn isn_secret_seed(entropy: u32) {
+    // XOR-mix to preserve any prior seed contribution.
+    let prev = ISN_SECRET.load(core::sync::atomic::Ordering::Relaxed);
+    ISN_SECRET.store(prev ^ entropy, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// FNV-1a offset basis (32-bit).
 const FNV_OFFSET_BASIS: u32 = 0x811C_9DC5;
@@ -126,6 +142,33 @@ const RTO_MAX_MS: u64 = 60_000;
 
 /// Maximum retransmission attempts before connection is considered dead.
 const RETX_MAX_ATTEMPTS: u8 = 8;
+
+// ---------------------------------------------------------------------------
+// Handshake (half-open) timer
+// ---------------------------------------------------------------------------
+
+/// Interval between SYN / SYN-ACK retransmissions, in milliseconds.
+///
+/// Deliberately a fixed interval and NOT `rto_ticks`: backing off the
+/// connection's RTO during the handshake would carry an inflated value into
+/// `Established`, where nothing resets it until the first RTT sample, and the
+/// first lost data segment would then wait seconds instead of ~1 s.
+const SYN_RETRY_INTERVAL_MS: u64 = 1_000;
+
+/// SYN / SYN-ACK retransmissions before a half-open slot is abandoned.
+///
+/// This is what bounds the lifetime of a half-open connection: 4 retries at
+/// `SYN_RETRY_INTERVAL_MS` means a `SynSent` / `SynRcvd` slot lives at most
+/// ~5 s without progress, then returns to `Closed`.
+///
+/// Before this existed nothing reaped those slots at all — `tcp_tick`'s only
+/// reaper was gated on `unacked`, which neither `connect()` nor the listener
+/// path ever sets — so `MAX_HALF_OPEN_PER_LISTENER`'s comment about slots
+/// being "reaped on RTO" described a mechanism that did not exist.  Four
+/// SYNs that were never completed silenced a listener permanently, and eight
+/// consumed `TCP_MAX_CONNS`, so the robot could not dial out either.  Both
+/// conditions survived until reboot.
+const SYN_MAX_RETRIES: u8 = 4;
 
 /// Timer ticks per millisecond (10 MHz clock).
 const TICKS_PER_MS: u64 = 10_000;
@@ -322,7 +365,7 @@ impl TcpConn {
             retx_len:     0,
             retx_seq:     0,
             retx_time:    0,
-            rto_ticks:    RTO_INITIAL_MS * TICKS_PER_MS,
+            rto_ticks:    0,
             srtt:         0,
             rttvar:       0,
             retx_count:   0,
@@ -331,13 +374,13 @@ impl TcpConn {
             last_activity:    0,
             keepalive_probes: 0,
 
-            cwnd:          CWND_INITIAL,
-            ssthresh:      SSTHRESH_INITIAL,
+            cwnd:          0,
+            ssthresh:      0,
             dup_ack_count: 0,
             last_ack_recv: 0,
 
-            remote_mss:    TCP_DEFAULT_REMOTE_MSS,
-            remote_window: TCP_WINDOW_SIZE,  // assume peer's window = ours
+            remote_mss:    0,
+            remote_window: 0,
 
 
             ooo_buf:       [OooSegment::empty(); OOO_MAX_SEGMENTS],
@@ -357,10 +400,16 @@ impl TcpConn {
     }
 
     /// Reset congestion and retransmission state for a fresh connection.
+    ///
+    /// Called at slot creation on both open paths (`connect` and the listener's
+    /// `SynRcvd`), so `retx_time` doubles as the slot's creation timestamp:
+    /// `tcp_tick` uses it to age out half-open connections.  It is seeded to
+    /// *now* rather than 0 for exactly that reason — a zero would read as
+    /// "sent at boot" and make the first tick retransmit immediately.
     fn reset_conn_state(&mut self) {
         self.retx_len         = 0;
         self.retx_seq         = 0;
-        self.retx_time        = 0;
+        self.retx_time        = robot_os_drivers::clint::get_time();
         self.rto_ticks        = RTO_INITIAL_MS * TICKS_PER_MS;
         self.srtt             = 0;
         self.rttvar           = 0;
@@ -469,8 +518,10 @@ fn generate_isn(src_ip: &[u8; 4], dst_ip: &[u8; 4], src_port: u16, dst_port: u16
     h ^= dp[1] as u32;
     h = h.wrapping_mul(FNV_PRIME);
 
-    // Hash secret seed (4 bytes)
-    let secret = ISN_SECRET.to_le_bytes();
+    // Hash secret seed (4 bytes). Loaded at runtime — see `ISN_SECRET` doc.
+    let secret = ISN_SECRET
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .to_le_bytes();
     i = 0;
     while i < 4 {
         h ^= secret[i] as u32;
@@ -503,7 +554,14 @@ fn parse_mss_option(data: &[u8], hdr_len: usize) -> u16 {
                 if i + (TCP_OPT_MSS_LEN as usize) <= opts.len()
                     && opts[i + 1] == TCP_OPT_MSS_LEN
                 {
-                    return u16::from_be_bytes([opts[i + 2], opts[i + 3]]);
+                    let mss = u16::from_be_bytes([opts[i + 2], opts[i + 3]]);
+                    // Floor the peer's value: `send_data` sizes every segment
+                    // by `remote_mss`, so an advertised MSS of 0 makes it
+                    // return 0 forever and `send_all_with_yield` burns its
+                    // whole yield budget without progress — a peer-inflicted
+                    // stall. 64 is the same defensive floor Linux applies
+                    // (tcp_min_snd_mss) for exactly this attack.
+                    return mss.max(64);
                 }
                 break;
             }
@@ -530,6 +588,53 @@ fn seq_in_window(seq_num: u32, win_start: u32, win_size: u32) -> bool {
     // seq_num - win_start (wrapping) should be < win_size
     let offset = seq_num.wrapping_sub(win_start);
     offset < win_size
+}
+
+/// Next expected sequence number after accepting a segment that carries FIN.
+///
+/// A FIN occupies one sequence number of its own, immediately after any
+/// payload the same segment carried — so the acknowledgement the peer expects
+/// is `seq + payload_len + 1`, not `seq + payload_len`. Getting this wrong by
+/// one leaves the peer retransmitting a FIN we believe we already
+/// acknowledged, and the connection sits in TimeWait on our side while the
+/// peer never reaches CLOSED.
+///
+/// Wrapping throughout: sequence numbers are modulo 2^32, and with
+/// `overflow-checks = true` a bare `+` here would turn a connection that
+/// happens to straddle the wrap point into a board reset.
+fn fin_next_ack(seq: u32, payload_len: usize) -> u32 {
+    seq.wrapping_add(payload_len as u32).wrapping_add(1)
+}
+
+/// RFC 793 §3.3 acceptability test for a segment on a synchronised connection.
+///
+/// Every inbound segment must pass this — not only the ones carrying data.
+/// The window check used to sit inside `if !payload.is_empty()`, so a
+/// payload-free segment skipped it entirely and still reached the ACK
+/// processing that stores the peer's advertised window: a single spoofed bare
+/// ACK advertising window 0 stopped the transmit side forever (`send_data`
+/// returns 0 on a closed window) while the connection went on looking healthy.
+/// The same unchecked path drove `dup_ack_count` and the congestion window.
+///
+/// With this in place, an off-path attacker who has already guessed the
+/// 4-tuple must additionally land `seq` inside a 64 KiB window out of the
+/// 2^32 sequence space.
+///
+/// The window used is the constant `TCP_WINDOW_SIZE`, not the live advertised
+/// window: it is a superset of what we have really advertised, which keeps
+/// legitimate peers (retransmissions, segments in flight when our window
+/// shrank) from being rejected while still costing a blind attacker ~2^16.
+///
+/// **Keep-alive exception** (RFC 1122 §4.2.3.6): a zero-length segment at
+/// `RCV.NXT - 1` is the standard keep-alive probe, and `tcp_tick` sends
+/// exactly that shape itself — so in a two-node deployment of this stack, both
+/// ends must accept it or each silently drops the other's probes and the
+/// connection is torn down by the keep-alive timer.
+fn segment_acceptable(seq_num: u32, seg_len: usize, rcv_nxt: u32) -> bool {
+    if seq_in_window(seq_num, rcv_nxt, TCP_WINDOW_SIZE as u32) {
+        return true;
+    }
+    seg_len == 0 && seq_num == rcv_nxt.wrapping_sub(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +687,24 @@ pub fn init(mac: [u8; 6], ip: [u8; 4]) {
     t.our_ip  = ip;
 }
 
+/// Re-point the TCP layer at a new local address.
+///
+/// TCP keeps its own copy of the address because every segment needs it for the
+/// pseudo-header. `init` used to be the only writer, so anything that changed
+/// the address afterwards — DHCP is the one that matters — left TCP building
+/// and verifying checksums against the OLD address while the rest of the stack
+/// had moved on. Symptom: every TCP segment silently fails checksum and the
+/// connection never establishes, with no error anywhere.
+///
+/// Called from `net_set_ip`, so callers configure the address in one place.
+/// Changing the address with connections live is not meaningful — existing
+/// slots keep the endpoints they were opened with — but at boot, which is when
+/// DHCP runs, there are none.
+pub fn set_our_ip(ip: [u8; 4]) {
+    let mut t = TCP.lock();
+    t.our_ip = ip;
+}
+
 /// Listen on a port.  Returns connection slot index or -1 on failure.
 pub fn listen(port: u16) -> i32 {
     let (mac, ip) = { let t = TCP.lock(); (t.our_mac, t.our_ip) };
@@ -599,8 +722,23 @@ pub fn listen(port: u16) -> i32 {
     idx as i32
 }
 
+/// Maximum number of `yield_fn` calls `connect_with_yield` will spin while
+/// waiting for the ARP cache to resolve the destination MAC before sending
+/// the first SYN.  Sized for a few wall-ms under hardware (ARP reply
+/// arrives in tens of µs) and a fraction of a second under QEMU TCG SMP
+/// (the slowest case observed).
+pub const CONNECT_ARP_MAX_YIELDS: u32 = 10_000;
+
 /// Initiate an outgoing TCP connection.  Returns connection index or -1.
 /// Connection is not established until state == Established.
+///
+/// **First-SYN behavior**: this function does NOT block on ARP — if the
+/// destination MAC is not cached, `ip::send` returns -1, the SYN is dropped
+/// silently, and the caller must retry (typically via the brain-task's
+/// outer reconnect loop).  Use `connect_with_yield` instead for a
+/// blocking-with-yield variant that issues the SYN only once ARP has
+/// resolved, eliminating the "first attempt always stalls" pattern under
+/// SLIRP/QEMU.
 pub fn connect(dst_ip: [u8; 4], dst_port: u16, src_port: u16) -> i32 {
     let (mac, ip) = { let t = TCP.lock(); (t.our_mac, t.our_ip) };
     let _ = mac;
@@ -623,6 +761,46 @@ pub fn connect(dst_ip: [u8; 4], dst_port: u16, src_port: u16) -> i32 {
     // Send SYN with MSS option
     send_syn_segment(&mac, &ip, &dst_ip, src_port, dst_port, TCP_SYN, seq, 0);
     idx as i32
+}
+
+/// Like `connect`, but yields until the ARP cache has the destination MAC
+/// before issuing the SYN.  This eliminates the "first SYN dropped silently
+/// due to ARP miss" pattern that otherwise costs an entire RTO + close-and-
+/// reconnect cycle (~1.5-2 s observed under SLIRP/QEMU).
+///
+/// The first `ip::send` inside `crate::send_syn_segment` would normally
+/// trigger an ARP request and return -1.  Here we issue the ARP request up
+/// front, yield-poll the cache for resolution, then call the standard
+/// `connect` (which now hits the populated cache and sends the SYN in one
+/// pass).
+///
+/// `yield_fn` is injected to keep `crates/net` scheduler-agnostic — same
+/// pattern as `send_all_with_yield`.  Falls back to the non-blocking
+/// `connect` after `CONNECT_ARP_MAX_YIELDS` to bound worst-case latency.
+pub fn connect_with_yield<F: FnMut()>(
+    dst_ip:   [u8; 4],
+    dst_port: u16,
+    src_port: u16,
+    mut yield_fn: F,
+) -> i32 {
+    // Snapshot our addresses to issue the ARP request without holding TCP.lock.
+    let (our_mac, our_ip) = { let t = TCP.lock(); (t.our_mac, t.our_ip) };
+
+    // If the cache already has the entry (subsequent connects, gateway hot),
+    // skip the resolution step entirely.
+    if crate::arp::lookup(&dst_ip).is_none() {
+        crate::arp::send_request(&our_mac, &our_ip, &dst_ip);
+        let mut yields: u32 = 0;
+        while crate::arp::lookup(&dst_ip).is_none() && yields < CONNECT_ARP_MAX_YIELDS {
+            yield_fn();
+            yields += 1;
+        }
+        // If we timed out, fall through to plain `connect` anyway — it'll
+        // fire another ARP and return SynSent; caller's reconnect loop is
+        // still the last-resort fallback.
+    }
+
+    connect(dst_ip, dst_port, src_port)
 }
 
 /// Send data on an established connection.
@@ -648,6 +826,7 @@ pub fn send_data(idx: usize, data: &[u8]) -> i32 {
     let max_send = (cwnd as usize)
         .min(remote_mss as usize)
         .min(remote_window as usize)
+        .min(TCP_MSS)               // never emit a segment larger than our own MSS
         .min(data.len());
     if max_send == 0 { return 0; }
     let send_data_slice = &data[..max_send];
@@ -675,6 +854,73 @@ pub fn send_data(idx: usize, data: &[u8]) -> i32 {
     } else {
         -1
     }
+}
+
+/// Maximum number of `yield_fn` calls `send_all_with_yield` will spin before
+/// giving up.  Acts as a soft timeout — if the peer never advances cwnd /
+/// never ACKs, we don't loop forever.  Sized for tens of seconds under QEMU
+/// TCG (where each yield may cost ~milliseconds) and a few hundred ms on
+/// real hardware.
+pub const SEND_ALL_MAX_YIELDS: u32 = 10_000;
+
+/// Read the unacked flag for a connection (true while a sent segment is
+/// awaiting ACK).  Exposed so multi-segment senders can wait for an in-flight
+/// segment to clear before overwriting `retx_buf`.
+pub fn is_unacked(idx: usize) -> bool {
+    if idx >= TCP_MAX_CONNS { return false; }
+    let t = TCP.lock();
+    t.conns[idx].unacked
+}
+
+/// Send all bytes of `data`, looping over partial `send_data` calls.
+///
+/// `send_data` returns at most one TCP segment's worth (bounded by cwnd,
+/// remote MSS, or remote window — whichever is smallest).  Callers that
+/// trust the first return value drop every byte past the segment boundary
+/// (root cause of #39 / sensor-pump pt2).
+///
+/// This helper loops until all `data.len()` bytes have been handed to the
+/// stack OR the connection drops OR the yield budget is exhausted (timeout).
+/// Between segments it waits for the previous segment's ACK so the next
+/// `send_data` call doesn't overwrite `retx_buf` while the previous segment
+/// is still in flight.
+///
+/// `yield_fn` is injected (instead of pulling in `crates/sched`) to keep the
+/// `net` crate scheduler-agnostic.  Kernel callers pass
+/// `robot_os_sched::task_yield`; userspace can pass a syscall yield.
+///
+/// Returns bytes successfully sent (≤ `data.len()`).  Callers should check
+/// `sent < data.len()` to detect partial completion (rare — peer stall).
+pub fn send_all_with_yield<F: FnMut()>(
+    idx: usize,
+    data: &[u8],
+    mut yield_fn: F,
+) -> usize {
+    let mut sent_total: usize = 0;
+    let mut yields: u32 = 0;
+    while sent_total < data.len() && yields < SEND_ALL_MAX_YIELDS {
+        // Wait for any in-flight segment to ACK before sending more — see
+        // is_unacked rationale above.
+        while is_unacked(idx) && yields < SEND_ALL_MAX_YIELDS {
+            yield_fn();
+            yields += 1;
+        }
+        if yields >= SEND_ALL_MAX_YIELDS { break; }
+
+        let n = send_data(idx, &data[sent_total..]);
+        if n < 0 {
+            // Connection dropped or fd invalid — caller will observe partial.
+            break;
+        }
+        if n == 0 {
+            // Peer window closed / cwnd not yet open — yield and retry.
+            yield_fn();
+            yields += 1;
+            continue;
+        }
+        sent_total += n as usize;
+    }
+    sent_total
 }
 
 /// Read received data from a connection.  Returns bytes read, 0 if none.
@@ -776,8 +1022,36 @@ pub fn accept(local_port: u16) -> i32 {
     -1
 }
 
-/// Handle an incoming TCP segment (called from ip::handle).
-pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
+/// Handle an incoming TCP segment with receive-side checksum validation.
+///
+/// Called from `ip::handle`, which forwards both IP endpoints.
+///
+/// Requires both endpoints because the TCP checksum covers the IPv4
+/// pseudo-header (src, dst, proto, length).  This is the ONLY ingress path —
+/// the segment processor below is private, so no future caller can reach it
+/// without passing through this validation.
+///
+/// Unlike UDP the TCP checksum is mandatory (RFC 793 §3.1): there is no
+/// "sender opted out" encoding, so any mismatch is an unconditional drop.
+pub fn handle_checked(src_ip: &[u8; 4], dst_ip: &[u8; 4], data: &[u8]) {
+    if data.len() < TCP_HDR_MIN { return; }
+    // TCP carries no length field of its own — the segment length comes from
+    // the IP total length, i.e. exactly what `ip::handle` sliced for us.
+    let tcp_len = match u16::try_from(data.len()) { Ok(n) => n, Err(_) => return };
+
+    // Sum the segment *including* the stored checksum; a correct segment folds
+    // to 0xFFFF, so the complement must be zero.
+    let pseudo = ip::pseudo_checksum(src_ip, dst_ip, ip::IP_PROTO_TCP, tcp_len);
+    if tcp_checksum(pseudo, data) != 0 { return; }
+
+    handle(src_ip, data);
+}
+
+/// Process a TCP segment whose checksum has already been verified.
+///
+/// Private by design: `handle_checked` is the only way in, so this cannot be
+/// reached without the mandatory checksum validation having run first.
+fn handle(src_ip: &[u8; 4], data: &[u8]) {
     if data.len() < TCP_HDR_MIN { return; }
     let hdr = unsafe { &*(data.as_ptr() as *const TcpHdr) };
     let dst_port  = u16::from_be_bytes(hdr.dst_port);
@@ -785,13 +1059,33 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
     let seq       = u32::from_be_bytes(hdr.seq);
     let ack_num   = u32::from_be_bytes(hdr.ack);
     let flags     = hdr.flags;
+
+    // Sensor-pump (#39) trace probe: log every inbound TCP segment with
+    // flags + seq + ack + payload length so we can compare against what
+    // the brain claims to send.  Gated on `--features qemu` so production
+    // builds pay nothing.
+    #[cfg(feature = "qemu")]
+    {
+        let off_hdr = ((hdr.data_off >> 4) as usize) * 4;
+        let off_hdr = if off_hdr < TCP_HDR_MIN { TCP_HDR_MIN } else { off_hdr };
+        let pl_len = data.len().saturating_sub(off_hdr);
+        robot_os_drivers::kprintln!(
+            "[TCP-RX] src={}.{}.{}.{}:{} -> :{} flags=0x{:02x} seq={} ack={} pl={}B",
+            src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
+            dst_port, flags, seq, ack_num, pl_len
+        );
+    }
     // Peer's advertised receive window — we cap our outbound size by
     // this so we don't overshoot and force the peer to drop segments.
     let peer_win  = u16::from_be_bytes(hdr.window);
     let off       = ((hdr.data_off >> 4) as usize) * 4;
-    // TCP header is at least 20 bytes (data_off >= 5); reject malformed segments.
-    let off       = if off < TCP_HDR_MIN { TCP_HDR_MIN } else { off };
-    let payload   = if off <= data.len() { &data[off..] } else { &[] };
+    // RFC 793: data_off >= 5 (20-byte minimum header) and the header cannot
+    // extend past the segment end.  Both are malformed — DROP, don't guess.
+    // The previous clamp (off < 20 → treat as 20) reinterpreted option bytes
+    // as payload; the `off > len → payload = &[]` fallback processed flags
+    // from a header that claims bytes the segment doesn't contain.
+    if off < TCP_HDR_MIN || off > data.len() { return; }
+    let payload   = &data[off..];
 
     let (mac, ip) = { let t = TCP.lock(); (t.our_mac, t.our_ip) };
     let now = robot_os_drivers::clint::get_time();
@@ -807,6 +1101,36 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
         // keeps the slot allocated forever (resource-exhaustion DoS), and
         // the unacked retx_buf keeps the bogus RTT samples driving cwnd.
         if flags & TCP_RST != 0 {
+            // Every state validates the RST before acting on it. The previous
+            // version exempted SynSent/SynRcvd with the comment "validated
+            // elsewhere" — there was no elsewhere, so a RST bearing any
+            // sequence number closed a connecting socket.
+            let (st, rcv_nxt, iss) = {
+                let t = TCP.lock();
+                (t.conns[idx].state, t.conns[idx].ack, t.conns[idx].seq)
+            };
+            let acceptable = match st {
+                // RFC 793 §3.4: a RST is only meaningful here if it
+                // acknowledges our SYN, i.e. it came from a host that actually
+                // saw it. Without the ACK check the ISN randomisation buys
+                // nothing on this path: any RST at all killed the connect.
+                TcpState::SynSent => {
+                    flags & TCP_ACK != 0 && ack_num == iss.wrapping_add(1)
+                }
+                // RFC 793: ignore a RST while listening. `find_conn` can match
+                // a Listen slot (its remote endpoint is 0.0.0.0:0), so a
+                // spoofed segment from 0.0.0.0:0 would otherwise destroy the
+                // listener — the server socket vanishes with no other symptom.
+                TcpState::Listen | TcpState::Closed => false,
+                // SynRcvd and every synchronised state: RFC 5961 — the
+                // sequence must fall in the receive window, or an off-path
+                // attacker who knows the 4-tuple tears the flow down with one
+                // spoofed segment.
+                _ => seq_in_window(seq, rcv_nxt, TCP_WINDOW_SIZE as u32),
+            };
+            if !acceptable {
+                return; // unacceptable RST — ignore (do not tear down)
+            }
             let mut t = TCP.lock();
             let c = &mut t.conns[idx];
             c.state          = TcpState::Closed;
@@ -820,11 +1144,40 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
         let state = { TCP.lock().conns[idx].state };
         match state {
             TcpState::SynSent if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 => {
+                // RFC 793 §3.4: a SYN-ACK is only ours if it acknowledges our
+                // SYN — SEG.ACK must equal ISS+1. `c.seq` still holds the ISS
+                // here (it is incremented on the transition below).
+                //
+                // This arm used to match on flags alone and never read
+                // `ack_num`, which made the RFC 6528 ISN randomisation
+                // decorative on the active-open path: an off-path attacker who
+                // guessed the 4-tuple (16 tries, given the deterministic
+                // ephemeral port) could complete our handshake without ever
+                // seeing the SYN-ACK, and hand the application a connection to
+                // a host of their choosing.
+                {
+                    let t = TCP.lock();
+                    if ack_num != t.conns[idx].seq.wrapping_add(1) { return; }
+                }
                 // SYN-ACK received → parse MSS, send ACK, move to Established
                 let remote_mss = parse_mss_option(data, off);
                 {
                     let mut t = TCP.lock();
                     let c = &mut t.conns[idx];
+                    // Our SYN consumed one sequence number (RFC 793 §3.3): the
+                    // peer ACKs ISN+1, so SND.NXT must advance to ISN+1 before
+                    // the first data byte. The passive-open path (SynRcvd→ACK
+                    // below) already does this; the active-open path did not,
+                    // leaving c.seq one BEHIND. Effect: the first data segment
+                    // started at ISN, whose first byte the peer treats as the
+                    // already-ACKed SYN slot and discards — so the app received
+                    // (len-1) bytes of the FIRST post-connect segment. Streaming
+                    // senders (sensor pump) self-realign after one frame and the
+                    // brain MAGIC-resyncs past it, which is why this stayed
+                    // latent; a one-shot request/response (the RFC-0019 handshake
+                    // reply, #34/#74) has no second frame to recover, so it
+                    // surfaced as "stub reads 65 of 66 bytes" → handshake stall.
+                    c.seq   = c.seq.wrapping_add(1);
                     c.ack   = seq.wrapping_add(1);
                     c.state = TcpState::Established;
                     c.remote_mss    = remote_mss;
@@ -836,9 +1189,20 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                 send_segment(&mac, &ip, src_ip, dst_port, src_port, TCP_ACK, seq_n, ack_n, &[]);
             }
             TcpState::SynRcvd if flags & TCP_ACK != 0 && flags & TCP_SYN == 0 => {
-                // Client's ACK completing the 3-way handshake → Established
+                // Client's ACK completing the 3-way handshake → Established.
+                //
+                // RFC 793 §3.4 / RFC 6528: the ACK must acknowledge the SYN-ACK
+                // we sent, i.e. SEG.ACK == our ISS + 1. Without this the
+                // handshake completes on an ACK the peer could not have
+                // computed: an off-path attacker spoofs a SYN from a victim
+                // address, then immediately spoofs a bare ACK without ever
+                // seeing our SYN-ACK, and `accept()` hands the application a
+                // connection that appears to come from the victim. Checking
+                // the ISN on the way back in is the entire reason for
+                // generating it unpredictably.
                 let mut t = TCP.lock();
                 let c = &mut t.conns[idx];
+                if ack_num != c.seq.wrapping_add(1) { return; }
                 c.seq   = c.seq.wrapping_add(1);
                 c.state = TcpState::Established;
                 c.remote_window = peer_win;
@@ -847,12 +1211,15 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
             }
             TcpState::Established => {
                 // --- Sequence number validation ---
+                //
+                // Applied to EVERY segment, data-bearing or not. See
+                // `segment_acceptable`: the check used to be nested inside the
+                // payload branch, so a bare ACK reached the window/congestion
+                // bookkeeping below with no validation at all.
                 let expected_ack = { TCP.lock().conns[idx].ack };
-                if !payload.is_empty() {
-                    if !seq_in_window(seq, expected_ack, TCP_WINDOW_SIZE as u32) {
-                        // Out-of-window segment — drop silently
-                        return;
-                    }
+                if !segment_acceptable(seq, payload.len(), expected_ack) {
+                    // Out-of-window segment — drop silently
+                    return;
                 }
 
                 // --- ACK processing ---
@@ -987,8 +1354,30 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
 
                 // --- FIN handling ---
                 if flags & TCP_FIN != 0 {
+                    // Only honour a FIN whose sequence is in the receive window
+                    // (RFC 5961). The check at the top of this arm is broader —
+                    // it also admits the RFC 1122 keep-alive shape at
+                    // `RCV.NXT - 1`, which must never be read as a connection
+                    // teardown — so a FIN is re-tested against the window here.
+                    if !seq_in_window(seq, expected_ack, TCP_WINDOW_SIZE as u32) {
+                        return;
+                    }
                     let mut t = TCP.lock();
                     let c = &mut t.conns[idx];
+                    // The FIN occupies sequence number seq + payload_len.  Only
+                    // consume it once every byte before it has actually landed
+                    // in the rx ring (c.ack caught up to it).  Two failure
+                    // modes otherwise: (a) ring filled mid-segment — c.ack
+                    // advanced only by `stored`, and +1 here would acknowledge
+                    // a data byte we dropped, silently losing the tail of the
+                    // stream; (b) the FIN segment arrived out of order (its
+                    // payload went to the OOO buffer) — +1 would desync the
+                    // flow entirely.  In both cases just skip: the earlier ACK
+                    // reported what we stored, and the peer retransmits the
+                    // remaining payload + FIN.
+                    if c.ack != seq.wrapping_add(payload.len() as u32) {
+                        return;
+                    }
                     c.ack = c.ack.wrapping_add(1); // FIN consumes one sequence number
                     c.state = TcpState::CloseWait;
                     c.last_activity = now;
@@ -1006,9 +1395,17 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                     let c = &mut t.conns[idx];
                     // Our FIN has been ACKed
                     if ack_num == c.fin_seq.wrapping_add(1) {
-                        if flags & TCP_FIN != 0 {
+                        // Same rule as the branch below: the FIN must fall in
+                        // the receive window before we consume it, or a
+                        // spoofed FIN bearing any sequence at all pushes us
+                        // into TimeWait. An out-of-window FIN is not ours to
+                        // consume — the ACK above is still valid, so fall
+                        // through to FinWait2 rather than dropping it.
+                        if flags & TCP_FIN != 0
+                            && seq_in_window(seq, c.ack, TCP_WINDOW_SIZE as u32)
+                        {
                             // Simultaneous close: FIN+ACK → TimeWait
-                            c.ack = c.ack.wrapping_add(1);
+                            c.ack = fin_next_ack(seq, payload.len());
                             c.state = TcpState::TimeWait;
                             c.time_wait_start = now;
                             let (seq_n, ack_n) = (c.seq, c.ack);
@@ -1020,10 +1417,13 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                         }
                     }
                 } else if flags & TCP_FIN != 0 {
-                    // Peer FIN before our FIN is ACKed → simultaneous close
+                    // Peer FIN before our FIN is ACKed → simultaneous close.
+                    // Unvalidated, any spoofed FIN carrying any sequence at all
+                    // pushed us into TimeWait and desynchronised the flow.
                     let mut t = TCP.lock();
                     let c = &mut t.conns[idx];
-                    c.ack = c.ack.wrapping_add(1);
+                    if !seq_in_window(seq, c.ack, TCP_WINDOW_SIZE as u32) { return; }
+                    c.ack = fin_next_ack(seq, payload.len());
                     c.state = TcpState::TimeWait;
                     c.time_wait_start = now;
                     let (seq_n, ack_n) = (c.seq, c.ack);
@@ -1036,7 +1436,12 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                 if flags & TCP_FIN != 0 {
                     let mut t = TCP.lock();
                     let c = &mut t.conns[idx];
-                    c.ack = c.ack.wrapping_add(1);
+                    // The FIN must fall in the receive window. This state
+                    // previously accepted a FIN bearing any sequence number
+                    // whatsoever, which both closed the connection on command
+                    // and left `c.ack` pointing somewhere arbitrary.
+                    if !seq_in_window(seq, c.ack, TCP_WINDOW_SIZE as u32) { return; }
+                    c.ack = fin_next_ack(seq, payload.len());
                     c.state = TcpState::TimeWait;
                     c.time_wait_start = now;
                     let (seq_n, ack_n) = (c.seq, c.ack);
@@ -1048,8 +1453,16 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
             TcpState::LastAck => {
                 if flags & TCP_ACK != 0 {
                     let mut t = TCP.lock();
-                    t.conns[idx].state = TcpState::Closed;
-                    t.conns[idx].unacked = false;
+                    let c = &mut t.conns[idx];
+                    // Only the ACK of OUR FIN closes the connection
+                    // (SEG.ACK == FIN sequence + 1). Any ACK used to do it,
+                    // including one carrying a stale or forged acknowledgement
+                    // number, so the slot could be freed while the peer still
+                    // considered the connection open — and reused for a new
+                    // peer while the old one's segments were still arriving.
+                    if ack_num != c.fin_seq.wrapping_add(1) { return; }
+                    c.state = TcpState::Closed;
+                    c.unacked = false;
                 }
             }
             TcpState::TimeWait => {
@@ -1082,9 +1495,12 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
                 n
             };
             if half_open >= MAX_HALF_OPEN_PER_LISTENER {
-                // Drop the SYN — the peer will retransmit. If they were
-                // legitimate, eventually one of the half-open slots will
-                // either complete or be reaped on RTO.
+                // Drop the SYN — the peer will retransmit. A legitimate peer
+                // gets in once a half-open slot completes or is reaped: the
+                // handshake timer in `tcp_tick` forces any SynRcvd slot back
+                // to Closed after `SYN_MAX_RETRIES` × `SYN_RETRY_INTERVAL_MS`
+                // (~5 s), so this cap can only ever delay a connection, never
+                // deafen the listener permanently.
                 return;
             }
             // Accept: create new connection for this peer
@@ -1144,17 +1560,24 @@ fn store_ooo_segment(c: &mut TcpConn, seg_seq: u32, data: &[u8]) {
         }
     }
     if slot.is_none() && (c.ooo_count as usize) >= OOO_MAX_SEGMENTS {
-        // Evict the entry with the highest sequence number
-        let mut max_seq = 0u32;
-        let mut max_idx = 0;
+        // Evict the entry with the highest sequence number (farthest from
+        // c.ack — least likely to become contiguous soon).  Track the best
+        // candidate explicitly: the previous version seeded max_seq = 0, and
+        // `0.wrapping_sub(c.ack)` is ~u32::MAX for any nonzero ack, so no
+        // real in-window entry ever beat the seed and slot 0 was always the
+        // one evicted, regardless of its sequence.
+        let mut best: Option<(usize, u32)> = None;
         for i in 0..OOO_MAX_SEGMENTS {
-            if c.ooo_buf[i].valid && c.ooo_buf[i].seq.wrapping_sub(c.ack) > max_seq.wrapping_sub(c.ack) {
-                max_seq = c.ooo_buf[i].seq;
-                max_idx = i;
+            if !c.ooo_buf[i].valid { continue; }
+            let off = c.ooo_buf[i].seq.wrapping_sub(c.ack);
+            if best.map_or(true, |(_, b)| off > b) {
+                best = Some((i, off));
             }
         }
-        slot = Some(max_idx);
-        c.ooo_count = c.ooo_count.saturating_sub(1);
+        if let Some((i, _)) = best {
+            slot = Some(i);
+            c.ooo_count = c.ooo_count.saturating_sub(1);
+        }
     }
 
     if let Some(s) = slot {
@@ -1254,15 +1677,64 @@ pub fn tcp_tick() {
 
     for idx in 0..TCP_MAX_CONNS {
         let (state, unacked, retx_time, rto, retx_count, last_act, ka_probes,
-             retx_seq, retx_len, ack_val, lp, rp, rip) = {
+             retx_seq, retx_len, conn_seq, ack_val, lp, rp, rip) = {
             let t = TCP.lock();
             let c = &t.conns[idx];
             (c.state, c.unacked, c.retx_time, c.rto_ticks, c.retx_count,
              c.last_activity, c.keepalive_probes,
-             c.retx_seq, c.retx_len, c.ack, c.local_port, c.remote_port, c.remote_ip)
+             c.retx_seq, c.retx_len, c.seq, c.ack, c.local_port, c.remote_port, c.remote_ip)
         };
 
         if state == TcpState::Closed || state == TcpState::Listen {
+            continue;
+        }
+
+        // --- Handshake (half-open) timer ---
+        //
+        // The retransmission branch below is gated on `unacked`, which is
+        // false for the whole handshake (neither `connect` nor the listener's
+        // SynRcvd path arms it — a SYN carries no data to put in `retx_buf`).
+        // That is why half-open slots previously lived forever: this was the
+        // reaper `MAX_HALF_OPEN_PER_LISTENER` assumed existed. Four SYNs that
+        // were opened and abandoned deafened a listener until reboot; eight
+        // took every slot in the table.
+        //
+        // `retx_time` is seeded to the creation instant by `reset_conn_state`,
+        // so it serves as both "when the last SYN went out" and "when this
+        // slot was born", and `retx_count` — unused while `unacked` is false —
+        // counts the retries. Retransmitting rather than only reaping is also
+        // the correct behaviour: a dropped SYN-ACK now recovers in ~1 s
+        // instead of stalling until the peer gives up.
+        if state == TcpState::SynSent || state == TcpState::SynRcvd {
+            let interval = SYN_RETRY_INTERVAL_MS * TICKS_PER_MS;
+            if now.saturating_sub(retx_time) >= interval {
+                if retx_count >= SYN_MAX_RETRIES {
+                    // Budget spent — free the slot.
+                    let mut t = TCP.lock();
+                    let c = &mut t.conns[idx];
+                    c.state        = TcpState::Closed;
+                    c.unacked      = false;
+                    c.retx_len     = 0;
+                    c.retx_count   = 0;
+                    c.was_accepted = false;
+                    continue;
+                }
+                // Re-send our SYN (active open) or SYN-ACK (passive open).
+                // `conn_seq` is still the ISS in both states: it is only
+                // advanced on the transition to Established.
+                let (syn_flags, syn_ack) = if state == TcpState::SynSent {
+                    (TCP_SYN, 0)
+                } else {
+                    (TCP_SYN | TCP_ACK, ack_val)
+                };
+                send_syn_segment(&mac, &ip, &rip, lp, rp, syn_flags, conn_seq, syn_ack);
+
+                let mut t = TCP.lock();
+                let c = &mut t.conns[idx];
+                c.retx_count = c.retx_count.saturating_add(1);
+                c.retx_time  = now;
+            }
+            // Nothing below applies to a half-open connection.
             continue;
         }
 
@@ -1409,6 +1881,7 @@ fn send_syn_segment(
 }
 
 /// Build and send a TCP segment.  Returns 0 on success.
+#[wcet(200_us)]
 fn send_segment(
     our_mac:  &[u8; 6],
     our_ip:   &[u8; 4],
@@ -1422,6 +1895,37 @@ fn send_segment(
 ) -> i32 {
     let tcp_len = TCP_HDR_MIN + data.len();
     if tcp_len > TCP_SEGMENT_BUF_SIZE { return -1; }
+
+    // Sensor-pump (#39) trace probe: log every outbound TCP segment.
+    // Pairs with the [TCP-RX] probe in `handle()` so we have full
+    // visibility into the wire conversation under `--features qemu`.
+    // Also dump the first 16 bytes of payload for non-trivial segments
+    // so we can see WHAT got serialised vs what the peer reads.
+    #[cfg(feature = "qemu")]
+    {
+        robot_os_drivers::kprintln!(
+            "[TCP-TX] :{} -> {}.{}.{}.{}:{} flags=0x{:02x} seq={} ack={} pl={}B",
+            src_port,
+            dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
+            flags, seq, ack, data.len()
+        );
+        if !data.is_empty() {
+            let n = data.len().min(16);
+            // Pre-format 16 bytes (zero-padded if shorter) so kprintln doesn't
+            // need a slice-formatting helper.
+            let mut hex = [0u8; 32];
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for i in 0..n {
+                hex[2*i]   = HEX[(data[i] >> 4) as usize];
+                hex[2*i+1] = HEX[(data[i] & 0x0f) as usize];
+            }
+            robot_os_drivers::kprintln!(
+                "[TCP-TX]   first {}B: {}",
+                n,
+                core::str::from_utf8(&hex[..2*n]).unwrap_or("?")
+            );
+        }
+    }
 
     let mut buf = [0u8; TCP_SEGMENT_BUF_SIZE];
     let hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut TcpHdr) };
@@ -1446,7 +1950,11 @@ fn send_segment(
     ip::send(our_mac, our_ip, dst_ip, ip::IP_PROTO_TCP, &buf[..tcp_len])
 }
 
-fn tcp_checksum(pseudo_sum: u32, data: &[u8]) -> u16 {
+/// Internet checksum seeded with a pseudo-header partial sum.
+/// Used on the TCP TX path, and on both the TCP and UDP RX paths for
+/// verification (a valid segment yields 0).  `udp.rs` reuses this rather than
+/// carrying a second copy of the fold loop.
+pub(crate) fn tcp_checksum(pseudo_sum: u32, data: &[u8]) -> u16 {
     let mut sum = pseudo_sum;
     let mut i = 0;
     while i + 1 < data.len() {

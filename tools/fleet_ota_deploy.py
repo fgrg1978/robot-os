@@ -46,7 +46,7 @@ from urllib.request import urlopen
 OTA_MAGIC          = b"ROTA"
 OTA_HEADER_VERSION = 1
 OTA_HEADER_SIZE    = 24
-PLATFORMS          = {"qemu": 0, "vf2": 1, "k1": 2, "esp32c3": 3}
+PLATFORMS          = {"qemu": 0, "vf2": 1, "k1": 2}
 
 
 @dataclass

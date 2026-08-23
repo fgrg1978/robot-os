@@ -20,6 +20,9 @@ pub mod multilink;
 pub mod lora;
 pub mod rf;
 
+// DEV01.2 — boot-time TFTP fetch (RFC 1350) wired over UDP.
+pub mod tftp_client;
+
 pub use multilink::{
     Transport, TransportError, MultiLinkTransport,
     MAX_LINKS,
@@ -36,6 +39,11 @@ pub use socket::{
     socket_listen, socket_listen_bound, socket_accept,
     socket_send, socket_recv, socket_close,
     SockAddr, AF_INET, SOCK_STREAM, SOCK_DGRAM, IPPROTO_TCP, IPPROTO_UDP,
+    // Per-task socket ownership. `socket_create_owned` / `socket_accept_owned`
+    // stamp the owning TID; `socket_owner` is what the syscall layer's gate
+    // reads; `socket_release_all` is the task-exit hook. See `socket.rs`.
+    socket_create_owned, socket_accept_owned, socket_owner,
+    socket_release_all, SOCK_OWNER_KERNEL, MAX_SOCKETS,
 };
 
 pub use ipv6::{
@@ -81,36 +89,47 @@ static NET_CFG: SpinLock<NetConfig> = SpinLock::new(NetConfig::new());
 // These two functions hide the difference from the rest of the stack.
 
 /// Send a raw Ethernet frame via the active transport.
+///
+/// No separate `is_ready()` pre-check for the VirtIO path: `send()` already
+/// fails cleanly on an uninitialized device, and the pre-check cost an extra
+/// `NET.lock()` round-trip on every single frame of the hot path.
 pub fn net_raw_send(frame: &[u8]) -> i32 {
     if robot_os_drivers::eth::eth_is_ready() {
         return robot_os_drivers::eth::eth_send(frame);
     }
-    if robot_os_drivers::virtio::net::is_ready() {
-        return match robot_os_drivers::virtio::net::send(frame) {
-            Ok(()) => frame.len() as i32,
-            Err(()) => -1,
-        };
+    match robot_os_drivers::virtio::net::send(frame) {
+        Ok(()) => frame.len() as i32,
+        Err(()) => -1,
     }
-    -1
 }
 
 /// Receive a raw Ethernet frame from the active transport.
 /// Returns the number of bytes received, or 0 if none available.
+///
+/// Same rationale as `net_raw_send`: `poll_recv()` guards on device readiness
+/// itself, so the previous `is_ready()` call here doubled the lock traffic of
+/// the busiest loop in the stack (`net_poll` calls this up to 64x per tick).
 fn net_raw_recv(buf: &mut [u8]) -> usize {
     if robot_os_drivers::eth::eth_is_ready() {
         let n = robot_os_drivers::eth::eth_recv(buf);
         return if n > 0 { n as usize } else { 0 };
     }
-    if robot_os_drivers::virtio::net::is_ready() {
-        return robot_os_drivers::virtio::net::poll_recv(buf);
-    }
-    0
+    robot_os_drivers::virtio::net::poll_recv(buf)
 }
 
 /// Initialize the network stack.
 ///
 /// Must be called after the transport driver is ready (VirtIO net or MACB eth).
 pub fn net_init() {
+    // Seed the TCP ISN secret from runtime entropy so an attacker who has the
+    // binary cannot predict every initial sequence number (RFC 6528). This
+    // bare-metal target has no dedicated TRNG crate today, so we mix the
+    // CLINT cycle counter at boot (unpredictable from static analysis) plus
+    // each transport MAC. Once a real TRNG lands, replace this seed source.
+    let boot_time = robot_os_drivers::clint::get_time();
+    let seed = (boot_time as u32) ^ ((boot_time >> 32) as u32);
+    tcp::isn_secret_seed(seed);
+
     // Determine which transport is available and get its MAC.
     let (mac, ready) = if robot_os_drivers::eth::eth_is_ready() {
         (robot_os_drivers::eth::eth_mac_addr(), true)
@@ -222,10 +241,18 @@ pub fn net_info() {
 
 /// Set a static IP configuration.
 pub fn net_set_ip(ip: [u8; 4], mask: [u8; 4], gw: [u8; 4]) {
-    let mut cfg = NET_CFG.lock();
-    cfg.ip      = ip;
-    cfg.mask    = mask;
-    cfg.gateway = gw;
+    {
+        let mut cfg = NET_CFG.lock();
+        cfg.ip      = ip;
+        cfg.mask    = mask;
+        cfg.gateway = gw;
+    }
+    // TCP caches its own copy for the checksum pseudo-header, and used to be
+    // written only by `tcp::init`. Anything that changed the address later —
+    // DHCP above all — left TCP checksumming against the old one, which drops
+    // every segment silently. Done after releasing NET_CFG so the two locks are
+    // never held at once.
+    tcp::set_our_ip(ip);
 }
 
 /// Get current IP address.

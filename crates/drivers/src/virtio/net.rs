@@ -48,6 +48,15 @@ const NET_HDR_SIZE: usize = core::mem::size_of::<VirtioNetHdr>();
 const RX_BUF_SIZE: usize = 1526; // 1514 ETH + 12 VirtIO net hdr (with padding)
 const NUM_RX_BUFS: usize = VIRTIO_QUEUE_SIZE / 2;
 
+// ---- TX buffers ----
+
+/// Max Ethernet frame we will transmit (no jumbo frames).
+const TX_BUF_SIZE: usize = 1514;
+/// One slot per descriptor index so a frame's buffer is identified by the very
+/// descriptor that references it — no separate allocator, and the buffer is
+/// live for exactly as long as the device owns the descriptor.
+const NUM_TX_BUFS: usize = VIRTIO_QUEUE_SIZE;
+
 struct NetState {
     dev:     VirtioDev,
     rxq:     Virtq,
@@ -55,6 +64,12 @@ struct NetState {
     mac:     [u8; 6],
     ready:   bool,
     rx_bufs: [[u8; RX_BUF_SIZE]; NUM_RX_BUFS],
+    /// Driver-owned TX staging. The device is never handed a caller address:
+    /// `send` returns as soon as the frame is queued, so a caller buffer could
+    /// be reused or popped off the stack while the device is still reading it.
+    tx_bufs: [[u8; TX_BUF_SIZE]; NUM_TX_BUFS],
+    /// Frames dropped because the TX ring was still full after reclaiming.
+    tx_dropped: u32,
 }
 
 impl NetState {
@@ -66,6 +81,8 @@ impl NetState {
             mac:     [0u8; 6],
             ready:   false,
             rx_bufs: [[0u8; RX_BUF_SIZE]; NUM_RX_BUFS],
+            tx_bufs: [[0u8; TX_BUF_SIZE]; NUM_TX_BUFS],
+            tx_dropped: 0,
         }
     }
 }
@@ -97,12 +114,28 @@ pub fn init() -> Result<(), ()> {
         unsafe { virtq_init(&mut dev, 0, &mut net.rxq) }?;
         unsafe { virtq_init(&mut dev, 1, &mut net.txq) }?;
 
-        // Read MAC address from config space (bytes 0-5)
-        for j in 0..6 {
-            net.mac[j] = unsafe {
-                mmio_read(dev.base, super::VIRTIO_MMIO_CONFIG + j as u32) as u8
-            };
-        }
+        // Read MAC address from config space (bytes 0-5).
+        //
+        // `mmio_read` is a 32-bit access, so it must only be issued at 4-byte
+        // aligned offsets. The previous version looped `CONFIG + 0..6` and took
+        // the low byte of each result: offsets 1/2/3 are unaligned, the device
+        // rounds them down to offset 0, and the low byte of that word is always
+        // MAC[0]. It therefore produced [m0,m0,m0,m0,m4,m4] — for QEMU's
+        // default 52:54:00:12:34:56 that is 52:52:52:52:34:34, a MAC the guest
+        // never actually owns. SLIRP tolerated the bogus address, so it went
+        // unnoticed until two guests had to ARP for each other.
+        //
+        // Read the two aligned words instead and unpack. VirtIO MMIO config
+        // space is little-endian and RISC-V is LE, so byte n of the config
+        // space is byte n of the word, LSB first.
+        let w0 = unsafe { mmio_read(dev.base, super::VIRTIO_MMIO_CONFIG) };
+        let w1 = unsafe { mmio_read(dev.base, super::VIRTIO_MMIO_CONFIG + 4) };
+        net.mac[0] =  w0        as u8;
+        net.mac[1] = (w0 >>  8) as u8;
+        net.mac[2] = (w0 >> 16) as u8;
+        net.mac[3] = (w0 >> 24) as u8;
+        net.mac[4] =  w1        as u8;
+        net.mac[5] = (w1 >>  8) as u8;
 
         // DRIVER_OK
         let s = unsafe { mmio_read(dev.base, VIRTIO_MMIO_STATUS) };
@@ -151,54 +184,107 @@ pub fn is_ready() -> bool {
     NET.lock().ready
 }
 
-/// Send a raw Ethernet frame.  `data` should include the Ethernet header.
-/// Prepends a zeroed VirtIO net header automatically.
+/// Free a completed TX chain (hdr -> data) starting at `head`.
+///
+/// `.next` must be read before each free: `virtq_free_desc` overwrites it to
+/// thread the descriptor back onto the free list.
+unsafe fn tx_reclaim_chain(net: &mut NetState, head: usize) {
+    let qsize = net.txq.num as usize;
+    let mut idx = head;
+    // Bounded and range-checked. `virtq_free_desc` scrubs the descriptor on
+    // free (`flags`/`addr`/`len` zeroed, `.next` rethreaded onto the free
+    // list), so a walk that reaches an already-freed descriptor sees no
+    // NEXT flag and terminates there instead of following the free list to
+    // the 0xFFFF terminator. The flags/next reads below still happen before
+    // the free, and the loop stays bounded by qsize as defence in depth
+    // against a duplicate completion from the device.
+    for _ in 0..qsize {
+        if idx >= qsize { return; }
+        let d = net.txq.desc.add(idx);
+        let has_next = (*d).flags & VIRTQ_DESC_F_NEXT != 0;
+        let next = (*d).next as usize;
+        virtq_free_desc(&mut net.txq, idx);
+        if !has_next { return; }
+        idx = next;
+    }
+}
+
+/// Queue a raw Ethernet frame for transmission. `data` must include the
+/// Ethernet header; the VirtIO net header is prepended automatically.
+///
+/// Asynchronous: returns once the frame is queued, without waiting for the
+/// device to consume it. It previously spun on `virtq_poll` until each frame
+/// completed, with `NET.lock()` held. Two problems, both fixed here:
+///
+///  * **Deadlock.** The spin was unbounded and the lock blocked every other
+///    network path, RX draining included. Two of these kernels on one link
+///    wedge each other permanently: both fill the peer's pipe, both block in
+///    TX, and neither can drain the RX that would release the other.
+///
+///  * **Throughput.** Stalling on every frame caps TX at one frame per
+///    completion round-trip. Gigabit is ~81k frames/s at 1500 bytes; a
+///    synchronous handshake per frame cannot reach that at any clock rate.
+///
+/// Returning early means the device reads the buffer after we return, so the
+/// frame is staged into driver-owned `tx_bufs` instead of pointing at caller
+/// memory — otherwise a stack buffer could be reused mid-DMA. Completed chains
+/// are reclaimed lazily at the head of the next call, so a descriptor the
+/// device still owns is never recycled underneath it.
 pub fn send(data: &[u8]) -> Result<(), ()> {
+    if data.is_empty() || data.len() > TX_BUF_SIZE { return Err(()); }
+
     let mut net = NET.lock();
     if !net.ready { return Err(()); }
 
-    // We need 2 descriptors: one for VirtIO header, one for packet data
+    // The only place descriptors come back — which is what makes the early
+    // return safe.
+    while let Some(done) = unsafe { virtq_poll(&mut net.txq) } {
+        unsafe { tx_reclaim_chain(&mut net, done) };
+    }
+
+    // Two descriptors per frame: VirtIO header, then payload.
     let hdr_idx = match unsafe { virtq_alloc_desc(&mut net.txq) } {
         Some(i) => i,
-        None    => return Err(()),
+        None    => { net.tx_dropped = net.tx_dropped.saturating_add(1); return Err(()); }
     };
     let data_idx = match unsafe { virtq_alloc_desc(&mut net.txq) } {
         Some(i) => i,
         None    => {
             unsafe { virtq_free_desc(&mut net.txq, hdr_idx) };
+            net.tx_dropped = net.tx_dropped.saturating_add(1);
             return Err(());
         }
     };
 
-    // VirtIO net header (static zeroed — no GSO/checksum offload needed)
+    // The header is constant and read-only, so one shared static is fine even
+    // with several frames in flight; only the payload is per-descriptor.
     static TX_HDR: VirtioNetHdr = VirtioNetHdr::zeroed();
 
-    // Copy device handle before mutably borrowing txq (borrow split workaround)
+    let len = data.len();
+    net.tx_bufs[data_idx][..len].copy_from_slice(data);
+    let buf_ptr = net.tx_bufs[data_idx].as_ptr() as u64;
     let dev = net.dev;
+
     unsafe {
         (*net.txq.desc.add(hdr_idx)).addr  = &TX_HDR as *const _ as u64;
         (*net.txq.desc.add(hdr_idx)).len   = NET_HDR_SIZE as u32;
         (*net.txq.desc.add(hdr_idx)).flags = VIRTQ_DESC_F_NEXT;
         (*net.txq.desc.add(hdr_idx)).next  = data_idx as u16;
 
-        (*net.txq.desc.add(data_idx)).addr  = data.as_ptr() as u64;
-        (*net.txq.desc.add(data_idx)).len   = data.len() as u32;
+        (*net.txq.desc.add(data_idx)).addr  = buf_ptr;
+        (*net.txq.desc.add(data_idx)).len   = len as u32;
         (*net.txq.desc.add(data_idx)).flags = 0;
         (*net.txq.desc.add(data_idx)).next  = 0;
 
         virtq_submit(&dev, 1, hdr_idx, &mut net.txq);
     }
 
-    // Poll until TX completes (spin-wait — no interrupt-driven TX for now)
-    loop {
-        if let Some(done_idx) = unsafe { virtq_poll(&mut net.txq) } {
-            unsafe { virtq_free_desc(&mut net.txq, done_idx) };
-            break;
-        }
-    }
-
     Ok(())
 }
+
+/// Frames dropped because the TX ring was full. Diagnostic only.
+pub fn tx_dropped() -> u32 { NET.lock().tx_dropped }
+
 
 /// Poll for a received Ethernet frame.  Copies data into `buf`, returns byte count.
 /// Returns 0 if no packet is available.
@@ -226,23 +312,62 @@ pub fn poll_recv(buf: &mut [u8]) -> usize {
     if let Some(slot) = slot_opt {
         // dev_len includes the VirtIO net header; subtract it to get the
         // Ethernet frame length.
-        let frame_len = dev_len.saturating_sub(NET_HDR_SIZE);
+        //
+        // Clamp against our own buffer: `dev_len` is written by the DEVICE into
+        // the used ring and is not trustworthy. `virtq_poll_with_len` documents
+        // that the caller must cap it, and this caller did not — a device
+        // reporting more than RX_BUF_SIZE produced an out-of-range slice, which
+        // panics, and `panic = "abort"` makes that a board reset triggered by
+        // an inbound frame.
+        let avail     = RX_BUF_SIZE.saturating_sub(NET_HDR_SIZE);
+        let frame_len = dev_len.saturating_sub(NET_HDR_SIZE).min(avail);
         let packet = &net.rx_bufs[slot][NET_HDR_SIZE..NET_HDR_SIZE + frame_len];
         let n = packet.len().min(buf.len());
         buf[..n].copy_from_slice(&packet[..n]);
 
-        // Re-queue the buffer (copy dev before mutable rxq borrow)
+        // Re-queue the buffer (copy dev before mutable rxq borrow).
+        // Rewrite addr/len as well as flags: it costs two stores and restores
+        // the descriptor↔buffer invariant even if something scribbled on the
+        // descriptor table (virtq_free_desc scrubs addr/len to 0 these days,
+        // so a descriptor that ever passed through the free list would
+        // otherwise be re-queued pointing at address 0).
         let dev = net.dev;
+        let addr = net.rx_bufs[slot].as_ptr() as u64;
         unsafe {
-            (*net.rxq.desc.add(desc_idx)).flags = VIRTQ_DESC_F_WRITE;
+            let d = net.rxq.desc.add(desc_idx);
+            (*d).addr  = addr;
+            (*d).len   = RX_BUF_SIZE as u32;
+            (*d).flags = VIRTQ_DESC_F_WRITE;
+            (*d).next  = 0;
             virtq_submit(&dev, 0, desc_idx, &mut net.rxq);
         }
 
         return n;
     }
 
-    // Buffer not found — free descriptor and return 0
-    unsafe { virtq_free_desc(&mut net.rxq, desc_idx) };
+    // Descriptor's addr doesn't match any rx_buf (device corruption, or a
+    // scrubbed descriptor that leaked through the free list). Freeing it here
+    // — the previous behaviour — permanently shrank the RX ring: with only
+    // NUM_RX_BUFS buffers, a handful of these and the node goes deaf. RX
+    // descriptors are paired 1:1 with rx_bufs[desc_idx] at init (allocated in
+    // order from a fresh free list), so when the index is in range we can
+    // restore that pairing and put the buffer back in service. Only an
+    // out-of-range index — which virtq_poll_with_len already rejects — would
+    // fall through to a free.
+    if desc_idx < NUM_RX_BUFS {
+        let dev  = net.dev;
+        let addr = net.rx_bufs[desc_idx].as_ptr() as u64;
+        unsafe {
+            let d = net.rxq.desc.add(desc_idx);
+            (*d).addr  = addr;
+            (*d).len   = RX_BUF_SIZE as u32;
+            (*d).flags = VIRTQ_DESC_F_WRITE;
+            (*d).next  = 0;
+            virtq_submit(&dev, 0, desc_idx, &mut net.rxq);
+        }
+    } else {
+        unsafe { virtq_free_desc(&mut net.rxq, desc_idx) };
+    }
     0
 }
 

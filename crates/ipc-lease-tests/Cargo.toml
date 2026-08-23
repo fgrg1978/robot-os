@@ -1,0 +1,32 @@
+[package]
+name = "robot_os_ipc_lease_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for crates/ipc/src/{lease,rpc,port}.rs — IPC-3 task-exit reclamation and IPC-6 lease ownership. Excluded from workspace."
+
+# `cap.rs` carries `#[cfg(kani)]` proof harnesses; the kernel's own
+# `crates/ipc/Cargo.toml` declares the same check-cfg. Without it the host
+# build emits a warning, and warnings count as failures in this project.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
+
+[dependencies]
+# Real generated constants — MAX_LEASES / MAX_PORTS / MAX_TASKS must be the
+# ones the kernel is built with, not a hand-copied guess.
+robot_os_limits = { path = "../limits" }
+
+# `port.rs` drags in `crate::cap` + `crate::cap_store`; those need these three,
+# exactly as `crates/cap-tests` does.
+robot_os_abi = { path = "../abi" }
+robot_os_degrade_policy = { path = "../degrade-policy" }
+wcet-macro = { path = "../wcet-macro" }
+
+# Host stand-ins for the two RV64-only kernel crates the ipc modules call
+# into. Renamed so the module sources compile unmodified — see each shim's
+# crate doc for why the real crate cannot be used on the host.
+robot_os_sync = { path = "shims/sync", package = "ipc_lease_test_sync" }
+robot_os_sched = { path = "shims/sched", package = "ipc_lease_test_sched" }
+robot_os_mm = { path = "shims/mm", package = "ipc_lease_test_mm" }
+
+[dev-dependencies]

@@ -8,11 +8,11 @@
 use alloc::alloc::{alloc, dealloc, Layout};
 use core::ptr;
 use robot_os_sync::SpinLock;
+pub use robot_os_limits::MAX_FDS_PER_PROC as MAX_FDS;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 pub const MAX_FILES:    usize = 128;
-pub const MAX_FDS:      usize = 16;
 pub const MAX_FILENAME: usize = 64;
 pub const MAX_PATH:     usize = 256;
 pub const MAX_MOUNTS:   usize = 4;
@@ -164,6 +164,25 @@ const ZEROED_FS: FsGlobal = FsGlobal {
 unsafe impl Send for FsGlobal {}
 
 static FS: SpinLock<FsGlobal> = SpinLock::new(ZEROED_FS);
+
+/// Non-blocking check for whether the global `FS` lock is currently free.
+///
+/// Intended for callers that must never block (e.g. the panic handler),
+/// which cannot afford to spin on `FS` if some hart is holding it — for
+/// instance because that hart is itself stuck inside a panic, or panicked
+/// while the lock was held and `panic = abort` means it will never be
+/// released.
+///
+/// This is inherently racy: another hart may acquire `FS` immediately
+/// after this returns `true`, and `vfs_open`/`vfs_write`/`vfs_close` each
+/// take and release `FS` multiple times internally, so a caller can still
+/// end up spinning on a later acquisition even after observing `true`
+/// here. This function only rules out the common, most dangerous case
+/// where the lock is already held at the time of the check — it is not a
+/// full non-blocking guarantee for the VFS call that follows.
+pub fn vfs_fs_lock_available() -> bool {
+    FS.try_lock().is_some()
+}
 
 // ─── String / path helpers ────────────────────────────────────────────────────
 
@@ -1022,8 +1041,23 @@ pub fn vfs_write(table: &mut FdTable, fd: i32, buf: *const u8, count: usize) -> 
         table.fds[fd as usize].offset = size;
     }
 
-    let offset   = table.fds[fd as usize].offset;
-    let new_size = offset + count as u32;
+    let offset = table.fds[fd as usize].offset;
+
+    // `count` is a usize but every size/offset in the inode table is a u32.
+    // `count as u32` silently truncated: a 4 GiB + 1 write sized the buffer
+    // for 1 byte and then `copy_nonoverlapping` below copied the full usize,
+    // smashing the heap past the allocation. The `offset + count` addition was
+    // also unchecked, so with `overflow-checks = true` a large offset aborted
+    // the kernel instead. `sys_write` clamps to 4096 so ring 3 cannot reach
+    // this, but in-kernel callers pass their own lengths.
+    let count_u32 = match u32::try_from(count) {
+        Ok(c)  => c,
+        Err(_) => return -1,
+    };
+    let new_size = match offset.checked_add(count_u32) {
+        Some(v) => v,
+        None    => return -1,
+    };
 
     // Grow data buffer if necessary.
     let cap = FS.lock().inodes[inode_idx as usize].capacity;
@@ -1037,9 +1071,21 @@ pub fn vfs_write(table: &mut FdTable, fd: i32, buf: *const u8, count: usize) -> 
         }
     }
 
-    let data_ptr = FS.lock().inodes[inode_idx as usize].data;
-    unsafe { ptr::copy_nonoverlapping(buf, data_ptr.add(offset as usize), count); }
-    table.fds[fd as usize].offset += count as u32;
+    // Re-read the capacity after the (possible) resize and clamp the copy to
+    // what the allocation actually holds, so a resize that returned Ok with a
+    // smaller-than-requested buffer still cannot be overrun.
+    let (data_ptr, cap_now) = {
+        let fs = FS.lock();
+        let n  = &fs.inodes[inode_idx as usize];
+        (n.data, n.capacity)
+    };
+    let writable = cap_now.saturating_sub(offset) as usize;
+    let to_write = count.min(writable);
+    if to_write > 0 {
+        unsafe { ptr::copy_nonoverlapping(buf, data_ptr.add(offset as usize), to_write); }
+    }
+    // `offset + to_write <= offset + count == new_size`, already checked above.
+    table.fds[fd as usize].offset = offset + to_write as u32;
 
     // Mark FAT32-backed inodes dirty so vfs_close flushes them.
     {
@@ -1049,7 +1095,8 @@ pub fn vfs_write(table: &mut FdTable, fd: i32, buf: *const u8, count: usize) -> 
         }
     }
 
-    count as i32
+    // Report what was actually copied, not what was asked for.
+    to_write as i32
 }
 
 /// Seek within a file.  Returns the new offset, or -1 on error.

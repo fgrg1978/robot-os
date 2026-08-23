@@ -1,0 +1,12 @@
+[package]
+name = "robot_os_msc_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side unit tests for robot_os_msc (DEV03 USB MSC). Excluded from workspace."
+
+# Mirror of dfu-tests / ota-tests pattern.
+# Run with: cd crates/msc-tests && cargo test
+
+[dependencies]
+robot_os_msc = { path = "../msc" }

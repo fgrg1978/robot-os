@@ -14,8 +14,9 @@
 //!     that never fork stay out of the table entirely.
 //!   - The COW marker bit is stored in PTE bit 8 (RSW field, OS-defined) —
 //!     see `PteFlags::COW` in `robot_os_arch::mmu`.
-//!   - Works only under a real MMU.  On `no-mmu` / `esp32c3` builds this
-//!     module is not compiled (see `lib.rs`).
+//!   - Works only under a real MMU.  On `no-mmu` builds the module still
+//!     compiles, but nothing drives it: there are no page tables to mark
+//!     COW and no page-fault path to resolve them.
 //!
 //! Known limitations:
 //!   - The refcount table has a hard cap (`MAX_TRACKED_PAGES`).  When full,
@@ -129,9 +130,36 @@ pub fn page_getref(phys: usize) -> u16 {
 /// `vmm::copy_kernel_entries_to_user()` separately.
 ///
 /// Returns the new page table's physical address.
+///
+/// On any error the partially built `child_pt` is torn down here (see
+/// [`vmm::destroy_user_pagetable`]) before returning. It used to be the
+/// caller's job, and no caller did it: `fork()` is reachable from ring 3 in a
+/// loop, so every `CapacityFull` from the refcount table leaked a root page
+/// table plus every intermediate table built so far.
 pub fn fork_cow(parent_pt: usize) -> KResult<usize> {
     let child_pt = vmm::create_pagetable()?;
 
+    match fork_cow_inner(parent_pt, child_pt) {
+        Ok(()) => {
+            // Parent's WRITE bits changed — flush its TLB so the first store
+            // actually traps into `handle_cow_fault`.
+            csr::sfence_vma();
+            Ok(child_pt)
+        }
+        Err(e) => {
+            // The parent's PTEs we already flipped to COW stay flipped: that
+            // is harmless (a store just takes one extra fault and copies), and
+            // the pages the child did reach were addref'd *before* being
+            // installed, so the teardown's decref leaves them alive for the
+            // parent. Flush anyway — some parent PTEs lost their WRITE bit.
+            vmm::destroy_user_pagetable(child_pt);
+            csr::sfence_vma();
+            Err(e)
+        }
+    }
+}
+
+fn fork_cow_inner(parent_pt: usize, child_pt: usize) -> KResult<()> {
     // Walk L2.
     for vpn2 in 0..PT_ENTRIES {
         let l2_pte = unsafe {
@@ -142,6 +170,19 @@ pub fn fork_cow(parent_pt: usize) -> KResult<usize> {
         }
         let l1_pt = l2_pte.phys_addr();
 
+        // Defence in depth against the loader ordering bug (audit finding 2 /
+        // 3): if `copy_kernel_entries_to_user` ever runs on an empty user PT
+        // again, `parent_pt.L2[vpn2]` is a pointer to the *kernel's* L1 table,
+        // and this walk would rewrite kernel PTEs — clearing WRITE and setting
+        // the COW marker on the kernel's own mappings, in every address space
+        // at once. Recognise a borrowed kernel table and never descend into it;
+        // there is nothing forkable down there in any case (kernel leaves have
+        // no USER bit).
+        let kernel_l1 = vmm::kernel_l1_table(vpn2);
+        if kernel_l1 == Some(l1_pt) {
+            continue;
+        }
+
         // Walk L1.
         for vpn1 in 0..PT_ENTRIES {
             let l1_pte = unsafe {
@@ -151,6 +192,21 @@ pub fn fork_cow(parent_pt: usize) -> KResult<usize> {
                 continue; // Skip megapages.
             }
             let l0_pt = l1_pte.phys_addr();
+
+            // Same guard one level down: at VPN[2]=0 the user owns the L1
+            // table but individual slots point at the kernel's L0 tables
+            // (CLINT, PLIC, UART), merged in by
+            // `copy_kernel_entries_to_user`.
+            if let Some(k_l1) = kernel_l1 {
+                let kl1_pte = unsafe {
+                    core::ptr::read_volatile((k_l1 + vpn1 * 8) as *const Pte)
+                };
+                if kl1_pte.is_valid() && !kl1_pte.is_leaf()
+                    && kl1_pte.phys_addr() == l0_pt
+                {
+                    continue;
+                }
+            }
 
             // Walk L0 (4 KiB pages).
             for vpn0 in 0..PT_ENTRIES {
@@ -168,6 +224,17 @@ pub fn fork_cow(parent_pt: usize) -> KResult<usize> {
 
                 let phys = l0_pte.phys_addr();
 
+                // Track the shared page BEFORE either PTE is touched.
+                //
+                // Ordering matters for safety, not just tidiness: if the
+                // refcount table fills up after the child's PTE is written,
+                // the child maps a page the table does not know about, and the
+                // error teardown then decrefs it, gets `true` ("sole owner"),
+                // and frees a frame the parent is still executing out of.
+                // Addref-first means "present in the child" implies "tracked
+                // with refcount >= 2", so teardown can never free a live page.
+                page_addref(phys)?;
+
                 // Parent: clear WRITE, set COW marker.
                 let cow_flags = (flags - PteFlags::WRITE) | PteFlags::COW;
                 let parent_new_pte = Pte::new(phys, cow_flags);
@@ -183,22 +250,24 @@ pub fn fork_cow(parent_pt: usize) -> KResult<usize> {
 
                 // Child: same physical page, same COW flags.  `walk()` will
                 // allocate intermediate tables as needed.
-                let child_pte_ptr = vmm::walk(child_pt, vaddr, true)?;
+                let child_pte_ptr = match vmm::walk(child_pt, vaddr, true) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Give back the reference we took a moment ago; the
+                        // page never made it into the child. `page_decref`
+                        // returns false here (2 -> 1) so nothing is freed and
+                        // the parent keeps its page.
+                        let _ = page_decref(phys);
+                        return Err(e);
+                    }
+                };
                 let child_pte = Pte::new(phys, cow_flags);
                 unsafe { core::ptr::write_volatile(child_pte_ptr, child_pte) };
-
-                // Track the shared page.  If the refcount table is full the
-                // fork fails — caller must tear down `child_pt`.
-                page_addref(phys)?;
             }
         }
     }
 
-    // Parent's WRITE bits changed — flush its TLB so the first store
-    // actually traps into `handle_cow_fault`.
-    csr::sfence_vma();
-
-    Ok(child_pt)
+    Ok(())
 }
 
 /// Handle a store page fault on a COW-marked page.
@@ -209,6 +278,23 @@ pub fn fork_cow(parent_pt: usize) -> KResult<usize> {
 ///
 /// Returns `Ok(())` on success, `NotMapped` if the fault isn't actually COW.
 pub fn handle_cow_fault(pt: usize, fault_addr: usize) -> KResult<()> {
+    // Null guard, same rule as the demand-paging path (see
+    // `vmm::USER_GUARD_LIMIT`). The hole here is narrower — a COW break needs
+    // an already-VALID, COW-marked leaf at that VA, so page 0 has to have been
+    // mapped by the parent before the fork — but it is not closed: the ELF
+    // loader in `sched::process` bounds `p_vaddr` only from ABOVE
+    // (`p_vaddr >= USER_LOW_MAX` is rejected, nothing rejects `p_vaddr == 0`),
+    // so an image that declares a PT_LOAD at VA 0 gets page 0 mapped and its
+    // children inherit it as COW. Refusing here means a store through a null
+    // pointer kills the task instead of quietly gaining a private zero page.
+    //
+    // This also gates `vmm::translate_user`, the other caller: a syscall
+    // pointer below the guard limit now fails translation outright rather
+    // than breaking COW on it first.
+    if crate::vmm::in_null_guard(fault_addr) {
+        return Err(KernelError::InvalidArg);
+    }
+
     let aligned_addr = fault_addr & !(PAGE_SIZE - 1);
     let pte_ptr = vmm::walk(pt, aligned_addr, false)?;
     let pte = unsafe { core::ptr::read_volatile(pte_ptr) };

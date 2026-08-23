@@ -97,7 +97,13 @@ pub const DRV_EVENT_SHUTDOWN: u32 = 3;
 // ───────────────────────────────────────────────────────────────────────────
 
 /// One pending client request awaiting driver dispatch.
+///
+/// `#[repr(C)]` is mandatory: this struct is copied verbatim across the
+/// user/kernel boundary (`sys_driver_fetch_request` does a `write_volatile`
+/// into a userspace pointer), so a userspace driver process must see the exact
+/// same field layout. A userspace mirror lives in `userspace/gpio_drv`.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct DriverRequest {
     /// Monotonic token used to match reply → waiter.
     pub token:      u64,
@@ -123,7 +129,11 @@ impl DriverRequest {
 }
 
 /// Reply produced by a userspace driver for a given token.
+///
+/// `#[repr(C)]` is mandatory — same cross-boundary reason as [`DriverRequest`]
+/// (`sys_driver_reply` does a `read_volatile` from a userspace pointer).
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct DriverReply {
     pub token:      u64,
     pub status:     i32,

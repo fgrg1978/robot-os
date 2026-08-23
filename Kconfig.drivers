@@ -1,0 +1,208 @@
+# Kconfig.drivers — Hardware driver enables
+#
+# RFC-0026 Phase C1.  Each option maps to the corresponding driver being
+# compiled in.  Board dependencies are encoded via `depends on BOARD_*`.
+
+menu "Drivers"
+
+# ---------------------------------------------------------------------------
+# Core I/O
+# ---------------------------------------------------------------------------
+
+config DRV_UART
+    bool "UART driver"
+    default y
+    help
+      16550-compatible UART driver (QEMU/VF2) or platform UART (K1).
+      Required for kprintln! and the shell task.  Disable only to shave
+      code size on deployments with no serial output path.
+
+config DRV_GPIO
+    bool "GPIO driver"
+    default y
+    help
+      General-purpose I/O pin driver.  Required for estop pin, buzzer,
+      LED status, and any peripheral connected through discrete digital
+      pins.  Platform-specific register layout selected by BOARD_*.
+
+config DRV_I2C
+    bool "I2C driver"
+    default y
+    help
+      I2C master driver.  Required by IMU (MPU-6050/ICM-20948),
+      barometer (BMP280/BMP388), ADS1115 ADC, and INA219 power monitor.
+      Disable only if the build targets a platform with no I2C peripherals.
+
+config DRV_PWM
+    bool "PWM driver"
+    default y
+    help
+      Pulse-width modulation driver.  Required for motor control (wheeled,
+      drone) and servo outputs (ackermann steering).  Up to PWM_MAX_CHANNELS
+      (8) channels depending on SoC.
+
+config DRV_MOTOR_PID
+    bool "Motor PID controller"
+    default y
+    depends on DRV_PWM
+    help
+      Closed-loop PID motor controller driving PWM outputs with encoder
+      feedback.  Depends on DRV_PWM for output.  Disable for pure-sensor
+      or brain-in-the-loop builds where the host handles actuation.
+
+# ---------------------------------------------------------------------------
+# Sensors
+# ---------------------------------------------------------------------------
+
+config DRV_IMU
+    bool "IMU driver (MPU-6050 / MPU-9250 / ICM-20948)"
+    default y
+    depends on DRV_I2C
+    help
+      Inertial Measurement Unit via I2C.  Provides accelerometer and
+      gyroscope data.  Required by the AHRS / attitude estimator.
+
+config DRV_BARO
+    bool "Barometer driver (BMP280 / BMP388)"
+    default y
+    depends on DRV_I2C
+    help
+      Atmospheric pressure sensor via I2C.  Used for altitude estimation
+      on drones and weather monitoring.  Disable to reduce I2C polling
+      overhead on wheeled robots that don't need altitude.
+
+config DRV_ADS1115
+    bool "ADS1115 16-bit ADC driver"
+    default y
+    depends on DRV_I2C
+    help
+      Texas Instruments ADS1115 four-channel 16-bit ADC via I2C.
+      Used for battery voltage measurement and analog sensor inputs.
+
+config DRV_INA219
+    bool "INA219 current/power monitor"
+    default y
+    depends on DRV_I2C
+    help
+      TI INA219 I2C current/power monitor.  Measures motor current,
+      battery discharge rate, and total power consumption.  Used by
+      the power management and safety modules.
+
+config DRV_BUZZER
+    bool "Buzzer driver"
+    default y
+    depends on DRV_GPIO
+    help
+      GPIO-driven piezo buzzer.  Used for audio alerts (offline mode,
+      battery warning, ESTOP acknowledgement).  Single GPIO pin output.
+
+config DRV_CSI
+    bool "CSI camera driver"
+    default y
+    help
+      MIPI CSI-2 / DVP camera interface driver.  Required for visual
+      obstacle detection and the VLM perception pipeline.  Board-specific
+      implementation (JH7110 CSI on VF2, K1 ISP on K1, mock on QEMU).
+
+config DRV_GPS_UART
+    bool "GPS receiver via UART (NMEA)"
+    default y
+    depends on DRV_UART
+    help
+      NMEA 0183 GPS receiver attached to a UART port.  Required for
+      outdoor navigation, geofencing, and GPS-locked missions.  Parses
+      GPRMC/GPGGA sentences.
+
+config DRV_RANGEFINDER_US
+    bool "Ultrasonic rangefinder (HC-SR04)"
+    default y
+    depends on DRV_GPIO
+    help
+      HC-SR04-style ultrasonic rangefinder using GPIO trigger/echo.
+      Provides obstacle distance in the forward hemisphere.
+      Disable for airborne platforms where ultrasonic is impractical.
+
+config DRV_RANGEFINDER_VL53L0X
+    bool "VL53L0X ToF laser rangefinder"
+    default y
+    depends on DRV_I2C
+    help
+      STMicro VL53L0X time-of-flight laser ranger via I2C.  Higher
+      precision than ultrasonic at short range (<2 m).  Suitable for
+      indoor obstacle avoidance and cliff detection.
+
+# ---------------------------------------------------------------------------
+# Machine learning
+# ---------------------------------------------------------------------------
+
+config DRV_ML_INFERENCE
+    bool "CNN / ML inference engine"
+    default y
+    help
+      Compiled-in INT8 CNN inference engine (crates/ml).  Required for
+      on-device object recognition and GMM motion detection.
+      Disable via cargo feature `no-ml` to reduce code size ~200 KiB.
+
+config DRV_NPU_ACCEL
+    bool "NPU hardware accelerator"
+    default y if BOARD_K1
+    default n
+    depends on DRV_ML_INFERENCE
+    help
+      Hardware neural-processing unit driver.  K1 has a dedicated NPU
+      for INT8 tensor operations.  On other boards, inference falls back
+      to the software SIMD path.
+
+# ---------------------------------------------------------------------------
+# USB
+# ---------------------------------------------------------------------------
+
+config DRV_USB_MSC_GADGET
+    bool "USB Mass Storage Class (MSC) gadget — DEV03"
+    default y if BOARD_VF2
+    default y if BOARD_K1
+    default n
+    help
+      Exposes the kernel FAT filesystem as a USB MSC device.
+      Enables drag-and-drop firmware and config updates via a USB cable.
+      Requires a board with USB-OTG hardware.  TODO(hw): USB-OTG
+      endpoint requires physical bring-up on real VF2/K1 hardware.
+
+config DRV_USB_DFU_RECOVERY
+    bool "USB DFU recovery mode — DEV02"
+    default y if BOARD_VF2
+    default y if BOARD_K1
+    default n
+    help
+      Device Firmware Update (DFU 1.1) recovery mode.  Entered when
+      the boot-counter rollback threshold is exceeded or a GPIO
+      recovery button is held.  Accepts a signed firmware image
+      over USB.  Requires USB-OTG hardware.
+
+# ---------------------------------------------------------------------------
+# Platform network
+# ---------------------------------------------------------------------------
+
+config DRV_VIRTIO_BLK_NET
+    bool "VirtIO block / network drivers (QEMU only)"
+    default y if BOARD_QEMU
+    default n
+    depends on BOARD_QEMU
+    help
+      VirtIO paravirtualized block and network drivers.  Only meaningful
+      under QEMU virt.  Enables disk image boot and high-speed networking
+      without emulating real hardware.  Selecting outside BOARD_QEMU
+      wastes code size.
+
+config DRV_MACB_ETHERNET
+    bool "MACB Ethernet driver (VF2 only)"
+    default y if BOARD_VF2
+    default n
+    depends on BOARD_VF2
+    help
+      Cadence MACB Gigabit Ethernet MAC driver for JH7110 (VF2).
+      Handles descriptor rings, interrupts, and MDIO PHY management.
+      Only relevant on VF2 — selecting on other boards is harmless
+      but compiles in dead code.
+
+endmenu # Drivers

@@ -1,0 +1,9 @@
+[package]
+name = "ipc_lease_test_sched"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host stand-in for robot_os_sched, used only by crates/ipc-lease-tests. NOT part of the kernel."
+
+[dependencies]
+robot_os_limits = { path = "../../../limits" }

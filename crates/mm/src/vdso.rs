@@ -6,7 +6,8 @@
 /// ecall, eliminating syscall overhead for the most common time queries.
 ///
 /// ## Seqlock protocol
-/// Writer (kernel, timer ISR):
+/// Writer (kernel, timer ISR — see `vdso_update()` for how concurrent
+/// writers from multiple harts are serialized):
 ///   1. seq += 1  →  odd   (write in progress)
 ///   2. store data fields
 ///   3. seq += 1  →  even  (data stable)
@@ -17,6 +18,13 @@
 ///     read data fields
 ///     seq2 = load seq;  if seq2 != seq1 → retry
 ///     // data is consistent
+///
+/// A classic seqlock only tolerates a SINGLE writer. On SMP, the timer ISR
+/// fires on every hart, so `vdso_update()` claims the right to write with a
+/// compare-exchange on `seq` itself before touching any data field — see the
+/// doc comment on `vdso_update()` for why that (rather than gating on hart
+/// identity, or a lock) is the correct and cheapest way to serialize writers
+/// here.
 ///
 /// VDSO_USER_BASE is exported to libsys so it can read without a syscall.
 
@@ -97,28 +105,101 @@ pub fn vdso_phys() -> usize {
     VDSO_PHYS.load(Ordering::Acquire) as usize
 }
 
-/// Update the vDSO timing data.  Called from the timer ISR.
+/// Update the vDSO timing data.  Called from the timer ISR — on every hart
+/// in an SMP kernel, since each hart takes its own periodic timer interrupt.
 ///
 /// Uses the seqlock write protocol: increment seq to odd, write, increment
-/// to even.  All stores use Release ordering so readers see consistent data.
+/// to even.  This protocol is only sound with a SINGLE writer: two harts
+/// racing the seq increment/store sequence can interleave and leave seq (and
+/// the data fields) in an incoherent state that no reader-side retry can
+/// detect.
+///
+/// Serializing writers by hart identity (e.g. "only hart 0 updates") was
+/// considered and rejected: it would depend on `tp`/`hart_id()` correctly
+/// identifying the running hart at the point this function is called from
+/// deep inside the timer ISR. That is NOT a safe assumption in this kernel —
+/// `crates/sched/src/task.rs` saves/restores `tp` as part of task context
+/// (`CTX_TP`) so `current_cpu_id()` survives ordinary context switches, but
+/// the EDF scheduler can migrate a task to a different physical hart, and the
+/// migrated task's restored `tp` then reflects the hart it last ran on, not
+/// the one it is running on now (tracked separately, see
+/// `docs/KERNEL_REVIEW_NOTES.md`, `context_switch.S:83` entry). A hart whose
+/// current task carries a stale `tp == 0` would wrongly believe itself to be
+/// the sole writer, silently reopening the exact multi-writer race this
+/// function exists to close — worse than not fixing the bug at all, because
+/// the failure would be workload-dependent and invisible in easy testing.
+///
+/// Instead, writers are serialized without needing any hart identity: the
+/// seqlock's own `seq` counter doubles as a claim ticket via
+/// compare-exchange. A hart only proceeds to write if it wins the CAS that
+/// flips `seq` from even to odd; every other hart (or a spurious re-entrant
+/// call — see below) that loses the race, or sees `seq` already odd, simply
+/// drops this tick's update and returns. That is harmless: the vDSO page is
+/// refreshed again on the very next tick, by whichever hart gets there first
+/// — there is no requirement that every tick be published, only that
+/// published data is always internally consistent. This also protects
+/// against IRQ-context re-entrancy on a single hart (e.g. a nested timer
+/// interrupt while a write is still open): the odd-`seq` check makes a
+/// reentrant call a no-op instead of corrupting an in-flight write.
+///
+/// Cost: one uncontended `compare_exchange` per timer tick on the common
+/// path (no contention: SMP harts rarely race the exact same tick), which is
+/// cheaper than an IRQ-safe lock (`SpinLock::lock_irqsave()` in
+/// `crates/sync/src/spinlock.rs`) held across the write on every hart, every
+/// tick, given this runs inside a WCET-budgeted ISR.
 #[inline]
 pub fn vdso_update(uptime_ticks: u64, uptime_ms: u64) {
     let phys = VDSO_PHYS.load(Ordering::Relaxed) as usize;
     if phys == 0 { return; }
 
-    // SAFETY: phys is a valid page allocated at init time; this is the sole
-    // writer (timer ISR, single-threaded per core; other cores only read).
+    // SAFETY: phys is a valid page allocated at init time. Multiple harts
+    // may call this concurrently; the CAS below ensures only the hart that
+    // wins the even→odd transition of `seq` touches the data fields, making
+    // this the sole writer for the duration of that write.
     let data = unsafe { &*(phys as *const VdsoData) };
 
-    // Seqlock: open write (seq → odd)
-    let seq = data.seq.load(Ordering::Relaxed);
-    data.seq.store(seq.wrapping_add(1), Ordering::Release);
-    core::sync::atomic::fence(Ordering::SeqCst);
+    // Seqlock: claim the write by CAS'ing seq from even to even+1 (odd).
+    // If seq is already odd, someone else's write is in flight — drop this
+    // tick. If the CAS loses the race, someone else claimed it first —
+    // drop this tick too. Either way the page is refreshed on the next tick.
+    let seq = data.seq.load(Ordering::Acquire);
+    if seq & 1 != 0 {
+        return;
+    }
+    if data
+        .seq
+        .compare_exchange(seq, seq.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
 
-    data.uptime_ticks.store(uptime_ticks, Ordering::Release);
-    data.uptime_ms.store(uptime_ms, Ordering::Release);
+    // We won the claim: we are now the sole writer. The successful CAS used
+    // Acquire ordering, so these stores cannot be hoisted above it.
+    //
+    // `uptime_ticks`/`uptime_ms` were sampled by the CALLER (main.rs, before
+    // this hart necessarily won the race above) from two different sources —
+    // a global `TICK_COUNT.fetch_add()` and `rdtime` respectively, read at
+    // two different instants — so a hart that stalled between its own
+    // sampling and winning a later CAS can carry a sample that is older in
+    // one field but not necessarily the other. Publishing a sample that
+    // regresses either field would walk the page's documented "monotonic"
+    // data backwards for every user-space reader. Require the new sample to
+    // dominate in BOTH fields before publishing; otherwise drop this tick's
+    // update entirely (the seqlock still closes normally so no reader
+    // spins) — the next tick that produces a fully-newer sample refreshes
+    // the page. Both loads are Relaxed: we are the sole writer at this
+    // point (we hold the claim), so no other write can race these reads.
+    let published_ticks = data.uptime_ticks.load(Ordering::Relaxed);
+    let published_ms = data.uptime_ms.load(Ordering::Relaxed);
+    if uptime_ticks >= published_ticks && uptime_ms >= published_ms {
+        data.uptime_ticks.store(uptime_ticks, Ordering::Release);
+        data.uptime_ms.store(uptime_ms, Ordering::Release);
+    }
 
-    core::sync::atomic::fence(Ordering::SeqCst);
-    // Seqlock: close write (seq → even)
+    // Seqlock: close write (seq → even). Release ordering makes whichever
+    // stores above ran visible to any reader whose seqlock retry-read
+    // observes this new value (paired with the reader's Acquire fences in
+    // `crates/libsys/src/lib.rs`).
     data.seq.store(seq.wrapping_add(2), Ordering::Release);
 }

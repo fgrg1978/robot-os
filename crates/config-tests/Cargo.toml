@@ -1,0 +1,11 @@
+[package]
+name = "robot_os_config_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for robot_os_config (INI parser + getters/setters). The config crate uses static-mut backing storage, so tests serialise via a Mutex to avoid cross-test contamination."
+
+# Run with:  cd crates/config-tests && cargo test
+
+[dependencies]
+robot_os_config = { path = "../config" }

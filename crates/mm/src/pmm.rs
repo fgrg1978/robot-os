@@ -5,22 +5,22 @@
 ///
 /// Ported from kernel/mm/pmm.c
 
-#[cfg(not(feature = "esp32c3"))]
 use robot_os_arch::mmu::PAGE_SIZE;
-#[cfg(feature = "esp32c3")]
-const PAGE_SIZE: usize = 4096;
 use robot_os_sync::SpinLock;
 use crate::addr::PhysAddr;
 use robot_os_common::error::{KResult, KernelError};
 
 /// Maximum number of physical pages we support.
 ///
-/// ESP32-C3 (small-mem): 384 KiB SRAM → 128 pages max, bitmap = 2 u64s (16 bytes).
-/// Normal targets: 16 GiB → 4_194_304 pages, bitmap = 65536 u64s (512 KiB in BSS).
+/// `small-mem` builds (PROFILE_EMBEDDED): 128 pages max, bitmap = 2 u64s (16 bytes).
+/// Other targets: derived from the board's real Kconfig `RAM_SIZE` (MiB),
+/// so the static bitmap in `.bss` matches actual RAM instead of a flat
+/// 16 GiB worst case (was 512 KiB regardless of board; vf2/k1/qemu all
+/// have far less RAM than that ceiling assumed).
 #[cfg(feature = "small-mem")]
 const MAX_PAGES: usize = 128;
 #[cfg(not(feature = "small-mem"))]
-const MAX_PAGES: usize = 4_194_304;
+const MAX_PAGES: usize = robot_os_limits::RAM_SIZE * 1024 * 1024 / PAGE_SIZE;
 
 /// Bitmap words needed: MAX_PAGES / 64 (rounded up).
 const BITMAP_WORDS: usize = (MAX_PAGES + 63) / 64;

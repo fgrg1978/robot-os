@@ -1,0 +1,30 @@
+[package]
+name = "robot_os_encrypt_link_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side cross-side compat tests for the RFC-0019 handshake state machine in `crates/encrypt-link`. Pins byte-for-byte agreement with robot-brain/secure_channel.py using deterministic ephemeral keys. Excluded from workspace."
+
+# Run with:
+#   cd crates/encrypt-link-tests && cargo +stable test --release
+#
+# Pinned to stable via rust-toolchain.toml.
+
+[features]
+# K-C5. Rebuild the suite with the enforced link policy compiled in, so both
+# halves of the gate get exercised:
+#
+#   cargo test --release                      # policy OFF
+#   cargo test --release --features enforced   # policy ON
+#
+# `tests/link_policy.rs` asserts the value of
+# `robot_os_encrypt_link::link_encrypt_enforced()` in BOTH states. That is
+# the guard against this tree's known failure mode — the secure-boot CI
+# scenario that passed green while running no Ed25519 at all, because the
+# thing it depended on was silently absent. A renamed or mis-forwarded
+# feature here fails the suite instead of quietly disarming the gate.
+enforced = ["robot_os_encrypt_link/link-encrypt-enforced"]
+
+[dependencies]
+robot_os_encrypt_link = { path = "../encrypt-link" }
+robot_os_crypto       = { path = "../crypto" }

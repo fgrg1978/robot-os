@@ -110,7 +110,7 @@ fn hw_wdt_init(timeout_ms: u32) {
     // TOP=5 → 24_000_000 / 2^21 ≈ 11 ms   ← too short
     // We want ≥ timeout_ms.
     // Approximate: find smallest TOP such that 2^(16+TOP) ≥ clock * timeout_ms / 1000
-    let clock_hz: u32 = crate::platform::hw::TIMER_FREQ as u32;
+    let clock_hz: u32 = crate::platform::hw::WDT_CLK_HZ as u32;
     let ticks_needed: u64 = clock_hz as u64 * timeout_ms as u64 / 1000;
     let mut top: u32 = 0;
     let mut period: u64 = 1u64 << 16;

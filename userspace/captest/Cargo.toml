@@ -1,0 +1,14 @@
+[package]
+name = "captest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Userspace capability + syscall ABI test: asserts that a ring-3 process granted sensor/motor capabilities can actually use them, and that an ungranted resource is still denied."
+
+[dependencies]
+robot_os_libsys = { path = "../../crates/libsys" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

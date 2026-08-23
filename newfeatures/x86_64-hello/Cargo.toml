@@ -1,0 +1,25 @@
+[package]
+name = "x86_64_hello"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "PHANES B2.boot — minimal x86_64 boot binary. Boots on qemu-system-x86_64 -M q35 via Multiboot1, transitions 32→64 with PAE + identity-mapped 1 GiB, prints 'hello' through COM1."
+
+# Excluded from workspace; targets x86_64-unknown-none via own
+# .cargo/config.toml.
+#
+# Build + run with:  make qemu-x86_64-hello
+
+[[bin]]
+name = "x86_64_hello"
+path = "src/main.rs"
+
+[dependencies]
+robot_os_arch_api    = { path = "../arch-api" }
+robot_os_arch_x86_64 = { path = "../arch-x86_64" }
+
+[profile.release]
+opt-level = 2
+debug     = true
+lto       = false
+panic     = "abort"

@@ -250,10 +250,7 @@ fn mlp_forward(w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32],
 /// Dot product dispatcher: uses `dot_f32_rvv` when the `rvv` feature is active.
 #[inline(always)]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(feature = "rvv")]
-    { robot_os_arch::rvv::dot_f32_rvv(a, b) }
-    #[cfg(not(feature = "rvv"))]
-    { robot_os_arch::rvv::dot_f32_scalar(a, b) }
+    robot_os_arch::vector::dot_f32_best(a, b)
 }
 
 // ── RMLP parsing helpers ──────────────────────────────────────────────────────

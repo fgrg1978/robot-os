@@ -1,0 +1,8 @@
+[package]
+name = "robot_os_gguf_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for the GGUF model-file parser in robot_os_ml::gguf. Pulls the file in via #[path] (same pattern as crates/ota-tests) because the full ml crate depends on robot_os_arch which is riscv-only."
+
+# Run with:  cd crates/gguf-tests && cargo test

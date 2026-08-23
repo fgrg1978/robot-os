@@ -1,0 +1,12 @@
+[package]
+name = "robot_os_cam_ring"
+version = "0.1.0"
+edition = "2021"
+description = "Lock-free SPSC frame ring for zero-copy camera pipelines (S1/S6). Pure no_std; no heap. Host-testable via crates/cam-ring-tests."
+license = "Apache-2.0"
+
+[lib]
+name = "robot_os_cam_ring"
+
+[dependencies]
+# No external dependencies — only core::sync::atomic.

@@ -1,0 +1,15 @@
+[package]
+name = "robot_os_tftp_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for robot_os_tftp. Excluded from workspace."
+
+# Run with:
+#   cd crates/tftp-tests && cargo +stable test \
+#       --target aarch64-apple-darwin
+
+[dependencies]
+robot_os_tftp = { path = "../tftp" }
+
+[dev-dependencies]

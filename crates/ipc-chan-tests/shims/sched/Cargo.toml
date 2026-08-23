@@ -1,0 +1,10 @@
+[package]
+name = "robot-os-sched-hostshim"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host stand-in for the two robot_os_sched accessors used by crates/ipc/src/{channel,pipe,signal}.rs."
+
+[lib]
+name = "robot_os_sched"
+path = "src/lib.rs"

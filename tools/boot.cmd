@@ -27,6 +27,19 @@ if test "${active_slot}" = "b"; then
     if fatload mmc 0:1 ${kernel_addr_r} KERN_A.BIN; then
         booti ${kernel_addr_r} - ${fdt_addr}
     fi
+elif test "${active_slot}" = "r"; then
+    # OT04 — kernel-side steered NEXT boot to the recovery slot (CRC
+    # verified R after both A and B failed on a previous boot). Try it
+    # directly instead of falling through the A/B branch below, which
+    # would silently default to A for any unrecognized active_slot value.
+    echo "[ROTA] Booting recovery slot (KERN_R.BIN)"
+    if fatload mmc 0:1 ${kernel_addr_r} KERN_R.BIN; then
+        booti ${kernel_addr_r} - ${fdt_addr}
+    fi
+    echo "[ROTA] Recovery slot failed to load — trying slot A"
+    if fatload mmc 0:1 ${kernel_addr_r} KERN_A.BIN; then
+        booti ${kernel_addr_r} - ${fdt_addr}
+    fi
 else
     echo "[ROTA] Booting slot A (KERN_A.BIN)"
     if fatload mmc 0:1 ${kernel_addr_r} KERN_A.BIN; then

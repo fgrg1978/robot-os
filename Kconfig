@@ -1,0 +1,26 @@
+# PHANES Kconfig — root menu
+#
+# RFC-0026 Phase C1 skeleton.  Sources all sub-menus in logical order.
+# Run `make menuconfig` to edit interactively.
+# Run `make defconfig-edge` to load the edge preset.
+#
+# GENERATED OUTPUT: .config (gitignored)
+# SOURCE OF TRUTH:  these Kconfig.* fragments
+#
+# Convention: every option is prefixed CONFIG_ in the generated .config file.
+# Do NOT write CONFIG_ here — kconfiglib adds it automatically.
+
+mainmenu "PHANES Kernel Configuration"
+
+source "Kconfig.arch"
+source "Kconfig.platform"
+source "Kconfig.profile"
+source "Kconfig.limits"
+source "Kconfig.timing"
+source "Kconfig.network"
+source "Kconfig.security"
+source "Kconfig.drivers"
+source "Kconfig.robot"
+source "Kconfig.brain"
+source "Kconfig.ota"
+source "Kconfig.development"

@@ -64,7 +64,28 @@ impl MmioRegion {
 pub struct DriverEntry {
     pub name: [u8; DRIVER_NAME_LEN],
     pub state: DriverState,
-    pub task_idx: usize,
+    /// TID of the task running this driver, NOT its scheduler pool slot.
+    ///
+    /// WHY the TID: this field is the key `driver_on_crash` matches a dying
+    /// task against. Pool slots (`TASKS[]` / `TASK_VALID[]`) are recycled —
+    /// `alloc_slot` hands back the first free index and `do_schedule` frees
+    /// it on exit — so keying on the slot attributes a crash to whichever
+    /// driver *last occupied that slot*, quietly marking a healthy driver
+    /// as Crashed and burning its restart budget while the one that
+    /// actually died is never noticed.
+    ///
+    /// 0 means "no task" and is used as the empty-slot sentinel: `NEXT_TID`
+    /// starts at 1 and its wrap-around explicitly skips 0 (see
+    /// `scheduler.rs`, `if NEXT_TID == 0 { NEXT_TID = 1 }`), so 0 is never
+    /// handed to a live task. If that allocator ever changes, this sentinel
+    /// breaks silently — every empty entry would match TID 0.
+    ///
+    /// Honest about the limit: `NEXT_TID` is a `wrapping_add(u32)`, so TIDs
+    /// are monotone-within-any-realistic-uptime, not unique. After 2^32
+    /// task creations a stale entry could alias a new task. That is a far
+    /// weaker collision than slot reuse (which recurs within milliseconds),
+    /// but it is not "impossible".
+    pub task_tid: u32,
     pub mmio: [MmioRegion; MAX_MMIO_PER_DRIVER],
     pub mmio_count: u8,
     pub irqs: [u32; MAX_IRQS_PER_DRIVER],
@@ -79,7 +100,7 @@ impl DriverEntry {
         DriverEntry {
             name: [0; DRIVER_NAME_LEN],
             state: DriverState::Empty,
-            task_idx: 0,
+            task_tid: 0, // 0 = no task; never a live TID (see field doc)
             mmio: [MmioRegion::empty(); MAX_MMIO_PER_DRIVER],
             mmio_count: 0,
             irqs: [0; MAX_IRQS_PER_DRIVER],
@@ -174,35 +195,64 @@ pub fn driver_set_irq(id: usize, irq: u32) -> bool {
     true
 }
 
-/// Mark a driver as running with the given scheduler task index.
-pub fn driver_start(id: usize, task_idx: usize) {
+/// Mark a driver as running, bound to the task with TID `task_tid`.
+///
+/// Returns `false` (and changes nothing) if the id is out of range, the
+/// slot is empty, `task_tid` is 0, or the driver has burned through its
+/// restart budget.
+///
+/// WHY it takes a TID and not a pool index: see [`DriverEntry::task_tid`].
+///
+/// WHY the restart-budget refusal: this function used to move a driver to
+/// `Running` from *any* state, and it deliberately does NOT reset
+/// `restart_count` — resetting would hand every crash-looping driver an
+/// unlimited budget, which on a robot means a wedged peripheral respawning
+/// forever instead of staying down where an operator can see it. But that
+/// leaves the mirror-image hazard: a caller that keeps force-starting an
+/// exhausted driver drives `restart_count` up on every crash. The counter
+/// is `u8` and this kernel builds with `overflow-checks = true` and
+/// `panic = "abort"`, so the 256th increment is a board reset — a
+/// physical-safety event. The increments themselves are now
+/// `saturating_add`, so the panic is gone regardless; this check is the
+/// second layer, refusing the pointless restart in the first place.
+///
+/// No caller reaches this today: `driver_check_health` never promotes an
+/// exhausted entry out of `Crashed`, and `driver_get_restart_list` only
+/// surfaces `Registered` ones. The guard is defence against the *next*
+/// caller, written when the supervisor is finally wired up.
+pub fn driver_start(id: usize, task_tid: u32) -> bool {
     let mut table = DRIVERS.lock();
     if id >= MAX_DRIVERS {
-        return;
+        return false;
+    }
+    // 0 is the "no task" sentinel — accepting it would make every empty
+    // entry a crash-match target for a task that never existed.
+    if task_tid == 0 {
+        return false;
     }
     let entry = &mut table.entries[id];
     if entry.state == DriverState::Empty {
-        return;
+        return false;
     }
-    entry.task_idx = task_idx;
+    if entry.restart_count > DRIVER_MAX_RESTARTS {
+        return false; // permanently failed — needs explicit operator action
+    }
+    entry.task_tid = task_tid;
     entry.state = DriverState::Running;
     entry.last_heartbeat = 0;
+    true
 }
 
-/// Update the heartbeat timestamp for a running driver.
-pub fn driver_heartbeat(id: usize) {
-    let mut table = DRIVERS.lock();
-    if id >= MAX_DRIVERS {
-        return;
-    }
-    let entry = &mut table.entries[id];
-    if entry.state == DriverState::Running {
-        // Use uptime from the timer crate if available; caller passes `now`.
-        // For simplicity, we just mark it as "recently alive" — the caller
-        // of `driver_check_health` provides the current tick.
-        entry.last_heartbeat = u64::MAX; // sentinel — updated by check_health caller
-    }
-}
+// NOTE: a `driver_heartbeat(id)` with no timestamp argument used to live
+// here. It stored `u64::MAX` as a "recently alive" sentinel, which
+// `driver_check_health` then fed to `now_ms.saturating_sub(last_heartbeat)`
+// — always 0, always under DRIVER_TIMEOUT_MS. One call to it made a driver
+// permanently immune to timeout detection: a watchdog switched off by the
+// very thing it watches. It had no callers (the wired path is
+// `SYS_DRV_HEARTBEAT` → `driver_heartbeat_with_time`), and this crate has
+// no clock to read a real timestamp from, so it was removed rather than
+// repaired — a no-op stub would be another mechanism reporting success
+// while doing nothing. Heartbeat with a timestamp or not at all.
 
 /// Update heartbeat with an explicit timestamp (ms).
 pub fn driver_heartbeat_with_time(id: usize, now_ms: u64) {
@@ -216,28 +266,53 @@ pub fn driver_heartbeat_with_time(id: usize, now_ms: u64) {
     }
 }
 
-/// Called when a task exits abnormally. Finds the driver by `task_idx`,
-/// marks it as crashed, and records the crash timestamp.
-pub fn driver_on_crash(task_idx: usize) {
+/// Called when a task exits. Finds the driver bound to TID `task_tid` and
+/// marks it as crashed.
+///
+/// `task_tid` is a TID, not a scheduler pool index — see
+/// [`DriverEntry::task_tid`] for why that distinction is the whole point of
+/// this function being correct.
+///
+/// Known gap (not fixable in this crate): this variant leaves `last_crash`
+/// at whatever it was, normally 0. `driver_check_health` then evaluates
+/// `now_ms.saturating_sub(0) >= DRIVER_RESTART_COOLDOWN_MS`, which is true
+/// immediately, so the restart cooldown is skipped on the crash path (it is
+/// honoured on the heartbeat-timeout path, which does stamp `last_crash`).
+/// `crates/sched` has no millisecond clock to read — the callers that have
+/// one should prefer [`driver_on_crash_with_time`].
+pub fn driver_on_crash(task_tid: u32) {
     let mut table = DRIVERS.lock();
+    if task_tid == 0 {
+        return; // sentinel, never a live task
+    }
     for entry in table.entries.iter_mut() {
-        if entry.state == DriverState::Running && entry.task_idx == task_idx {
+        if entry.state == DriverState::Running && entry.task_tid == task_tid {
             entry.state = DriverState::Crashed;
-            entry.restart_count += 1;
-            // Caller should set last_crash via driver_on_crash_with_time
-            // or check_health will handle restart timing.
+            // saturating, NOT `+= 1`: `restart_count` is u8 and this kernel
+            // builds `overflow-checks = true` + `panic = "abort"`, so an
+            // overflow here is a full board reset. Saturating at 255 keeps
+            // the entry permanently above DRIVER_MAX_RESTARTS, i.e. it
+            // stays down — the fail-safe direction.
+            entry.restart_count = entry.restart_count.saturating_add(1);
             return;
         }
     }
 }
 
-/// Called when a task exits abnormally, with an explicit crash timestamp.
-pub fn driver_on_crash_with_time(task_idx: usize, now_ms: u64) {
+/// Called when a task exits, with an explicit crash timestamp (ms).
+///
+/// Preferred over [`driver_on_crash`]: stamping `last_crash` is what makes
+/// `DRIVER_RESTART_COOLDOWN_MS` actually apply to this crash.
+pub fn driver_on_crash_with_time(task_tid: u32, now_ms: u64) {
     let mut table = DRIVERS.lock();
+    if task_tid == 0 {
+        return; // sentinel, never a live task
+    }
     for entry in table.entries.iter_mut() {
-        if entry.state == DriverState::Running && entry.task_idx == task_idx {
+        if entry.state == DriverState::Running && entry.task_tid == task_tid {
             entry.state = DriverState::Crashed;
-            entry.restart_count += 1;
+            // See driver_on_crash for why this is saturating.
+            entry.restart_count = entry.restart_count.saturating_add(1);
             entry.last_crash = now_ms;
             return;
         }
@@ -265,7 +340,9 @@ pub fn driver_check_health(now_ms: u64) -> usize {
                     && now_ms.saturating_sub(entry.last_heartbeat) > DRIVER_TIMEOUT_MS
                 {
                     entry.state = DriverState::Crashed;
-                    entry.restart_count += 1;
+                    // See driver_on_crash: u8 + overflow-checks + panic=abort
+                    // means `+= 1` past 255 resets the board.
+                    entry.restart_count = entry.restart_count.saturating_add(1);
                     entry.last_crash = now_ms;
                 }
             }

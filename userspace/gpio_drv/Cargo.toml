@@ -1,0 +1,14 @@
+[package]
+name = "gpio_drv"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "E11.AQ3 — ring-3 userspace GPIO driver. Registers DRV_KIND_GPIO with the kernel driver-server and serves requests forwarded by the in-kernel UserDriverProxy. Excluded from workspace; built standalone like reflex/uhello."
+
+[dependencies]
+robot_os_libsys = { path = "../../crates/libsys" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

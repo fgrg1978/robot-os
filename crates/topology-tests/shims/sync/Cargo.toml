@@ -1,0 +1,8 @@
+[package]
+name = "topology_seed_test_sync"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host stand-in for robot_os_sync, used only by crates/topology-tests' P1 cap-seed bridge suite. NOT part of the kernel. Same shape as crates/cap-tests/shims/sync — copied rather than path-shared so this test crate stays self-contained (each *-tests crate owns its shims)."
+
+[dependencies]

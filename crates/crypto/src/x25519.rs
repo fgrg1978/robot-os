@@ -38,7 +38,66 @@ const P: [u64; 4] = [
 /// - `point`:  32-byte public key (or BASEPOINT for key generation).
 ///
 /// Returns the 32-byte shared secret (or public key).
+///
+/// Backed by `curve25519-dalek::MontgomeryPoint::mul_clamped` — vetted,
+/// constant-time, all RFC 7748 vectors pass (task #212). The legacy
+/// in-tree Montgomery ladder below (decode_u_coordinate + fe_* +
+/// Fermat invert) is kept as `x25519_legacy` for A/B regression
+/// reference; new code must call `x25519`.
 pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
+    use curve25519_dalek::MontgomeryPoint;
+    let p = MontgomeryPoint(*point);
+    p.mul_clamped(*scalar).0
+}
+
+/// Contributory-behaviour X25519: like [`x25519`], but returns `None` when
+/// the shared secret is all zeros.
+///
+/// RFC 7748 §6.1 makes this check optional and says protocols "MAY" perform
+/// it; for us it is mandatory, because of *where* the multiplication
+/// happens. `EncryptLink::handle_initiator_hello` derives the shared secret
+/// from a peer public key that has not been authenticated yet — the PSK
+/// proof is only checked afterwards. A peer who sends one of the twelve
+/// small-order Curve25519 points (all-zero, `u=1`, the two order-8 points,
+/// and their `p`-offset aliases) forces the product to the identity, so
+/// *both* sides derive session keys from a shared secret of 32 zero bytes,
+/// independent of either private key.
+///
+/// That is not exploitable today: the channel only reaches `Established`
+/// after CONFIRM verifies against the PSK, and both `encrypt` and `decrypt`
+/// refuse to run before then, so an attacker without the PSK never gets a
+/// frame encrypted under the degenerate key. The reason to check anyway is
+/// that this safety rests entirely on the *ordering* of two operations in a
+/// different crate. Any refactor that derives keys before verifying the
+/// proof — or that adds a code path emitting a frame from `AwaitConfirm` —
+/// silently converts a fragile-but-correct handshake into a key exchange an
+/// unauthenticated peer can pin to a known value. Rejecting the all-zero
+/// output makes the failure structural rather than ordering-dependent.
+///
+/// The all-zero output test catches *every* small-order input, which is why
+/// it is preferred over blacklisting the twelve point encodings: the
+/// blacklist has to be complete and stay complete, this does not.
+pub fn x25519_checked(scalar: &[u8; 32], point: &[u8; 32]) -> Option<[u8; 32]> {
+    let shared = x25519(scalar, point);
+    // Constant-time all-zero test: fold every byte into one accumulator so
+    // the check itself does not leak which byte was non-zero. (A timing
+    // leak here would be mild, but the primitive is already available and
+    // an early-exit loop over a shared secret is exactly the pattern this
+    // tree is trying to stop copying around.)
+    let mut acc = 0u8;
+    for b in shared.iter() {
+        acc |= *b;
+    }
+    if core::hint::black_box(acc) == 0 {
+        return None;
+    }
+    Some(shared)
+}
+
+/// Hand-rolled X25519 — kept for A/B regression vs the dalek reference.
+/// DO NOT call from new code; use [`x25519`].
+#[allow(dead_code)]
+pub fn x25519_legacy(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     // Clamp scalar per RFC 7748 §5
     let mut k = *scalar;
     k[0]  &= 248;
@@ -82,8 +141,10 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
         let diff_sq = fe_sq(&diff);
         z_3 = fe_mul(&x_1, &diff_sq);
         x_2 = fe_mul(&aa, &bb);
-        // a24 = 121665; z_2 = e * (aa + a24 * e)
-        let a24_e = fe_mul_small(&e, 121666);
+        // a24 = 121665; z_2 = e * (aa + a24 * e) per RFC 7748 §5.
+        // Pre-2026-05 had 121666 here — off-by-one bug that broke
+        // every RFC 7748 test vector (task #212).
+        let a24_e = fe_mul_small(&e, 121665);
         let inner = fe_add(&aa, &a24_e);
         z_2 = fe_mul(&e, &inner);
     }

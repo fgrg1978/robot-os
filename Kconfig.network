@@ -1,0 +1,143 @@
+# Kconfig.network — Ethernet, TCP/IP stack parameters, ARP, brain link
+#
+# RFC-0026 Phase C1.  All network constants with defaults matching the
+# current codebase values from crates/net/src/*.
+
+menu "Network"
+
+# ---------------------------------------------------------------------------
+# Ethernet / IP
+# ---------------------------------------------------------------------------
+
+config ETH_MTU
+    int "Ethernet MTU (bytes)"
+    range 576 9000
+    default 1500
+    help
+      Maximum Transmission Unit at the Ethernet frame payload level.
+      Standard is 1500.  Jumbo frames (9000) require switch support
+      and increase per-packet DMA descriptor work.
+      Current codebase: 1500 (crates/net/src/ip.rs ETH_MTU).
+
+config TCP_MSS
+    int "TCP Maximum Segment Size (bytes)"
+    range 536 8960
+    default 1460
+    help
+      TCP MSS advertised in SYN options.  ETH_MTU - IP_HDR(20) -
+      TCP_HDR(20) = 1460 for standard Ethernet.  Reducing below 1460
+      decreases throughput but helps on links with smaller frame limits.
+      Current codebase: 1460 (crates/net/src/tcp.rs TCP_MSS).
+
+config TCP_BUF_SIZE
+    int "TCP per-connection receive/send buffer (bytes)"
+    range 4096 1048576
+    default 131072
+    help
+      Static RX + TX ring buffer per TCP connection.  131072 bytes =
+      128 KiB.  With TCP_MAX_CONNS connections, total buffer RAM =
+      TCP_MAX_CONNS × TCP_BUF_SIZE × 2.  Larger buffers improve
+      throughput on high-latency links (BDP = RTT × bandwidth).
+      Current codebase: 131072 (crates/net/src/tcp.rs TCP_BUF_SIZE).
+
+config TCP_WINDOW_SIZE
+    int "TCP advertised window size (bytes)"
+    range 1024 65535
+    default 65535
+    help
+      TCP receive window size advertised to the peer.  Capped at 65535
+      bytes by the TCP header's 16-bit field (no window scaling yet).
+      Should not exceed TCP_BUF_SIZE.
+      Current codebase: min(TCP_BUF_SIZE, 65535).
+
+# ---------------------------------------------------------------------------
+# Congestion control
+# ---------------------------------------------------------------------------
+
+config CWND_INITIAL_MSS_MULT
+    int "Initial congestion window (multiples of MSS)"
+    range 1 10
+    default 2
+    help
+      Starting cwnd = CWND_INITIAL_MSS_MULT × TCP_MSS.  RFC 5681
+      allows up to 4 × MSS; Linux uses 10 × MSS (IW10).  We use 2
+      for conservatism on embedded networks with limited buffer space.
+      Current codebase: 2 (CWND_INITIAL = TCP_MSS * 2).
+
+config SSTHRESH_INITIAL_BYTES
+    int "Initial slow-start threshold (bytes)"
+    range 1460 1048576
+    default 131072
+    help
+      Initial ssthresh value.  Set equal to TCP_BUF_SIZE so slow-start
+      climbs the full buffer window before switching to congestion
+      avoidance.  Current codebase: TCP_BUF_SIZE (131072 bytes).
+
+config DUP_ACK_THRESHOLD
+    int "Duplicate ACK count for fast retransmit"
+    range 1 10
+    default 3
+    help
+      When this many duplicate ACKs arrive without new data, the
+      sender assumes a segment was lost and retransmits immediately
+      (fast retransmit, RFC 5681 §3.2).
+      Current codebase: 3 (crates/net/src/tcp.rs DUP_ACK_THRESHOLD).
+
+config OOO_MAX_SEGMENTS
+    int "Out-of-order reassembly queue depth"
+    range 1 64
+    default 4
+    help
+      Maximum out-of-order segments held in the reorder queue while
+      waiting for a missing earlier segment.  Larger queues absorb
+      more reordering but consume more memory per connection.
+      Current codebase: 4 (crates/net/src/tcp.rs OOO_MAX_SEGMENTS).
+
+config TIME_WAIT_MS
+    int "TCP TIME_WAIT duration (ms)"
+    range 100 120000
+    default 2000
+    help
+      Duration a connection stays in TIME_WAIT state after both sides
+      have closed.  RFC 793 recommends 2 × MSL (60 s each), but
+      embedded kernels use shorter values to reuse ports faster.
+      Current codebase: 2000 ms (crates/net/src/tcp.rs TIME_WAIT_MS).
+
+# ---------------------------------------------------------------------------
+# ARP
+# ---------------------------------------------------------------------------
+
+config ARP_CACHE_SIZE
+    int "ARP cache entries"
+    range 4 1024
+    default 16
+    help
+      Number of IP→MAC mappings cached in the ARP table.  Evicts
+      least-recently-used entries when full.  16 entries covers most
+      small subnets (brain + OTA server + gateway).
+      Current codebase: 16 (crates/net/src/arp.rs ARP_CACHE_SIZE).
+
+# ---------------------------------------------------------------------------
+# Brain link defaults
+# ---------------------------------------------------------------------------
+
+config BRAIN_SERVER_IP_DEFAULT
+    string "Default brain server IP address"
+    default "10.0.2.2"
+    help
+      IP address of the Python brain server.  10.0.2.2 is the QEMU
+      NAT gateway address (the host machine from the guest's perspective).
+      Overridden at runtime via CONFIG.INI key `behavior_server_ip`.
+      Current codebase: 10.0.2.2 (CFG_NET_GATEWAY / behavior default).
+
+config BRAIN_SERVER_PORT_DEFAULT
+    int "Default brain server port"
+    range 1 65535
+    default 9000
+    help
+      TCP port the kernel connects to on the brain server.
+      Overridden at runtime via CONFIG.INI key `behavior_server_port`.
+      Current codebase: 9000 (protocol.py BRAIN_PORT / config.rs default 0
+      = disabled until set; 9000 is the brain-side bind port).
+
+endmenu # Network

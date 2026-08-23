@@ -1,0 +1,62 @@
+# Kconfig.brain — Brain server link defaults and subsumption layer enables
+#
+# RFC-0026 Phase C1.  Compile-time defaults for the brain link.
+# Runtime values can be overridden in CONFIG.INI.
+
+menu "Brain Server Link"
+
+config BRAIN_L1_ENABLED
+    bool "Behavior layer 1 (L1 — obstacle avoidance)"
+    default y
+    help
+      Enables the L1 reactive obstacle-avoidance layer of the
+      Subsumption architecture.  When active, proximity sensor readings
+      override motor commands to avoid collisions.
+      Compile-time default; runtime toggle via CONFIG.INI `behavior_l1`.
+
+config BRAIN_L2_ENABLED
+    bool "Behavior layer 2 (L2 — remote VLA brain link)"
+    default y
+    help
+      Enables the L2 remote VLA (Vision-Language-Action) layer.
+      The kernel connects to the Python brain server and dispatches
+      camera frames / sensor packets for AI planning.
+      Compile-time default; runtime toggle via CONFIG.INI `behavior_l2`.
+
+config BRAIN_L3_ENABLED
+    bool "Behavior layer 3 (L3 — autonomous exploration)"
+    default y
+    help
+      Enables the L3 autonomous-exploration layer.  When neither L1
+      nor L2 produce commands, L3 drives the robot to explore its
+      environment using nav/occupancy grid waypoints.
+      Compile-time default; runtime toggle via CONFIG.INI `behavior_l3`.
+
+config AUTO_RECONNECT
+    bool "Auto-reconnect to brain server on connection loss"
+    default y
+    help
+      When the brain link drops, the kernel automatically retries
+      the TCP connection every OFFLINE_RECONNECT_INTERVAL_TICKS ticks.
+      Disable to stay in offline-autonomous mode permanently after
+      first disconnect (e.g. for field deployments with no brain).
+
+config MULTISTREAM_SCHED_PRIORITY
+    bool "Multi-stream scheduler: priority (control preempts bulk)"
+    default n
+    help
+      RFC-0021 multi-stream link scheduling policy — a compile-time
+      choice so each binary carries exactly one policy (zero hot-path
+      overhead; the unused branch is const-eliminated).
+
+      n (default) = FIFO: streams share the link in send order; a large
+        STREAM_CAMERA frame can head-of-line-block a STREAM_CONTROL frame.
+      y = PRIORITY: STREAM_CONTROL frames are interleaved ahead of bulk
+        stream chunks, bounding control hold-off to ~one chunk-time
+        instead of one full bulk-frame-time (experiment I2).
+
+      Selected via `make menuconfig` / defconfig; surfaces as
+      `robot_os_limits::MULTISTREAM_SCHED_PRIORITY`. A/B the two builds
+      with the bench_boot capture + dashboard.
+
+endmenu # Brain Server Link

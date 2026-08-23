@@ -11,6 +11,7 @@ pub use fat32::{
     fat32_mount, fat32_lookup_root, fat32_read_chain, fat32_mounted, fat32_ls_root,
     fat32_write_file, fat32_unlink_root, fat32_unlink_path,
     fat32_alloc_cluster, fat32_free_chain, fat32_sync,
+    fat32_locks_available,
     // File-level API (phase AS).
     fat32_mount_volume, fat32_unmount,
     fat32_open, fat32_read, fat32_write, fat32_seek, fat32_fsync, fat32_close,
@@ -47,4 +48,5 @@ pub use vfs::{
     vfs_mount,
     fd_table_init, fd_alloc, fd_free, fd_get, fd_dup, fd_dup2,
     vfs_open, vfs_close, vfs_read, vfs_write, vfs_lseek,
+    vfs_fs_lock_available,
 };

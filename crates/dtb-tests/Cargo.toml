@@ -1,0 +1,11 @@
+[package]
+name = "robot_os_dtb_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for robot_os_dtb (Flattened Device Tree parser). Excluded from workspace; same nightly-build-std workaround as other *-tests crates."
+
+# Run with:  cd crates/dtb-tests && cargo test
+
+[dependencies]
+robot_os_dtb = { path = "../dtb" }

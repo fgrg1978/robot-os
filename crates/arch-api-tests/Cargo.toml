@@ -1,0 +1,11 @@
+[package]
+name = "robot_os_arch_api_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for robot_os_arch_api — PagePerms named constants, ArchId/arch_name round-trip, trait shape pinned via a Stub impl that satisfies all five traits (Cpu/Interrupts/Mmu/Boot/Vector)."
+
+# Run with:  cd crates/arch-api-tests && cargo test
+
+[dependencies]
+robot_os_arch_api = { path = "../arch-api" }

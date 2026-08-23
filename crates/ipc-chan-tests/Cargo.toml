@@ -1,0 +1,30 @@
+[package]
+name = "robot_os_ipc_chan_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for the ownership/bounds logic in crates/ipc/src/{channel,pipe,signal}.rs. Excluded from workspace."
+
+# Same pattern as cap-tests: `robot_os_ipc` as a whole cannot be built for
+# the host (RV64-only deps), so the three modules are pulled in with
+# `#[path]` over a small shim for `robot_os_sync`.
+#
+# Run with:  cd crates/ipc-chan-tests && cargo test
+
+[dependencies]
+# Host stand-ins. Their `[lib] name` is the kernel crate's name, so the
+# `#[path]`-included sources resolve `use robot_os_sync::SpinLock;` and
+# `robot_os_sched::current_task_tid()` without being edited.
+robot-os-sync-hostshim = { path = "shims/sync" }
+robot-os-sched-hostshim = { path = "shims/sched" }
+# MAX_CHANNELS / MAX_PIPES come from the generated .config constants; this
+# leaf has no runtime dependencies of its own, so it builds for the host.
+robot_os_limits = { path = "../limits" }
+# channel.rs and cap.rs both use `#[wcet(N_us)]`; the proc-macro must be
+# available for host compilation.
+wcet-macro = { path = "../wcet-macro" }
+# cap.rs (pulled in because channel.rs references `crate::cap`) needs these.
+robot_os_abi = { path = "../abi" }
+robot_os_degrade_policy = { path = "../degrade-policy" }
+
+[dev-dependencies]

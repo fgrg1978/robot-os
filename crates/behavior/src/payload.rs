@@ -30,6 +30,15 @@ pub const PAYLOAD_GPIO_SPRAY: u32 = 20;
 /// GPIO pin driving the external camera shutter trigger input.
 pub const PAYLOAD_GPIO_CAM_TRIGGER: u32 = 21;
 /// PWM channel connected to the gripper servo signal wire.
+///
+/// Currently non-functional on real hardware: `pwm_set_duty` is
+/// unimplemented (see `drivers::pwm::pwm_set_duty`) and this channel index
+/// (4) is out of range on the real 4-channel JH7110 PWM8 instance (valid:
+/// 0-3) even if it were implemented. A working gripper needs its own
+/// high-resolution timer to generate the ~50 Hz / 1-2 ms RC-servo signal —
+/// the kernel's existing scheduler tick (10 ms) is far too coarse to
+/// represent that pulse width at all. Deliberately deferred to hardware
+/// bring-up (decided 2026-08): not attempted in this pass.
 pub const PAYLOAD_PWM_GRIPPER: u32 = 4;
 
 // ── Servo PWM constants (standard 50 Hz hobby servo) ─────────────────────────
@@ -73,9 +82,27 @@ pub fn payload_init() {
     gpio_write(PAYLOAD_GPIO_CAM_TRIGGER, 0);
 
     // Gripper servo: PWM at 50 Hz, parked at closed position.
-    pwm_set_period(PAYLOAD_PWM_GRIPPER, GRIPPER_PWM_PERIOD_NS);
-    pwm_set_duty(PAYLOAD_PWM_GRIPPER, GRIPPER_PWM_CLOSED_NS);
-    pwm_enable(PAYLOAD_PWM_GRIPPER);
+    // Every step's return code is checked and logged — silently discarding
+    // these previously meant the gripper could fail to move on real
+    // hardware with no diagnostic trail (see `drivers::pwm::pwm_set_duty`
+    // doc comment: unimplemented on vf2/k1 pending JH7110 TRM duty
+    // comparator info, so this WILL fail there today).
+    if pwm_set_period(PAYLOAD_PWM_GRIPPER, GRIPPER_PWM_PERIOD_NS) != 0 {
+        robot_os_drivers::kprintln!(
+            "[PAYLOAD] gripper: pwm_set_period(ch={}) failed", PAYLOAD_PWM_GRIPPER
+        );
+    }
+    if pwm_set_duty(PAYLOAD_PWM_GRIPPER, GRIPPER_PWM_CLOSED_NS) != 0 {
+        robot_os_drivers::kprintln!(
+            "[PAYLOAD] gripper: pwm_set_duty(ch={}) failed — gripper will not move \
+             to the closed position on this platform", PAYLOAD_PWM_GRIPPER
+        );
+    }
+    if pwm_enable(PAYLOAD_PWM_GRIPPER) != 0 {
+        robot_os_drivers::kprintln!(
+            "[PAYLOAD] gripper: pwm_enable(ch={}) failed", PAYLOAD_PWM_GRIPPER
+        );
+    }
 }
 
 // ── Command dispatch ──────────────────────────────────────────────────────────
@@ -112,7 +139,13 @@ pub fn payload_gripper(pos: u8) -> bool {
     let clamped = pos.min(100) as u32;
     // Linear map: pos=0 → CLOSED_NS, pos=100 → OPEN_NS
     let duty_ns = GRIPPER_PWM_CLOSED_NS + clamped * GRIPPER_PWM_RANGE_NS / 100;
-    pwm_set_duty(PAYLOAD_PWM_GRIPPER, duty_ns);
+    if pwm_set_duty(PAYLOAD_PWM_GRIPPER, duty_ns) != 0 {
+        robot_os_drivers::kprintln!(
+            "[PAYLOAD] gripper: pwm_set_duty(ch={}, pos={}) failed — gripper did not move",
+            PAYLOAD_PWM_GRIPPER, clamped
+        );
+        return false;
+    }
     GRIPPER_POS.store(clamped as u8, Ordering::Relaxed);
     true
 }

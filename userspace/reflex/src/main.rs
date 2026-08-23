@@ -31,8 +31,27 @@ const OBSTACLE_CLEAR_MM: u16 = 600;      // resume normal
 const TILT_ESTOP_MG: i32 = 700;
 
 // Motor speeds
-const BACKUP_SPEED: u64 = 30;           // reverse speed (negative applied in logic)
-const TURN_SPEED: u64 = 40;             // turn-in-place speed
+//
+// There are no speed constants here any more, and that is a kernel-ABI
+// limitation, not an oversight. This file used to carry
+// `BACKUP_SPEED = 30` / `TURN_SPEED = 40` and reverse by passing the
+// negation of them to `sys::motor_speed`, on the strength of a libsys doc
+// that read "signed: positive = forward, negative = reverse".
+//
+// That doc was wrong. `sys_motor_speed` (crates/syscall/src/handlers.rs:753)
+// takes an UNSIGNED percentage, hard-codes `MotorDir::Forward`, and
+// `motor_set` (crates/robot/src/motor.rs:91) clamps it with
+// `speed_pct.min(100)`. A sign-extended -30 arrives as 0xFFFF...E2 and
+// clamps to 100 — so "reverse away from the obstacle" drove BOTH MOTORS
+// FULL SPEED FORWARD INTO IT. On QEMU that was a log line; on the robot it
+// is a collision, and it is the reason this daemon is here at all.
+//
+// The untyped motor ABI cannot express a (direction, speed) pair:
+// `sys::motor_speed` sets speed and forces Forward;
+// `sys::motor_set_direction` sets direction and forces a kernel-fixed 50%.
+// The behaviours below therefore run at 50% rather than the 30/40 they
+// used to ask for. Restoring the chosen speeds needs a kernel-side syscall
+// carrying both — see the ABI audit report.
 
 // Timing
 const REFLEX_PERIOD_MS: u64 = 25;       // 40 Hz -faster than brain's 20 Hz
@@ -124,20 +143,21 @@ fn motor_stop() {
 }
 
 /// Reverse both motors briefly.
+///
+/// Reverse is only reachable through `motor_set_direction`, which is the
+/// kernel's `SYS_MOTOR_ENABLE` — direction plus a fixed 50% speed. See the
+/// note on the removed speed constants above.
 fn motor_backup() {
-    // Negative speed = reverse (kernel interprets signed)
-    let neg_speed = (-(BACKUP_SPEED as i64)) as u64;
-    sys::motor_speed(MOTOR_LEFT, neg_speed);
-    sys::motor_speed(MOTOR_RIGHT, neg_speed);
+    sys::motor_set_direction(MOTOR_LEFT, sys::MOTOR_DIR_BACKWARD);
+    sys::motor_set_direction(MOTOR_RIGHT, sys::MOTOR_DIR_BACKWARD);
     sys::sleep(BACKUP_DURATION_MS);
     motor_stop();
 }
 
-/// Turn away from obstacle (turn left -away from front obstacle).
+/// Turn away from obstacle (spin in place: left reverses, right drives).
 fn motor_turn_away() {
-    let neg_speed = (-(TURN_SPEED as i64)) as u64;
-    sys::motor_speed(MOTOR_LEFT, neg_speed);
-    sys::motor_speed(MOTOR_RIGHT, TURN_SPEED);
+    sys::motor_set_direction(MOTOR_LEFT, sys::MOTOR_DIR_BACKWARD);
+    sys::motor_set_direction(MOTOR_RIGHT, sys::MOTOR_DIR_FORWARD);
     sys::sleep(TURN_DURATION_MS);
     motor_stop();
 }

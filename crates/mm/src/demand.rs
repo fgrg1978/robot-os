@@ -21,7 +21,6 @@
 //!     the fault has materialized it).
 //!
 //! `no-mmu` behaviour:
-//!   - This module is not compiled on `esp32c3` (no MMU, no page tables).
 //!   - On the RV64 `no-mmu` feature the module still compiles (same target
 //!     as the normal RV64 kernel, vmm is available), but the kernel's
 //!     page-fault dispatch is gated with `#[cfg(not(feature = "no-mmu"))]`

@@ -2,11 +2,21 @@
 name = "robot_os_ipc"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
 
 [dependencies]
+robot_os_abi = { workspace = true }
 robot_os_sched = { workspace = true }
 robot_os_sync = { workspace = true }
 robot_os_common = { workspace = true }
 robot_os_mm = { workspace = true }
 robot_os_drivers = { workspace = true }
 robot_os_arch = { workspace = true }
+robot_os_limits = { workspace = true }
+# RFC-0037: degrade taxonomy + speed-ceiling mapping live in this dep-free leaf
+# so that motor-actuation policy does not pollute the TCB.
+robot_os_degrade_policy = { workspace = true }
+wcet-macro = { path = "../wcet-macro" }

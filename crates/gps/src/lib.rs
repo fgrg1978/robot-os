@@ -302,8 +302,9 @@ fn validate_checksum(sentence: &[u8]) -> bool {
         }
     }
     if star_pos == 0 || star_pos + 2 >= sentence.len() {
-        // No checksum — accept anyway (some receivers omit it).
-        return true;
+        // Safety-critical: an NMEA sentence without a valid checksum is not
+        // trusted (spoofed/garbage frames must not reach the RTL/failsafe).
+        return false;
     }
 
     // Compute XOR checksum.
@@ -389,9 +390,10 @@ fn parse_nmea_coord(coord: &[u8], hemi: &[u8]) -> i32 {
             mul /= 10;
         }
     }
-    // Total minutes in deg7: (min_int * 10^7 + min_frac * 10) / 60
-    // We compute: min_deg7 = (min_int * 10_000_000 + min_frac * 10) / 60
-    let min_total = min_int as u64 * 10_000_000 + min_frac as u64 * 10;
+    // Total minutes in deg7: min_int * 10^7 + min_frac
+    // (min_frac is already scaled to 7 decimal digits by the loop above,
+    // matching min_int's 10^7 scale — no extra factor needed.)
+    let min_total = min_int as u64 * 10_000_000 + min_frac as u64;
     let min_deg7 = (min_total / 60) as i32;
 
     let deg7 = degrees as i32 * 10_000_000 + min_deg7;

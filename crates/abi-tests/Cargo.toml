@@ -1,0 +1,11 @@
+[package]
+name = "robot_os_abi_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for the abi crate's #[cfg(test)] suites. Excluded from workspace."
+
+[dependencies]
+robot_os_abi = { path = "../abi" }
+
+[dev-dependencies]

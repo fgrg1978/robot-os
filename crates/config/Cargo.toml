@@ -2,6 +2,7 @@
 name = "robot_os_config"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 # Pure no_std — zero external dependencies.
 # cfg_load is called once during single-threaded boot; all other

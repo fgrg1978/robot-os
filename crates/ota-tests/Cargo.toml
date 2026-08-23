@@ -2,6 +2,7 @@
 name = "robot_os_ota_tests"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "Host-side unit tests for OTA pure logic (OT01). Excluded from workspace."
 
 # This crate is EXCLUDED from the workspace (see top-level Cargo.toml).

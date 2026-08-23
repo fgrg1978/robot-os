@@ -1,0 +1,13 @@
+[package]
+name = "robot_os_drivers_api"
+version = "0.1.0"
+edition = "2021"
+description = "PHANES Driver trait + DriverIsolation + DriverManifest + Registry struct. Pure no_std + host-compatible — no RISC-V dependencies. RFC-0002 modular pattern surface."
+license = "Apache-2.0"
+repository = "https://github.com/phanes-project/phanes"
+
+[lib]
+name = "robot_os_drivers_api"
+
+[dependencies]
+robot_os_abi = { workspace = true }

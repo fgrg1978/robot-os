@@ -1,0 +1,14 @@
+[package]
+name = "abitest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Userspace syscall ABI conformance test: exercises the libsys wrappers whose argument shape was verified against crates/syscall/src/{dispatch,handlers}.rs and asserts the kernel returns what the docs promise."
+
+[dependencies]
+robot_os_libsys = { path = "../../crates/libsys" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

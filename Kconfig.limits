@@ -1,0 +1,265 @@
+# Kconfig.limits — Resource cap table (subsumes RFC-0023)
+#
+# RFC-0026 Phase C1.  Every static-array bound from across the codebase
+# is declared here with profile-derived defaults.
+# Phase C3 will replace the scattered `pub const` sites with generated.rs.
+
+menu "Resource Limits"
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+config MAX_TASKS
+    int "Maximum schedulable tasks"
+    range 8 16384
+    default 32   if PROFILE_EMBEDDED
+    default 64   if PROFILE_EDGE
+    default 4096 if PROFILE_FLEET
+    help
+      Size of the static task-control-block (TCB) array.  Each task
+      costs ~384 B of TCB plus its kernel stack (KERNEL_STACK_SIZE_KB).
+      Current codebase default: 64 (edge).  Scheduler walk WCET scales
+      linearly with MAX_TASKS at each tick.
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+
+config TCP_MAX_CONNS
+    int "Maximum simultaneous TCP connections"
+    range 1 65536
+    default 4    if PROFILE_EMBEDDED
+    default 8    if PROFILE_EDGE
+    default 1024 if PROFILE_FLEET
+    help
+      Static connection-control-block (CCB) array size.  Each entry
+      costs TCP_BUF_SIZE × 2 bytes of buffer memory (RX + TX) plus
+      ~128 B overhead.  Edge default = 8 (current codebase value).
+      Must be ≤ MAX_SOCKETS.
+
+config MAX_SOCKETS
+    int "Maximum total sockets (TCP + UDP)"
+    range 1 65536
+    default 8    if PROFILE_EMBEDDED
+    default 16   if PROFILE_EDGE
+    default 2048 if PROFILE_FLEET
+    help
+      Combined pool for all socket types.  UDP sockets are cheap
+      (~48 B each); TCP sockets are heavier (see TCP_BUF_SIZE).
+      Must be ≥ TCP_MAX_CONNS + 4 reserved UDP slots.
+      Current codebase value: 16 (edge).
+
+# ---------------------------------------------------------------------------
+# File descriptors
+# ---------------------------------------------------------------------------
+
+config MAX_FDS_PER_PROC
+    int "File descriptors per process"
+    range 4 4096
+    default 8   if PROFILE_EMBEDDED
+    default 16  if PROFILE_EDGE
+    default 256 if PROFILE_FLEET
+    help
+      Maximum open FDs a single process can hold simultaneously.
+      Includes sockets, FAT32 files, and device nodes.
+      Current codebase value: 16 (edge, crates/fs/src/vfs.rs MAX_FDS).
+
+config MAX_FDS_TOTAL
+    int "Global file descriptor table size"
+    range 16 262144
+    default 128   if PROFILE_EMBEDDED
+    default 2048  if PROFILE_EDGE
+    default 16384 if PROFILE_FLEET
+    help
+      System-wide FD table.  The build-time validator in
+      `crates/limits/build.rs` enforces:
+          MAX_FDS_TOTAL >= MAX_TASKS * 4
+      (average-case budget: ~4 FDs per task — stdin/stdout/stderr + one
+      socket).  MAX_FDS_PER_PROC is the per-task ceiling and does NOT
+      enter this formula directly.
+
+      Defaults derived from PROFILE × MAX_TASKS:
+        embedded  (32 tasks)    -> 128
+        edge     (512 tasks)    -> 2048
+        fleet    (4096 tasks)   -> 16384
+      Higher values are safe but cost ~32 B per FD-table slot.
+
+# ---------------------------------------------------------------------------
+# IPC
+# ---------------------------------------------------------------------------
+
+config MAX_CHANNELS
+    int "Maximum IPC channels"
+    range 4 65536
+    default 16   if PROFILE_EMBEDDED
+    default 16   if PROFILE_EDGE
+    default 4096 if PROFILE_FLEET
+    help
+      Static channel table size.  Each channel is a fixed-capacity
+      message queue.  Current codebase value: 16 (crates/ipc/src/channel.rs).
+      Note: behavior/brain_protocol.rs uses MAX_CHANNELS = 8 for a
+      different purpose — subsumption layer count, not IPC channel count.
+
+config MAX_PIPES
+    int "Maximum IPC pipes"
+    range 4 65536
+    default 8    if PROFILE_EMBEDDED
+    default 32   if PROFILE_EDGE
+    default 1024 if PROFILE_FLEET
+    help
+      Static pipe (byte-stream IPC) table size.  Each pipe holds a
+      fixed-size ring buffer.  Current codebase value: 32.
+
+config MAX_PORTS
+    int "Maximum IPC ports (rendezvous endpoints)"
+    range 4 65536
+    default 8   if PROFILE_EMBEDDED
+    default 32  if PROFILE_EDGE
+    default 512 if PROFILE_FLEET
+    help
+      Named port table size.  Ports are used for capability-based
+      rendezvous.  Current codebase value: 32 (crates/ipc/src/port.rs).
+
+config MAX_LEASES
+    int "Maximum IPC memory leases"
+    range 4 65536
+    default 8   if PROFILE_EMBEDDED
+    default 16  if PROFILE_EDGE
+    default 512 if PROFILE_FLEET
+    help
+      Lease table for shared-memory delegation between tasks.  Each
+      lease maps a physical region into another task's address space
+      for a bounded time.  Current codebase value: 16.
+
+# ---------------------------------------------------------------------------
+# Pub/Sub
+# ---------------------------------------------------------------------------
+
+config MAX_SERVICES
+    int "Maximum named services"
+    range 4 65536
+    default 8   if PROFILE_EMBEDDED
+    default 32  if PROFILE_EDGE
+    default 512 if PROFILE_FLEET
+    help
+      Service-registry table size.  Services are typed endpoints
+      discoverable by name.  Current codebase value: 32 (crates/service).
+
+config MAX_TOPICS
+    int "Maximum pub/sub topics"
+    range 4 65536
+    default 8   if PROFILE_EMBEDDED
+    default 32  if PROFILE_EDGE
+    default 512 if PROFILE_FLEET
+    help
+      Static topic table size.  Each topic holds a fixed-size message
+      ring plus subscriber list.  Current codebase value: 32 (crates/pubsub).
+
+config MAX_SUBS_PER_TOPIC
+    int "Maximum subscribers per topic"
+    range 1 256
+    default 4  if PROFILE_EMBEDDED
+    default 8  if PROFILE_EDGE
+    default 32 if PROFILE_FLEET
+    help
+      Fan-out limit per topic.  Each subscription slot holds a task ID
+      and a read pointer.  Current codebase value: 8 (crates/pubsub).
+
+# ---------------------------------------------------------------------------
+# Capability system
+# ---------------------------------------------------------------------------
+
+config MAX_CAPS_TOTAL
+    int "Total capability pool size"
+    range 64 1048576
+    default 256   if PROFILE_EMBEDDED
+    default 1024  if PROFILE_EDGE
+    default 65536 if PROFILE_FLEET
+    help
+      Global capability table entries.  Each entry is ~16 B.  Must be
+      ≥ MAX_TASKS × 8 (rough per-task budget).
+      Current codebase value: 1024 (crates/topology/src/types.rs).
+
+config MAX_CAPS_PER_TASK
+    int "Maximum capabilities per task"
+    range 8 16384
+    default 32  if PROFILE_EMBEDDED
+    default 256 if PROFILE_EDGE
+    default 512 if PROFILE_FLEET
+    help
+      Per-task capability slot count.  Limits how many IPC endpoints,
+      memory regions, and devices a single process can hold at once.
+      Current codebase value: 256 (crates/ipc/src/cap.rs).
+
+# ---------------------------------------------------------------------------
+# Memory budgets
+# ---------------------------------------------------------------------------
+
+config KERNEL_HEAP_SIZE
+    int "Kernel heap size (KiB)"
+    range 64 1048576
+    default 512    if PROFILE_EMBEDDED
+    default 32768  if PROFILE_EDGE
+    default 262144 if PROFILE_FLEET
+    help
+      Static heap region carved out during boot for the kernel allocator.
+      Must cover all TCBs + kernel stacks + static tables + IPC buffers.
+      Edge default: 32 MiB.  Embedded: 512 KiB.  Fleet: 256 MiB.
+
+config USER_STACK_SIZE_KB
+    int "User-task stack size (KiB)"
+    range 4 1024
+    default 16 if ARCH_RISCV64
+    default 32 if ARCH_AARCH64
+    default 48 if ARCH_X86_64
+    help
+      Default virtual stack size per user task.  Lazily allocated via
+      demand paging — only touched pages cost physical memory.  Sized
+      to hold the largest FP register save context plus ~4 KiB guard.
+      NEON (Aarch64) and XSAVE (x86_64) save areas require larger stacks.
+
+config KERNEL_STACK_SIZE_KB
+    int "Per-task kernel stack (KiB)"
+    range 4 256
+    default 8  if ARCH_RISCV64 && PROFILE_EMBEDDED
+    default 16 if ARCH_RISCV64
+    default 32 if ARCH_AARCH64
+    default 32 if ARCH_X86_64
+    help
+      Kernel-mode stack depth reserved when a user task syscalls into
+      the kernel.  Sized for the deepest syscall handler chain including
+      interrupt nesting.  Larger on Aarch64/x86_64 due to bigger trap frames.
+
+config INTERRUPT_STACK_SIZE_KB
+    int "Per-hart interrupt stack (KiB)"
+    range 2 64
+    default 4 if ARCH_RISCV64
+    default 8 if ARCH_AARCH64
+    default 8 if ARCH_X86_64
+    help
+      Dedicated stack used for top-half IRQ handlers.  Separate from
+      the task kernel stack to prevent stack overflow when IRQs nest.
+      Must accommodate the worst-case nested IRQ depth.
+
+# ---------------------------------------------------------------------------
+# WCET measurement table
+# ---------------------------------------------------------------------------
+
+config WCET_MAX_POINTS
+    int "Maximum WCET measurement points (fixed + per-function)"
+    range 16 1024
+    default 32   if PROFILE_EMBEDDED
+    default 128  if PROFILE_EDGE
+    default 512  if PROFILE_FLEET
+    default 32
+    help
+      Total slots in the WCET measurement table.  The first 9 are
+      reserved for the existing fixed points (pid_loop, sensor_read,
+      ctx_switch, timer_isr, actuator_write, net_send, cnn_infer,
+      lidar_scan, path_plan); the rest are filled by `#[wcet(...)]`
+      attribute annotations enumerated by crates/drivers/build.rs.
+      See RFC-0027.  Sized as a Kconfig option so each deployment
+      profile can tune the budget without a source-code change.
+
+endmenu # Resource Limits

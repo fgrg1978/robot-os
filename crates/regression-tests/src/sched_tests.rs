@@ -50,36 +50,31 @@ fn equal_priorities_do_not_preempt() {
     assert!(!should_preempt(NET_POLL_PRIORITY, NET_POLL_PRIORITY));
 }
 
-// ── Load-balancing primitive (find_least_loaded_cpu) ─────────────────────
+// ── Load-balancing primitive — RETIRADO A PROPÓSITO (K-C12) ──────────────
 //
-// scheduler.rs picks the CPU with the smallest task count for new tasks
-// that aren't pinned. Lock down: ties go to the lowest-index CPU.
-
-fn find_least_loaded_cpu(loads: &[u32]) -> usize {
-    let mut min_idx = 0;
-    let mut min_load = loads[0];
-    for (i, &l) in loads.iter().enumerate().skip(1) {
-        if l < min_load { min_load = l; min_idx = i; }
-    }
-    min_idx
-}
-
-#[test]
-fn least_loaded_picks_smallest() {
-    assert_eq!(find_least_loaded_cpu(&[5, 3, 7, 2]), 3);
-    assert_eq!(find_least_loaded_cpu(&[0, 1, 2, 3]), 0);
-}
-
-#[test]
-fn least_loaded_breaks_ties_to_lowest_index() {
-    assert_eq!(find_least_loaded_cpu(&[3, 3, 3, 3]), 0);
-    assert_eq!(find_least_loaded_cpu(&[5, 1, 1, 1]), 1);
-}
-
-#[test]
-fn least_loaded_single_cpu() {
-    assert_eq!(find_least_loaded_cpu(&[7]), 0);
-}
+// Aquí vivían tres tests sobre una copia **privada** de `find_least_loaded_cpu`
+// escrita a mano en este fichero. Pasaban siempre, y no probaban nada: la copia
+// se probaba a sí misma. Cuando K-C12 demostró que esa política estaba mal y el
+// kernel la sustituyó, los tres siguieron en verde afirmando la política
+// abandonada — el peor resultado posible para un test de regresión, porque
+// además invitaba a "arreglar" el kernel de vuelta hacia ellos.
+//
+// Qué estaba mal en la política, para que no vuelva: contaba tareas
+// **encoladas**, una métrica ciega dos veces. No ve la tarea que está
+// *corriendo* (no está en ninguna cola) e ignora la prioridad, mientras
+// `cpu_dequeue` es prioridad estricta sin envejecimiento. Un hijo de `fork()`
+// con prioridad 16 colocado en el hart que hospeda `rt-motor` y `flight-ctrl`
+// (ambos prioridad 8) quedaba `Ready` para siempre. Medido: 98 de 98 hijos
+// ejecutaron en un hart sin residentes RT; 0 de 5 en los dos que sí los tenían.
+//
+// La política real vive ahora en `robot_os_sched::task::pick_cpu_by_load`, que
+// puntúa **residencia** en vez de estado instantáneo, y se prueba contra la
+// función del kernel —no contra una copia— en `crates/sched-wake-tests`.
+//
+// La lección es la que este fichero existe para enseñar: un test que replica a
+// mano la lógica que dice vigilar no vigila nada. Si vuelve a hacer falta
+// cobertura aquí, tírese del fuente real con `#[path]`, como ya hacen
+// `crypto_tests.rs` y `property.rs` en este mismo crate.
 
 // ── Time-slice expiry ────────────────────────────────────────────────────
 //

@@ -41,6 +41,15 @@ pub const ETH_TYPE_IPV6:    u16 = 0x86DD;
 pub const IPV6_VERSION:     u8  = 6;
 /// Minimum IPv6 header size (no extension headers).
 pub const IPV6_HDR_SIZE:    usize = 40;
+
+/// Ethernet II header length, ahead of the IPv6 header in a built frame.
+pub const ETH_HDR_LEN:      usize = 14;
+/// UDP header length.
+pub const UDP_HDR_LEN:      usize = 8;
+/// Largest UDP payload that still fits one 1500-byte-MTU IPv6 datagram:
+/// `1500 - 40 (IPv6) - 8 (UDP)`.  This stack does no fragmentation, so it is
+/// a hard bound, and `udpv6_send`'s frame buffer is sized from it.
+pub const IPV6_UDP_MAX_PAYLOAD: usize = 1500 - IPV6_HDR_SIZE - UDP_HDR_LEN;
 /// Default Hop Limit (analogous to IPv4 TTL).
 pub const IPV6_HOP_LIMIT:   u8  = 64;
 
@@ -167,8 +176,45 @@ pub fn is_our_addr(addr: &[u8; 16]) -> bool {
 pub fn is_all_nodes(addr: &[u8; 16]) -> bool { addr == &MCAST_ALL_NODES }
 
 /// Check if `addr` is a multicast address (starts with `FF`).
+///
+/// This is a *format* test, not a membership test — it says the address is
+/// some multicast group, not that we are in it.  Do not use it as a receive
+/// filter; use [`is_joined_group`].
 #[inline]
 pub fn is_multicast(addr: &[u8; 16]) -> bool { addr[0] == 0xFF }
+
+/// The solicited-node multicast group for `addr` (RFC 4291 §2.7.1):
+/// `FF02::1:FFXX:XXXX`, where `XX:XXXX` are the low 24 bits of `addr`.
+///
+/// Neighbor Solicitations for one of our addresses are sent to this group
+/// rather than to all-nodes, so an interface that does not accept it cannot be
+/// resolved by its neighbours.
+pub fn solicited_node(addr: &[u8; 16]) -> [u8; 16] {
+    let mut g = [0u8; 16];
+    g[0]  = 0xFF;
+    g[1]  = 0x02;
+    // bytes 2..11 stay zero
+    g[11] = 0x01;
+    g[12] = 0xFF;
+    g[13] = addr[13];
+    g[14] = addr[14];
+    g[15] = addr[15];
+    g
+}
+
+/// True if `addr` is a multicast group this interface has actually joined.
+///
+/// The joined set for a host with one auto-configured link-local address is
+/// exactly two groups (RFC 4291 §2.8): all-nodes `FF02::1`, and the
+/// solicited-node group of that address.  Accepting `addr[0] == 0xFF` instead
+/// — i.e. every group that exists — meant any remote host could pick an
+/// arbitrary destination and still have the datagram parsed and dispatched to
+/// an upper layer, which is how a forged source reached the shared UDP socket
+/// table.  Membership, not format, is the filter.
+#[inline]
+pub fn is_joined_group(addr: &[u8; 16]) -> bool {
+    is_all_nodes(addr) || *addr == solicited_node(&ipv6_link_local())
+}
 
 // ── Pseudo-header checksum ────────────────────────────────────────────────────
 
@@ -337,8 +383,12 @@ pub fn ipv6_rx(frame: &[u8], frame_len: usize) {
     let src: &[u8; 16] = frame[8..24].try_into().unwrap();
     let dst: &[u8; 16] = frame[24..40].try_into().unwrap();
 
-    // Only process frames addressed to us or all-nodes multicast.
-    if !is_our_addr(dst) && !is_all_nodes(dst) && !is_multicast(dst) { return; }
+    // Destination filter: our unicast address, or a group we have joined
+    // (all-nodes + solicited-node).  The trailing `|| is_multicast(dst)` this
+    // replaces admitted every multicast address in existence, which made the
+    // whole filter a no-op for anyone who bothered to set the first byte to
+    // 0xFF — including traffic aimed at the UDP dispatcher below.
+    if !is_our_addr(dst) && !is_joined_group(dst) { return; }
 
     let next_hdr = frame[6];
     let payload  = &frame[IPV6_HDR_SIZE..IPV6_HDR_SIZE + payload_len];
@@ -362,12 +412,18 @@ pub fn udpv6_send(
     dst_port: u16,
     data:     &[u8],
 ) -> bool {
-    if data.len() + 8 > 1452 { return false; } // MTU - IPv6_HDR - UDP_HDR
+    // Admission bound and frame size must agree, or the copy below writes past
+    // the frame and panics — a full board reset under `panic = "abort"`.  They
+    // did not: the old bound allowed 1444 payload bytes, giving a 1506-byte
+    // frame into a `[u8; 1500]`.  Both are now derived from the same MTU
+    // arithmetic (1500 = 40 IPv6 + 8 UDP + payload), and the explicit length
+    // check below keeps that an enforced invariant rather than a claim.
+    if data.len() > IPV6_UDP_MAX_PAYLOAD { return false; }
     let src_addr = ipv6_link_local();
 
     // Build UDP header + payload (8 + data.len() bytes).
     let udp_len = (8 + data.len()) as u16;
-    let mut udp_buf = [0u8; 1460];
+    let mut udp_buf = [0u8; UDP_HDR_LEN + IPV6_UDP_MAX_PAYLOAD];
     udp_buf[0] = (src_port >> 8) as u8;
     udp_buf[1] = src_port as u8;
     udp_buf[2] = (dst_port >> 8) as u8;
@@ -382,10 +438,15 @@ pub fn udpv6_send(
     udp_buf[6] = (csum >> 8) as u8;
     udp_buf[7] = csum as u8;
 
-    let frame_len = 14 + IPV6_HDR_SIZE + udp_len as usize;
-    let mut frame = [0u8; 1500];
-    ipv6_build_header(&mut frame[14..], NEXTHDR_UDP, &src_addr, dst_addr, udp_len);
-    frame[14 + IPV6_HDR_SIZE..frame_len].copy_from_slice(&udp_buf[..udp_len as usize]);
+    let frame_len = ETH_HDR_LEN + IPV6_HDR_SIZE + udp_len as usize;
+    let mut frame = [0u8; super::ethernet::ETH_FRAME_MAX];
+    // Belt and braces: the admission bound above already guarantees this, but
+    // the guarantee is arithmetic in another place, and the cost of being
+    // wrong is a reset rather than a dropped packet.
+    if frame_len > frame.len() { return false; }
+    ipv6_build_header(&mut frame[ETH_HDR_LEN..], NEXTHDR_UDP, &src_addr, dst_addr, udp_len);
+    frame[ETH_HDR_LEN + IPV6_HDR_SIZE..frame_len]
+        .copy_from_slice(&udp_buf[..udp_len as usize]);
 
     super::ethernet::send_ipv6(&mut frame, frame_len, dst_addr)
 }

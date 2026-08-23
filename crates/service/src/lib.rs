@@ -6,8 +6,7 @@
 //! Services communicate via IPC channels.
 
 use robot_os_sync::SpinLock;
-
-pub const MAX_SERVICES:     usize = 32;
+pub use robot_os_limits::MAX_SERVICES;
 pub const MAX_SERVICE_NAME: usize = 32;
 
 #[derive(Clone, Copy, PartialEq)]

@@ -2,6 +2,7 @@
 name = "robot_os_drivers"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 # Platform feature flags.
 # Default (no feature): targets QEMU virt machine.
@@ -10,12 +11,27 @@ edition = "2021"
 [features]
 vf2     = []
 k1      = []
-esp32c3 = ["robot_os_arch/esp32c3"]
 # Relaxed WCET bounds for QEMU emulated environment.
 qemu    = []
+# RFC-0027: per-function `#[wcet(...)]` runtime telemetry. Default OFF — the
+# per-function WCET CI gate was rejected (RFC-0027 §Results, KILL2: QEMU TCG
+# SMP inflates rdcycle with cross-hart time). The macro-emitted instrumentation
+# (wcet_begin_fn/wcet_end_fn) is a no-op unless this feature is enabled, so the
+# annotations cost nothing in production builds. Enable on real hardware
+# (VF2/K1) bring-up where rdcycle is trustworthy: `--features wcet`.
+wcet    = []
 
 [dependencies]
-robot_os_arch   = { workspace = true }
-robot_os_sync   = { workspace = true }
-robot_os_common = { workspace = true }
-robot_os_mm     = { workspace = true }
+robot_os_abi           = { workspace = true }
+robot_os_arch          = { workspace = true }
+robot_os_sync          = { workspace = true }
+robot_os_common        = { workspace = true }
+robot_os_mm            = { workspace = true }
+robot_os_driver_server = { workspace = true }
+robot_os_drivers_api   = { workspace = true }
+robot_os_limits        = { workspace = true }
+
+[build-dependencies]
+# No external deps — build.rs uses only std (fs, env, path).
+# The scanner that discovers #[wcet(...)] annotations is intentionally
+# dependency-free to keep incremental rebuild cost near zero.

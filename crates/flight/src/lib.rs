@@ -21,6 +21,11 @@ pub mod sitl;
 pub mod path3d;
 pub mod terrain;
 pub mod slam;
+// D04: pure drone math (integer trig + wind estimator) lives in the
+// dependency-free `robot_os_flight_math` leaf crate so it is host-testable.
+// Re-exported here so existing `robot_os_flight::{trig,wind}` / `crate::trig`
+// paths keep resolving.
+pub use robot_os_flight_math::{position, trig, wind};
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use robot_os_channel::Channel;
@@ -151,9 +156,19 @@ pub enum FlightMode {
     Manual,
     /// RC = target angle, angle + rate PID.
     Stabilize,
-    /// Stabilize + altitude PID.
+    /// **PLANNED**: Stabilize + altitude PID. The `FlightPid::update_alt`
+    /// method exists but is NOT wired into `flight_control_task` yet —
+    /// AltHold currently behaves identically to Stabilize. Wiring requires
+    /// closed-loop SITL/HIL validation of the altitude controller (same
+    /// discipline as the D04 position controller); deferred until a real
+    /// SITL exercises it.
     AltHold,
-    /// AltHold + GPS position PID.
+    /// **PLANNED**: AltHold + position PID. Same status as `AltHold` —
+    /// the position controller exists in `crate::position::PositionController`
+    /// (D04, host-tested in flight-math-tests) but is NOT wired into
+    /// `flight_control_task`; PosHold currently forwards whatever
+    /// roll/pitch/throttle the server publishes via `CH_FLIGHT_TARGET`.
+    /// Deferred until SITL/HIL.
     PosHold,
     /// Follow waypoints from server.
     Auto,
@@ -437,7 +452,11 @@ pub fn mixer_compute(
 }
 
 fn clamp_throttle(v: i32) -> u16 {
-    if v <= 0 { 0 }
+    // When armed, floor at THROTTLE_IDLE so an aggressive mix correction can
+    // never stop a prop mid-flight (0 µs = motor off, risks ESC desync).
+    // Disarmed floors at 0 (motors off).
+    let floor = if is_armed() { THROTTLE_IDLE as i32 } else { 0 };
+    if v <= floor { floor as u16 }
     else if v >= THROTTLE_MAX as i32 { THROTTLE_MAX }
     else { v as u16 }
 }
@@ -472,7 +491,10 @@ impl Pid {
             integral: 0,
             prev_error: 0,
             out_min, out_max,
-            i_max: out_max * 1000, // default windup limit
+            // Windup limit on the *raw* integral so the delivered I term
+            // (ki*integral/1000) stays within ±out_max. Without the /ki the
+            // limit was ki× too large, making anti-windup a no-op.
+            i_max: out_max.saturating_mul(1000) / if ki > 0 { ki } else { 1 },
         }
     }
 
@@ -557,8 +579,11 @@ impl FlightPid {
         // Outer loop: angle error → target rate.
         let target_rate = self.angle_pid[axis].update(angle_error, dt_us);
 
-        // Inner loop: rate error → control output.
-        let rate_error = target_rate - gyro_rate;
+        // Inner loop: rate error → control output. Subtract in i64 and
+        // saturate: a toxic/sentinel gyro sample (e.g. i32::MIN) must not
+        // overflow this subtraction and abort the flight loop.
+        let rate_error =
+            (target_rate as i64 - gyro_rate as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         self.rate_pid[axis].update(rate_error, dt_us)
     }
 

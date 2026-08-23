@@ -15,6 +15,7 @@
 /// Default: 320x240 = 76,800 bytes per frame (raw Gray8).
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use robot_os_sync::SpinLock;
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -34,6 +35,35 @@ pub const CAMERA_WARMUP_MS: u32 = 200;
 const JPEG_QUALITY: u8 = 50;
 /// Maximum JPEG output buffer size (empirical: raw / 4 is usually enough).
 pub const JPEG_MAX_SIZE: usize = 320 * 240 / 4;
+
+/// Capture width used by the JPEG path (reduced from the sensor resolution
+/// so the compressed frame fits a 115200-baud UART bridge).
+pub const JPEG_CAP_W: usize = 160;
+/// Capture height used by the JPEG path.
+pub const JPEG_CAP_H: usize = 120;
+
+/// Scratch buffer for the raw grayscale frame that feeds the JPEG encoder.
+///
+/// This lives in `.bss` behind a lock, not on the caller's stack, and that
+/// is a hard requirement rather than a micro-optimisation. A task kernel
+/// stack is 16 KiB (`crates/sched/src/task.rs`), the bottom 4 KiB of which
+/// is an unmapped guard page, leaving ~12 KiB usable. This array is
+/// `160 * 120 = 19,200` bytes — larger than the entire usable stack on its
+/// own. Because it was zero-initialised, merely *entering* the function
+/// memset straight through the guard page: fault → panic → and with
+/// `panic = "abort"` in this tree a panic is a full board reset. On a robot
+/// mid-motion that is a physical-safety event, not a crash report. The
+/// reachable trigger was any ring-3 task holding the camera `Sensor`
+/// capability calling `SYS_SENSOR_READ` with `SENSOR_TYPE_CAMERA`.
+///
+/// The same reasoning already appears in `kernel/src/main.rs` for the
+/// ~150 KiB camera frame buffers; the difference is that those have a
+/// single owner (the behavior task) and can be plain statics, whereas
+/// `csi_capture_jpeg` has two callers — the syscall path and the behavior
+/// task — so "no aliasing risk" does not hold here and the buffer needs
+/// real mutual exclusion.
+static JPEG_RAW: SpinLock<[u8; JPEG_CAP_W * JPEG_CAP_H]> =
+    SpinLock::new([0u8; JPEG_CAP_W * JPEG_CAP_H]);
 
 /// Pixel format.
 #[derive(Clone, Copy, PartialEq)]
@@ -208,6 +238,10 @@ pub fn csi_capture(buf: &mut [u8]) -> usize {
 ///
 /// The JPEG output is much smaller than raw (~10:1 for grayscale),
 /// making it feasible to send over UART bridge at 115200 baud.
+///
+/// Returns 0 — a normal, already-handled "no frame this time" result — if
+/// the camera is not ready, not powered, or if another caller currently
+/// holds the shared raw-frame scratch buffer.
 pub fn csi_capture_jpeg(jpeg_buf: &mut [u8]) -> usize {
     if !CSI_READY.load(Ordering::Acquire) { return 0; }
     if !CSI_POWERED.load(Ordering::Acquire) { return 0; }
@@ -215,27 +249,39 @@ pub fn csi_capture_jpeg(jpeg_buf: &mut [u8]) -> usize {
     let w = CSI_WIDTH.load(Ordering::Relaxed) as usize;
     let h = CSI_HEIGHT.load(Ordering::Relaxed) as usize;
 
-    // Capture raw frame into a temporary stack buffer
-    // For 320x240 Gray8 = 76800 bytes — too large for stack.
-    // Use a reduced resolution for JPEG capture over UART.
-    const JPEG_CAP_W: usize = 160;
-    const JPEG_CAP_H: usize = 120;
+    // The JPEG path captures at a reduced resolution: 320x240 Gray8 is
+    // 76,800 bytes, far more than the UART bridge can carry per frame.
     let cap_w = w.min(JPEG_CAP_W);
     let cap_h = h.min(JPEG_CAP_H);
 
     let raw_size = cap_w * cap_h;
     if raw_size == 0 { return 0; }
 
-    // Use a portion of the jpeg_buf as temporary raw storage
-    // (we need raw_size bytes for raw + output space for JPEG)
-    // Encode directly: grayscale → minimal JPEG
+    // Take the shared scratch buffer (see `JPEG_RAW` for why it is not a
+    // local array). `try_lock` rather than `lock`: this runs in task
+    // context with interrupts enabled, so a plain spin could deadlock the
+    // hart — the holder gets preempted by the timer ISR, the scheduler
+    // switches in another task on the same hart, that task calls in here
+    // and spins on a lock only the descheduled holder can release.
+    // `lock_irqsave` would also close that hole but at the cost of holding
+    // interrupts off for the whole encode (~300 blocks), which eats into
+    // reflex's 25 ms control period for no benefit. Camera capture is
+    // best-effort and every caller already handles a 0 return, so
+    // declining a concurrent capture is the cheap, correct answer.
+    let mut raw = match JPEG_RAW.try_lock() {
+        Some(g) => g,
+        None => return 0,
+    };
+
+    // Only bump the frame counter once we know we will actually produce a
+    // frame — otherwise a contended call would advance the synthetic
+    // pattern sequence without emitting anything.
     let frame_id = CSI_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    // Generate raw grayscale at reduced resolution
-    let mut raw = [0u8; JPEG_CAP_W * JPEG_CAP_H];
-    generate_gray8(&mut raw, cap_w, cap_h, frame_id);
+    // Generate raw grayscale at reduced resolution.
+    generate_gray8(&mut raw[..], cap_w, cap_h, frame_id);
 
-    // Encode to minimal JPEG
+    // Encode to minimal JPEG.
     encode_gray_jpeg(&raw[..raw_size], cap_w, cap_h, jpeg_buf)
 }
 

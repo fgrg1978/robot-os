@@ -1,0 +1,191 @@
+# Kconfig.platform — Board / SoC / platform selection
+#
+# RFC-0026 Phase C1.  Each BOARD_* choice locks in platform-specific
+# hardware addresses, clock frequencies, and RAM layout.
+# Per the RFC, BOARD_VF2/K1 imply ARCH_RISCV64.
+# BOARD_QEMU is ARCH-agnostic (one entry per ISA, but defaults to riscv64).
+
+menu "Platform / Board"
+
+# ---------------------------------------------------------------------------
+# Board choice
+# ---------------------------------------------------------------------------
+
+choice
+    prompt "Target board"
+    default BOARD_QEMU
+    help
+      Selects the hardware target.  Each board sets default addresses
+      for UART, interrupt controller, timer, and RAM.  Hardware-specific
+      driver enables are also implied by the board choice.
+
+    config BOARD_QEMU
+        bool "QEMU virt (riscv64/aarch64/x86_64 simulation)"
+        help
+          QEMU virtio machine.  Used for development and CI.
+          Hardware addresses match the QEMU virt device-tree defaults.
+          VirtIO block/net devices replace real hardware drivers.
+
+    config BOARD_VF2
+        bool "StarFive VisionFive 2 (JH7110, RISC-V)"
+        depends on ARCH_RISCV64
+        help
+          StarFive VisionFive 2 SBC with JH7110 SoC.
+          4-core rv64gc @ 1.5 GHz, 8 GiB LPDDR4.
+          MACB Ethernet, StarFive GPIO/PWM/I2C controllers.
+
+    config BOARD_K1
+        bool "SpacemiT K1 / BananaPi BPI-F3 (RISC-V + RVV 1.0)"
+        depends on ARCH_RISCV64
+        help
+          SpacemiT K1 SoC with 8-core rv64gcv @ 1.6 GHz + RVV V1.0 (VLEN=256).
+          Used for ML/CNN inference acceleration paths.
+
+    config BOARD_GENERIC
+        bool "Generic / custom (manually specify all addresses)"
+        help
+          For board bring-up or platforms not yet in this list.
+          Fill in UART_BASE, PLIC_BASE, TIMER_FREQ, RAM_BASE, RAM_SIZE
+          manually in the options below.
+
+endchoice
+
+# ---------------------------------------------------------------------------
+# UART base address
+# ---------------------------------------------------------------------------
+
+config UART_BASE
+    hex "UART base address"
+    default 0x10000000 if BOARD_QEMU
+    default 0x10000000 if BOARD_VF2
+    default 0x60000000 if BOARD_K1
+    default 0x10000000
+    help
+      Physical base address of the primary UART controller.
+      QEMU virt and VF2 JH7110 share 0x1000_0000 (16550-compatible).
+      K1 uses the SpacemiT vendor address.
+      This value is embedded in the kernel binary at compile time.
+
+# ---------------------------------------------------------------------------
+# Interrupt controller base
+# ---------------------------------------------------------------------------
+
+config PLIC_BASE
+    hex "PLIC base address (riscv64) or GIC dist base (aarch64)"
+    default 0x0C000000 if BOARD_QEMU
+    default 0x0C000000 if BOARD_VF2
+    default 0x10000000 if BOARD_K1
+    default 0x0C000000
+    help
+      Physical base address of the Platform-Level Interrupt Controller
+      (RISC-V PLIC) or GIC distributor (Aarch64).  Must match the
+      device-tree / board reference manual exactly.
+
+# ---------------------------------------------------------------------------
+# Timer frequency
+# ---------------------------------------------------------------------------
+
+config TIMER_FREQ
+    int "Timer frequency (Hz)"
+    default 10000000 if BOARD_QEMU
+    default 4000000  if BOARD_VF2
+    default 24000000 if BOARD_K1
+    default 10000000
+    range 1000000 200000000
+    help
+      Frequency of the hardware timer counter used by the scheduler
+      (CLINT mtime on RISC-V, generic timer on Aarch64).  This is NOT
+      the CPU clock — it is the timer increment rate.
+      QEMU virt: 10 MHz.  JH7110 (VF2): 4 MHz.  K1: 24 MHz.
+      Must match hardware to get correct tick math.
+
+# ---------------------------------------------------------------------------
+# RAM base and size
+# ---------------------------------------------------------------------------
+
+config RAM_BASE
+    hex "RAM physical base address"
+    default 0x80000000 if BOARD_QEMU
+    default 0x40000000 if BOARD_VF2
+    default 0x00000000 if BOARD_K1
+    default 0x80000000
+    help
+      Physical start address of main DRAM.  The linker script and
+      MMU identity-map setup derive their constants from this value.
+      QEMU virt and most riscv64 SBCs put DRAM at 0x8000_0000;
+      VF2 places it at 0x4000_0000.
+
+config RAM_SIZE
+    int "RAM size (MiB)"
+    default 256  if BOARD_QEMU
+    default 8192 if BOARD_VF2
+    default 4096 if BOARD_K1
+    default 256
+    range 1 65536
+    help
+      Total RAM in MiB.  Controls the kernel's memory manager initial
+      pool size.  QEMU defaults to 256 MiB (matches `make qemu`).
+
+# ---------------------------------------------------------------------------
+# Kernel load address
+# ---------------------------------------------------------------------------
+
+config KERNEL_LOAD_ADDR
+    hex "Kernel ELF load / link address"
+    default 0x80200000 if BOARD_QEMU
+    default 0x40200000 if BOARD_VF2
+    default 0x00200000 if BOARD_K1
+    default 0x80200000
+    help
+      Physical address where OpenSBI (or bootloader) places the kernel
+      image before jumping to _start.  Must match the linker script's
+      LOAD_ADDR symbol.  Changing this requires a matching linker-*.ld
+      update.
+
+# ---------------------------------------------------------------------------
+# Number of hardware CPUs / harts
+# ---------------------------------------------------------------------------
+
+config NUM_CPUS
+    int "Number of hardware CPUs / harts"
+    default 4 if BOARD_QEMU
+    default 4 if BOARD_VF2
+    default 8 if BOARD_K1
+    default 4
+    range 1 256
+    help
+      Number of physical CPU cores the kernel will manage.  Sets the
+      per-hart data-structure array sizes (interrupt stack, idle task,
+      PLIC claim registers).  Must not exceed the hardware count —
+      excess entries are never scheduled but waste static memory.
+
+# ---------------------------------------------------------------------------
+# HDMI framebuffer (VF2 only — DC8200 + Innosilicon HDMI TX)
+# ---------------------------------------------------------------------------
+# Compiled in only with `--features hdmi` (crates/display) — these values
+# are read by that code but exist regardless of whether the feature is
+# active, same relationship as the WCET (RFC-0027) threshold configs vs
+# the `wcet` Cargo feature.
+
+config HDMI_WIDTH
+    int "HDMI framebuffer width (pixels)"
+    default 640
+    range 64 3840
+    help
+      Fixed output resolution — no EDID negotiation with the monitor
+      (see crates/display). 640x480 is the safe VESA default: the most
+      universally-supported fallback timing, most likely to work
+      blind on an unknown display. Changing this requires the display
+      timing constants in crates/display/src/dc8200.rs to match a
+      real, valid mode (arbitrary width/height pairs are not
+      necessarily valid CRTC timings).
+
+config HDMI_HEIGHT
+    int "HDMI framebuffer height (pixels)"
+    default 480
+    range 64 2160
+    help
+      See HDMI_WIDTH — must be changed together with it to match a
+      real display mode, not independently.
+
+endmenu # Platform / Board

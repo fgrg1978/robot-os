@@ -2,6 +2,7 @@
 name = "robot_os_kernel"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 # Pass --features vf2 to target StarFive VisionFive 2 (JH7110).
 # Pass --features k1  to target SpacemiT K1 (BananaPi BPI-F3, RV64GCVB + RVV1.0).
@@ -11,17 +12,66 @@ edition = "2021"
 [features]
 vf2  = ["robot_os_drivers/vf2", "robot_os_ota/vf2"]
 k1   = ["robot_os_drivers/k1", "robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv", "robot_os_ota/k1"]
-rvv  = ["robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv"]
+rvv  = ["robot_os_arch/rvv", "robot_os_shell/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv", "robot_os_sched/rvv"]
 # Relaxed timing bounds for QEMU emulation (timer ISR ~100x slower than hardware).
-qemu = ["robot_os_drivers/qemu"]
+qemu = ["robot_os_drivers/qemu", "robot_os_net/qemu"]
+# RFC-0027: per-function `#[wcet(...)]` runtime telemetry. Default OFF (CI gate
+# rejected, KILL2). Opt-in on real hardware (VF2/K1) where rdcycle is reliable.
+wcet = ["robot_os_drivers/wcet"]
+# DEV01.4 — opt-in boot-time TFTP fetch smoke. Calls
+# robot_os_net::tftp_client::tftp_fetch against the default gateway
+# (10.0.2.2 = QEMU user-mode network's built-in TFTP if started with
+# `-netdev user,tftp=DIR,...`). Prints [TFTP] N bytes / [TFTP] error
+# and otherwise leaves boot unaffected.
+tftp-smoke = []
+net-smoke = []
+dhcp-smoke = []
+pi-smoke = []
 no-ml       = ["robot_os_shell/no-ml", "robot_os_behavior/no-ml"]
 no-mmu      = ["robot_os_shell/no-mmu", "robot_os_sched/no-mmu"]
 # Boot directly from a ROM/firmware without OpenSBI.
 # The kernel starts in M-mode; boot_noopensbi.S configures PMP then mrets to S-mode.
 no-opensbi  = []
-esp32c3 = ["no-mmu", "no-ml", "robot_os_drivers/esp32c3", "robot_os_shell/esp32c3", "robot_os_mm/small-mem", "robot_os_mm/esp32c3", "robot_os_arch/esp32c3", "robot_os_sched/esp32c3", "robot_os_ota/esp32c3"]
 # UEFI boot path — links in crates/efi stub + boot_efi.S.  Opt-in only.
 uefi = ["robot_os_efi"]
+# Kconfig.security SECURE_BOOT_ENFORCED. Forces the boot sequence
+# (kernel/src/main.rs, right after the active-slot CRC check) to verify
+# the Ed25519 signature of the active OTA slot and halt instead of
+# booting on any non-Verified result. See crates/ota/src/secure_boot.rs.
+# Off by default in every existing defconfig/build.sh config — dev/CI
+# builds keep today's warn-only behaviour unless this is explicitly set.
+secure-boot-enforced = ["robot_os_ota/secure-boot-enforced"]
+# Refuse to boot when /fat/LINK.KEY is missing or invalid, instead of
+# silently downgrading the brain link to plaintext. Compile-time only, by
+# design — see the gate in kernel/src/main.rs.
+link-auth-enforced = []
+# K-C5: refuse to produce or accept any brain-link frame outside an
+# established RFC-0019 AEAD session, and refuse to boot without a key (a
+# keyless encrypted-only robot can never talk — fail at provisioning time,
+# loudly, not in the field). Superset of link-auth-enforced's boot gate;
+# the per-packet gate lives in crates/behavior/src/auth_envelope.rs and
+# const-folds to nothing when this is off. Compile-time only, by design.
+link-encrypt-enforced = ["robot_os_behavior/link-encrypt-enforced"]
+# Drive the ring-3 reflex daemon through a real obstacle decision by moving
+# the simulated rangefinder under it. QEMU-only validation aid.
+reflex-smoke = ["qemu"]
+# Traza del camino rapido de IPC (diagnostico; ver crates/syscall/Cargo.toml).
+ipc-trace = ["robot_os_syscall/ipc-trace"]
+ipc-census = ["robot_os_syscall/ipc-census"]
+# VF2-only DC8200 + Innosilicon HDMI TX framebuffer driver
+# (crates/display). Opt-in, not part of the `vf2` feature bundle: fixed
+# resolution (HDMI_WIDTH/HDMI_HEIGHT in Kconfig.platform), no EDID
+# negotiation, solid-color milestone only — never validated against real
+# hardware (QEMU has no model for this peripheral at all). See
+# docs/KERNEL_REVIEW_NOTES.md, "Framebuffer/HDMI (VF2)".
+hdmi = ["robot_os_display", "robot_os_display/vf2"]
+# QEMU-only ramfb framebuffer test (crates/display/src/ramfb.rs) — a
+# generic "can this kernel drive a framebuffer" check, unrelated to the
+# real VF2 DC8200/HDMI TX driver (`hdmi` above), which QEMU can't
+# simulate at all. Opt-in, not bundled into `qemu` — needs `-device
+# ramfb -display <backend>` on the QEMU command line too (not
+# `-nographic`, which every other QEMU boot this session has used).
+ramfb = ["robot_os_display", "robot_os_display/qemu"]
 
 [[bin]]
 name = "kernel"
@@ -32,17 +82,20 @@ robot_os_common = { workspace = true }
 robot_os_arch = { workspace = true }
 robot_os_sync = { workspace = true }
 robot_os_drivers = { workspace = true }
+robot_os_abi = { workspace = true }
 robot_os_mm = { workspace = true }
 robot_os_sched = { workspace = true }
 robot_os_syscall = { workspace = true }
 robot_os_fs = { workspace = true }
 robot_os_net = { workspace = true }
+robot_os_multi_stream = { workspace = true }
 robot_os_ipc = { workspace = true }
 robot_os_service = { workspace = true }
 robot_os_robot = { workspace = true }
 robot_os_shell  = { workspace = true }
 robot_os_ml     = { workspace = true }
 robot_os_camera = { workspace = true }
+robot_os_display = { workspace = true, optional = true }
 robot_os_config = { workspace = true }
 robot_os_imu    = { workspace = true }
 robot_os_baro   = { workspace = true }
@@ -54,6 +107,17 @@ robot_os_flight    = { workspace = true }
 robot_os_telemetry = { workspace = true }
 robot_os_nav       = { workspace = true }
 robot_os_ota       = { workspace = true }
+robot_os_dfu       = { workspace = true }
+# Synthetic per-subsystem microbenches.  `cfg(feature = "qemu")`
+# triggers a one-shot `run_all` from behavior_task post-boot so the
+# bench harness scrapes [BENCH-RES] lines without needing shell input
+# (which is unreliable end-to-end under QEMU TCG SMP).
+robot_os_bench     = { path = "../crates/bench", features = ["all"] }
+# DEV03 — USB MSC gadget. Pure no_std protocol crate; kernel side
+# wiring lives in kernel/src/msc_gadget.rs.
+robot_os_msc       = { workspace = true }
 robot_os_pubsub    = { workspace = true }
 robot_os_trace     = { workspace = true }
 robot_os_efi       = { workspace = true, optional = true }
+robot_os_topology  = { workspace = true }
+robot_os_limits    = { workspace = true }

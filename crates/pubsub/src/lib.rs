@@ -10,16 +10,12 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use robot_os_sync::SpinLock;
+use robot_os_limits::MAX_TOPICS;
+use robot_os_limits::MAX_SUBS_PER_TOPIC as MAX_SUBSCRIBERS_PER_TOPIC;
 
 // ---------------------------------------------------------------------------
 // Constants — no magic numbers
 // ---------------------------------------------------------------------------
-
-/// Maximum number of topics that can exist simultaneously.
-const MAX_TOPICS: usize = 32;
-
-/// Maximum number of subscribers per topic.
-const MAX_SUBSCRIBERS_PER_TOPIC: usize = 8;
 
 /// Maximum length of a topic name in bytes (e.g. "/sensors/imu").
 const MAX_TOPIC_NAME_LEN: usize = 32;

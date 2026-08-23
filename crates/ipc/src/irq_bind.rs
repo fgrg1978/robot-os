@@ -5,6 +5,7 @@
 //! event-driven userspace driver architectures.
 
 use crate::port::{port_queue_event, PortEvent};
+use robot_os_sync::SpinLock;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -59,10 +60,19 @@ impl IrqBinding {
 // Global state
 // ---------------------------------------------------------------------------
 
-static mut IRQ_BINDINGS: [IrqBinding; MAX_IRQ_BINDINGS] = {
-    const EMPTY: IrqBinding = IrqBinding::empty();
-    [EMPTY; MAX_IRQ_BINDINGS]
-};
+/// Global IRQ binding table.
+///
+/// Protected by a single `SpinLock` (same shape as `port.rs`'s `PORTS`).
+/// `irq_dispatch()` runs from the PLIC IRQ handler while `irq_bind()` /
+/// `irq_unbind_all()` run from syscall context on any hart — was a bare
+/// `static mut` with zero synchronization, so a bind/unbind racing the
+/// PLIC handler mid-mutation could dispatch to a torn/half-written entry,
+/// and two harts binding concurrently could both claim the same free slot.
+/// Uses `lock_irqsave()` throughout for the same same-hart-deadlock reason
+/// `PORTS` does — see its doc comment.
+const EMPTY_IRQ_BINDING: IrqBinding = IrqBinding::empty();
+static IRQ_BINDINGS: SpinLock<[IrqBinding; MAX_IRQ_BINDINGS]> =
+    SpinLock::new([EMPTY_IRQ_BINDING; MAX_IRQ_BINDINGS]);
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -70,28 +80,25 @@ static mut IRQ_BINDINGS: [IrqBinding; MAX_IRQ_BINDINGS] = {
 
 /// Bind an IRQ to a target. Returns 0 on success, -1 on failure.
 pub fn irq_bind(irq: u32, owner_task: u32, target: IrqTarget) -> i32 {
-    unsafe {
-        // Check if this IRQ is already bound by this task
-        for i in 0..MAX_IRQ_BINDINGS {
-            if IRQ_BINDINGS[i].active && IRQ_BINDINGS[i].irq == irq
-                && IRQ_BINDINGS[i].owner_task == owner_task
-            {
-                // Update existing binding
-                IRQ_BINDINGS[i].target = target;
-                return 0;
-            }
+    let mut bindings = IRQ_BINDINGS.lock_irqsave();
+    // Check if this IRQ is already bound by this task
+    for i in 0..MAX_IRQ_BINDINGS {
+        if bindings[i].active && bindings[i].irq == irq && bindings[i].owner_task == owner_task {
+            // Update existing binding
+            bindings[i].target = target;
+            return 0;
         }
-        // Find free slot
-        for i in 0..MAX_IRQ_BINDINGS {
-            if !IRQ_BINDINGS[i].active {
-                IRQ_BINDINGS[i] = IrqBinding {
-                    irq,
-                    owner_task,
-                    target,
-                    active: true,
-                };
-                return 0;
-            }
+    }
+    // Find free slot
+    for i in 0..MAX_IRQ_BINDINGS {
+        if !bindings[i].active {
+            bindings[i] = IrqBinding {
+                irq,
+                owner_task,
+                target,
+                active: true,
+            };
+            return 0;
         }
     }
     -1 // No free slots
@@ -99,11 +106,10 @@ pub fn irq_bind(irq: u32, owner_task: u32, target: IrqTarget) -> i32 {
 
 /// Unbind all IRQ bindings for a task (called on task exit).
 pub fn irq_unbind_all(owner_task: u32) {
-    unsafe {
-        for i in 0..MAX_IRQ_BINDINGS {
-            if IRQ_BINDINGS[i].active && IRQ_BINDINGS[i].owner_task == owner_task {
-                IRQ_BINDINGS[i] = IrqBinding::empty();
-            }
+    let mut bindings = IRQ_BINDINGS.lock_irqsave();
+    for i in 0..MAX_IRQ_BINDINGS {
+        if bindings[i].active && bindings[i].owner_task == owner_task {
+            bindings[i] = IrqBinding::empty();
         }
     }
 }
@@ -112,26 +118,36 @@ pub fn irq_unbind_all(owner_task: u32) {
 /// Dispatches to all bindings matching this IRQ number.
 /// This is IN ADDITION to the existing wake_by_irq() call.
 pub fn irq_dispatch(irq: u32) {
-    unsafe {
+    // Collect matching targets under the lock, then dispatch after releasing
+    // it — port_queue_event() takes PORTS' own lock, and there's no reverse
+    // path (nothing under PORTS ever locks IRQ_BINDINGS), but there's no
+    // reason to hold this lock any longer than needed to read the table.
+    let mut targets = [IrqTarget::None; MAX_IRQ_BINDINGS];
+    let mut n = 0;
+    {
+        let bindings = IRQ_BINDINGS.lock_irqsave();
         for i in 0..MAX_IRQ_BINDINGS {
-            let binding = &IRQ_BINDINGS[i];
-            if !binding.active || binding.irq != irq {
-                continue;
+            let binding = &bindings[i];
+            if binding.active && binding.irq == irq {
+                targets[n] = binding.target;
+                n += 1;
             }
-            match binding.target {
-                IrqTarget::WakeTask(_tid) => {
-                    // Already handled by wake_by_irq() in the scheduler.
-                    // No additional action needed here.
-                }
-                IrqTarget::QueueToPort(port_id, user_key) => {
-                    port_queue_event(port_id, PortEvent {
-                        key: user_key,
-                        source_type: PORT_SOURCE_TYPE_IRQ,
-                        source_id: irq,
-                    });
-                }
-                IrqTarget::None => {}
+        }
+    }
+    for target in &targets[..n] {
+        match *target {
+            IrqTarget::WakeTask(_tid) => {
+                // Already handled by wake_by_irq() in the scheduler.
+                // No additional action needed here.
             }
+            IrqTarget::QueueToPort(port_id, user_key) => {
+                port_queue_event(port_id, PortEvent {
+                    key: user_key,
+                    source_type: PORT_SOURCE_TYPE_IRQ,
+                    source_id: irq,
+                });
+            }
+            IrqTarget::None => {}
         }
     }
 }

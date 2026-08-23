@@ -76,6 +76,9 @@ const FAT32_FIRST_DATA_CLUSTER: u32 = 2;
 
 const SECTOR_SIZE: usize = 512;
 
+/// FAT32 entries are 4 bytes, so a 512-byte sector holds 128 of them.
+const FAT32_ENTRIES_PER_SECTOR: u32 = (SECTOR_SIZE / 4) as u32;
+
 /// Size of one on-disk directory entry.
 const FAT32_DIR_ENTRY_SIZE: usize = 32;
 /// Number of directory entries that fit in a 512-byte sector.
@@ -221,7 +224,18 @@ fn fat32_journal_recover() -> Result<(), ()> {
         JOURNAL_PENDING => {
             // Operation was not completed — roll back.
             // If it was an alloc, free the cluster that was partially allocated.
-            if entry.op_type == JOURNAL_OP_ALLOC && entry.cluster >= 2 {
+            //
+            // `entry.cluster` came off LBA 1, which sits inside the volume the
+            // attacker can rewrite over USB mass storage, so it is untrusted
+            // input that we are about to turn into a disk write in every FAT
+            // copy — automatically, on mount. Reject anything outside the FAT's
+            // real entry range before handing it to `fat32_write_fat_entry`
+            // (which bounds it a second time; this check keeps the intent
+            // visible at the point where the untrusted value enters).
+            let fat_sz32 = { FAT32.lock().fat_sz32 };
+            let in_range = entry.cluster >= FAT32_FIRST_DATA_CLUSTER
+                && entry.cluster < chain_walk_limit(fat_sz32);
+            if entry.op_type == JOURNAL_OP_ALLOC && in_range {
                 let _ = fat32_write_fat_entry(entry.cluster, 0);
             }
             // For FREE/WRITE_DIR/UNLINK with PENDING state, the FAT/dir
@@ -272,13 +286,66 @@ impl Fat32Vol {
     }
 
     /// Convert cluster number to first sector in that cluster.
+    /// `None` when the cluster does not map into a representable sector range.
     #[allow(dead_code)]
-    fn cluster_to_sector(&self, cluster: u32) -> u32 {
-        self.data_start + (cluster - 2) * self.secs_per_clus
+    fn cluster_to_sector(&self, cluster: u32) -> Option<u32> {
+        cluster_first_sector(self.data_start, cluster, self.secs_per_clus)
     }
 }
 
 static FAT32: SpinLock<Fat32Vol> = SpinLock::new(Fat32Vol::new());
+
+/// First data sector of `cluster`, or `None` if the whole cluster does not fit
+/// in the u32 sector space.
+///
+/// Cluster values come from on-disk FAT entries / directory entries and are
+/// only bounded by `FAT32_EOC` (~268M) before use, so `(cluster - 2) * spc`
+/// (spc up to 128) overflows u32 easily on a crafted image. This used to
+/// saturate, which merely moved the abort one line down: every caller then did
+/// `read_sector(first_sector + s)` with a plain `+`, and with
+/// `overflow-checks = true` and `panic = "abort"` that addition is a board
+/// reset — a physical-safety event on a robot. Saturating also silently
+/// aliased distinct clusters onto the same sector.
+///
+/// Returning `Option` fixes the class instead of one site. **The success case
+/// guarantees `first_sector + spc` fits in u32**, so every caller may use a
+/// plain `+` for `first_sector + s` with `s < spc` and be provably
+/// overflow-free; `saturating_add` at those sites would be worse, silently
+/// reading the *wrong* sector if the invariant ever broke.
+///
+/// Clusters below `FAT32_FIRST_DATA_CLUSTER` (0 and 1 are reserved, and 0 is
+/// also the "empty file" marker) are rejected here rather than wrapping.
+#[inline]
+fn cluster_first_sector(data_start: u32, cluster: u32, spc: u32) -> Option<u32> {
+    let first = cluster
+        .checked_sub(FAT32_FIRST_DATA_CLUSTER)?
+        .checked_mul(spc)?
+        .checked_add(data_start)?;
+    // Reject unless the *entire* cluster is addressable, so the caller's
+    // `first_sector + s` loop (and `first_sector + sector_index`) cannot
+    // overflow for any s < spc.
+    first.checked_add(spc)?;
+    Some(first)
+}
+
+/// Maximum number of clusters a single chain may visit before we declare the
+/// volume corrupt.
+///
+/// FAT cluster chains are attacker-controlled: the volume is exported over USB
+/// mass storage by `msc_gadget`, so an adversary with physical access can set
+/// `FAT[2] = 2` and every naive `while cluster < EOC { cluster = next(cluster) }`
+/// walker spins forever. Because the FAT sector is held in `SECTOR_CACHE`, that
+/// spin does no I/O and never yields — it is a hard hang of whichever hart
+/// serviced a ring-3 `open()`, not a slow path.
+///
+/// A chain cannot legitimately be longer than the number of entries the FAT
+/// itself can hold (`fat_sz32` sectors × 128 entries per sector), so exceeding
+/// that bound proves a cycle or a corrupt table. Saturating keeps a hostile
+/// `fat_sz32` from wrapping the bound to something tiny.
+#[inline]
+fn chain_walk_limit(fat_sz32: u32) -> u32 {
+    fat_sz32.saturating_mul(FAT32_ENTRIES_PER_SECTOR)
+}
 
 // ── Sector cache (LRU, 8 entries × 512 B = 4 KiB) ────────────────────────────
 //
@@ -294,14 +361,27 @@ static FAT32: SpinLock<Fat32Vol> = SpinLock::new(Fat32Vol::new());
 const SECTOR_CACHE_LINES: usize = 8;
 
 struct SectorCacheLine {
-    sector: u32,             // u32::MAX = invalid
+    /// Sector number held by this line — meaningful only when `valid`.
+    sector: u32,
+    /// Set once this line actually holds data fetched from the device.
+    ///
+    /// This used to be encoded as `sector == u32::MAX`, which made LBA
+    /// 0xFFFFFFFF alias the "empty line" sentinel: `read_sector(0xFFFFFFFF)`
+    /// matched every untouched line and returned `Ok` with 512 zero bytes
+    /// without ever reaching `blkdev::read` — which *would* have rejected it
+    /// (`virtio::blk::blk_rw` refuses `sector + count > capacity`). A crafted
+    /// FAT volume could therefore drive a chain walk to the very top of the
+    /// address space, get a silent success, and hand the caller a sector
+    /// number that overflows on the next `+ s`. An explicit flag keeps every
+    /// u32 usable as a real sector and lets the device do the rejecting.
+    valid:  bool,
     data:   [u8; SECTOR_SIZE],
     last_use: u64,           // monotonic counter for LRU eviction
 }
 
 impl SectorCacheLine {
     const fn new() -> Self {
-        Self { sector: u32::MAX, data: [0u8; SECTOR_SIZE], last_use: 0 }
+        Self { sector: 0, valid: false, data: [0u8; SECTOR_SIZE], last_use: 0 }
     }
 }
 
@@ -326,13 +406,30 @@ impl SectorCache {
 
 static SECTOR_CACHE: SpinLock<SectorCache> = SpinLock::new(SectorCache::new());
 
+/// Non-blocking check for whether the FAT32 locks (`FAT32` volume state and
+/// `SECTOR_CACHE`) are both currently free.
+///
+/// Intended for callers that must never block (e.g. the panic handler),
+/// mirroring `vfs::vfs_fs_lock_available()`. Any FAT32-backed VFS
+/// operation (open/read/write/close on a `/fat/...` path) can end up
+/// acquiring both of these in addition to the VFS-level `FS` lock, so a
+/// caller that only checked `FS` can still spin here. Like its VFS
+/// counterpart, this is a racy point-in-time check, not a hold — the
+/// locks can be taken by another hart right after this returns `true`.
+pub fn fat32_locks_available() -> bool {
+    FAT32.try_lock().is_some() && SECTOR_CACHE.try_lock().is_some()
+}
+
 /// Invalidate every cache line touching `sector` — call after an
 /// out-of-band write (raw block layer, OTA writes that bypass FS).
 #[allow(dead_code)]
 pub fn fat32_cache_invalidate(sector: u32) {
     let mut c = SECTOR_CACHE.lock();
     for line in c.lines.iter_mut() {
-        if line.sector == sector { line.sector = u32::MAX; }
+        // Clear the `valid` flag rather than stamping a sentinel sector
+        // number; see `SectorCacheLine::valid` for why u32::MAX must stay a
+        // perfectly ordinary (and device-rejected) LBA.
+        if line.valid && line.sector == sector { line.valid = false; }
     }
 }
 
@@ -343,13 +440,15 @@ fn read_sector(sector: u32, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), ()> {
     {
         let mut c = SECTOR_CACHE.lock();
         for line in c.lines.iter_mut() {
-            if line.sector == sector {
+            // `valid` first: an untouched line must never satisfy a lookup,
+            // whatever sector number happens to sit in it.
+            if line.valid && line.sector == sector {
                 buf.copy_from_slice(&line.data);
                 c.counter = c.counter.saturating_add(1);
                 let stamp = c.counter;
                 // Refresh LRU stamp on the matched line.
                 for line in c.lines.iter_mut() {
-                    if line.sector == sector { line.last_use = stamp; break; }
+                    if line.valid && line.sector == sector { line.last_use = stamp; break; }
                 }
                 c.hits = c.hits.saturating_add(1);
                 return Ok(());
@@ -368,12 +467,13 @@ fn read_sector(sector: u32, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), ()> {
     let mut oldest = u64::MAX;
     let mut found_empty = false;
     for (i, line) in c.lines.iter().enumerate() {
-        if line.sector == u32::MAX { evict_idx = i; found_empty = true; break; }
+        if !line.valid { evict_idx = i; found_empty = true; break; }
         if line.last_use < oldest { oldest = line.last_use; evict_idx = i; }
     }
     let _ = found_empty;
     let line = &mut c.lines[evict_idx];
     line.sector   = sector;
+    line.valid    = true;
     line.data.copy_from_slice(buf);
     line.last_use = stamp;
     c.misses = c.misses.saturating_add(1);
@@ -402,10 +502,19 @@ pub fn fat32_mount() -> Result<(), ()> {
     if bpb.bytes_per_sec != 512 { return Err(()); }
     if bpb.fat_sz32 == 0        { return Err(()); }
 
+    let spc = bpb.sec_per_clus as u32;
+    // Reject bogus geometry: spc must be a power of two in 1..=128 (FAT spec),
+    // and the data-region start must not overflow u32 (crafted BPB → abort).
+    if spc == 0 || spc > 128 || (spc & (spc - 1)) != 0 { return Err(()); }
     let fat_start  = bpb.rsvd_sec_cnt as u32;
-    let data_start = fat_start + bpb.num_fats as u32 * bpb.fat_sz32;
+    let data_start = match (bpb.num_fats as u32)
+        .checked_mul(bpb.fat_sz32)
+        .and_then(|f| fat_start.checked_add(f))
+    {
+        Some(v) => v,
+        None => return Err(()),
+    };
     let root_clus  = bpb.root_clus;
-    let spc        = bpb.sec_per_clus as u32;
 
     let mut v = FAT32.lock();
     v.fat_start      = fat_start;
@@ -432,10 +541,27 @@ pub fn fat32_mount() -> Result<(), ()> {
 /// Read the FAT entry for `cluster` to find the next cluster in the chain.
 /// Returns Ok(next_cluster), where >= FAT32_EOC means end of chain.
 fn fat32_next_cluster(cluster: u32) -> Result<u32, ()> {
-    let fat_start = { FAT32.lock().fat_start };
-    // Each FAT32 entry is 4 bytes; 512-byte sector holds 128 entries
-    let fat_sector = fat_start + cluster / 128;
-    let fat_offset = (cluster % 128) as usize;
+    let (fat_start, fat_sz32) = {
+        let v = FAT32.lock();
+        (v.fat_start, v.fat_sz32)
+    };
+
+    // The FAT only has `fat_sz32 * 128` entries. Without this bound a cluster
+    // number harvested from a crafted directory entry (up to 0x0FFFFFFF) walks
+    // straight past the end of the table and the parser starts interpreting
+    // *file data* — or anything else on the disk — as FAT entries, which is
+    // both an information leak and a way to steer subsequent chain walks
+    // anywhere on the medium.
+    if cluster >= chain_walk_limit(fat_sz32) { return Err(()); }
+
+    // Each FAT32 entry is 4 bytes; 512-byte sector holds 128 entries.
+    // `cluster < fat_sz32 * 128` implies `cluster / 128 < fat_sz32`, and mount
+    // already proved `fat_start + num_fats * fat_sz32` fits in u32, so this
+    // add cannot overflow; checked anyway so the proof is not load-bearing.
+    let fat_sector = fat_start
+        .checked_add(cluster / FAT32_ENTRIES_PER_SECTOR)
+        .ok_or(())?;
+    let fat_offset = (cluster % FAT32_ENTRIES_PER_SECTOR) as usize;
 
     let mut buf = [0u8; SECTOR_SIZE];
     read_sector(fat_sector, &mut buf)?;
@@ -448,22 +574,35 @@ fn fat32_next_cluster(cluster: u32) -> Result<u32, ()> {
 /// Read all data from a cluster chain into `out_buf`.
 /// Returns bytes written.
 pub fn fat32_read_chain(start_cluster: u32, out_buf: &mut [u8]) -> usize {
-    let (spc, data_start) = {
+    let (spc, data_start, fat_sz32) = {
         let v = FAT32.lock();
-        (v.secs_per_clus, v.data_start)
+        (v.secs_per_clus, v.data_start, v.fat_sz32)
     };
+    // Cycle guard — see `chain_walk_limit`. A self-referential FAT entry would
+    // otherwise spin here forever whenever `out_buf` is larger than one cluster.
+    let limit = chain_walk_limit(fat_sz32);
+    let mut steps = 0u32;
 
     let mut cluster = start_cluster;
     let mut written = 0;
 
     while written < out_buf.len() {
-        if cluster < 2 || cluster >= FAT32_EOC { break; }
+        if cluster < FAT32_FIRST_DATA_CLUSTER || cluster >= FAT32_EOC { break; }
+        if steps >= limit { break; }
+        steps += 1;
 
-        let first_sector = data_start + (cluster - 2) * spc;
+        // `None` means the cluster does not map to an addressable sector range
+        // (crafted cluster number); stop rather than fabricate a sector.
+        let first_sector = match cluster_first_sector(data_start, cluster, spc) {
+            Some(v) => v,
+            None => break,
+        };
         for s in 0..spc {
             let remaining = out_buf.len() - written;
             if remaining == 0 { break; }
             let mut sec_buf = [0u8; SECTOR_SIZE];
+            // `s < spc` and `cluster_first_sector` proved `first_sector + spc`
+            // fits in u32, so this addition cannot overflow.
             if read_sector(first_sector + s, &mut sec_buf).is_err() { break; }
             let to_copy = remaining.min(SECTOR_SIZE);
             out_buf[written..written + to_copy].copy_from_slice(&sec_buf[..to_copy]);
@@ -485,16 +624,29 @@ pub fn fat32_lookup_root(name83: &[u8; 11]) -> Result<(u32, u32), ()> {
     if !FAT32.lock().mounted { return Err(()); }
     let root_cluster = FAT32.lock().root_cluster;
 
+    let (spc, data_start, fat_sz32) = {
+        let v = FAT32.lock();
+        (v.secs_per_clus, v.data_start, v.fat_sz32)
+    };
+    // Cycle guard — see `chain_walk_limit`. Reachable from ring 3 via open().
+    let limit = chain_walk_limit(fat_sz32);
+    let mut steps = 0u32;
+
     let mut cluster = root_cluster;
-    while cluster >= 2 && cluster < FAT32_EOC {
-        let (spc, data_start) = {
-            let v = FAT32.lock();
-            (v.secs_per_clus, v.data_start)
+    while cluster >= FAT32_FIRST_DATA_CLUSTER && cluster < FAT32_EOC {
+        if steps >= limit { return Err(()); }
+        steps += 1;
+
+        // `None` = crafted cluster number that does not map into the sector
+        // space; treat as "not found" rather than fabricating a sector.
+        let first_sector = match cluster_first_sector(data_start, cluster, spc) {
+            Some(v) => v,
+            None => return Err(()),
         };
-        let first_sector = data_start + (cluster - 2) * spc;
 
         for s in 0..spc {
             let mut sec_buf = [0u8; SECTOR_SIZE];
+            // s < spc, and cluster_first_sector proved first_sector + spc fits.
             read_sector(first_sector + s, &mut sec_buf).ok();
 
             // 16 directory entries per 512-byte sector
@@ -543,7 +695,7 @@ fn write_sector(sector: u32, buf: &[u8; SECTOR_SIZE]) -> Result<(), ()> {
     // straight invalidate because the next reader pays no miss cost.
     let mut c = SECTOR_CACHE.lock();
     for line in c.lines.iter_mut() {
-        if line.sector == sector {
+        if line.valid && line.sector == sector {
             line.data.copy_from_slice(buf);
             break;
         }
@@ -561,12 +713,25 @@ fn fat32_write_fat_entry(cluster: u32, value: u32) -> Result<(), ()> {
         (v.fat_start, v.fat_sz32, v.num_fats)
     };
 
-    let fat_sector_off = cluster / 128;
-    let fat_byte_off   = (cluster % 128) as usize * 4;
+    // Bound the cluster against the actual FAT size *here*, not only in the
+    // callers. This function does a read-modify-write at
+    // `fat_start + cluster/128` in EVERY FAT copy, so an unbounded `cluster`
+    // is an arbitrary 4-byte disk write. The journal at LBA 1 lives inside the
+    // attacker-writable volume and feeds a cluster number straight into this
+    // function during `fat32_journal_recover()`, i.e. automatically on the next
+    // mount, before anything else touches the disk. Clusters 0 and 1 hold the
+    // media descriptor / dirty flags and are never legitimate targets.
+    if fat_sz32 == 0 { return Err(()); }
+    if cluster < FAT32_FIRST_DATA_CLUSTER || cluster >= chain_walk_limit(fat_sz32) {
+        return Err(());
+    }
+
+    let fat_sector_off = cluster / FAT32_ENTRIES_PER_SECTOR;
+    let fat_byte_off   = (cluster % FAT32_ENTRIES_PER_SECTOR) as usize * 4;
 
     // Read sector from FAT copy 0 for modification.
     let mut buf = [0u8; SECTOR_SIZE];
-    read_sector(fat_start + fat_sector_off, &mut buf)?;
+    read_sector(fat_start.checked_add(fat_sector_off).ok_or(())?, &mut buf)?;
 
     // Preserve upper nibble of the existing entry (FAT32 spec requirement).
     let cur = u32::from_le_bytes([
@@ -578,9 +743,17 @@ fn fat32_write_fat_entry(cluster: u32, value: u32) -> Result<(), ()> {
     buf[fat_byte_off..fat_byte_off + 4].copy_from_slice(&bytes);
 
     // Write updated sector to all FAT copies.
+    // `num_fats` and `fat_sz32` are both straight out of the BPB; compute each
+    // copy's sector with checked arithmetic so a bogus geometry errors out
+    // instead of aborting the kernel on overflow.
     let copies = num_fats.max(1) as u32;
     for i in 0..copies {
-        write_sector(fat_start + i * fat_sz32 + fat_sector_off, &buf)?;
+        let sec = i
+            .checked_mul(fat_sz32)
+            .and_then(|off| fat_start.checked_add(off))
+            .and_then(|base| base.checked_add(fat_sector_off))
+            .ok_or(())?;
+        write_sector(sec, &buf)?;
     }
     Ok(())
 }
@@ -596,10 +769,20 @@ pub fn fat32_alloc_cluster() -> Result<u32, ()> {
 
     for sec_idx in 0..fat_sz32 {
         let mut buf = [0u8; SECTOR_SIZE];
-        if read_sector(fat_start + sec_idx, &mut buf).is_err() { return Err(()); }
-        for i in 0..128u32 {
-            let cluster = sec_idx * 128 + i;
-            if cluster < 2 { continue; }
+        // Checked, not saturating: saturating would silently rescan the last
+        // addressable sector and hand out a cluster number that does not
+        // correspond to the entry we actually read.
+        let sec = match fat_start.checked_add(sec_idx) { Some(v) => v, None => return Err(()) };
+        if read_sector(sec, &mut buf).is_err() { return Err(()); }
+        for i in 0..FAT32_ENTRIES_PER_SECTOR {
+            let cluster = match sec_idx
+                .checked_mul(FAT32_ENTRIES_PER_SECTOR)
+                .and_then(|c| c.checked_add(i))
+            {
+                Some(c) => c,
+                None => return Err(()),
+            };
+            if cluster < FAT32_FIRST_DATA_CLUSTER { continue; }
             let off   = (i * 4) as usize;
             let entry = u32::from_le_bytes([
                 buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
@@ -616,8 +799,19 @@ pub fn fat32_alloc_cluster() -> Result<u32, ()> {
 
 /// Free all clusters in a chain starting at `start`.
 pub fn fat32_free_chain(start: u32) {
+    let fat_sz32 = { FAT32.lock().fat_sz32 };
+    // Cycle guard — see `chain_walk_limit`. This loop looks self-terminating on
+    // a cycle (freeing FAT[2] makes the next lookup return 0), but that relies
+    // on the write succeeding: the `let _ =` swallows a device error, and
+    // `fat32_write_fat_entry` now legitimately rejects out-of-range clusters,
+    // so on either path the loop would revisit the same cluster forever.
+    let limit = chain_walk_limit(fat_sz32);
+    let mut steps = 0u32;
+
     let mut cluster = start;
-    while cluster >= 2 && cluster < FAT32_EOC {
+    while cluster >= FAT32_FIRST_DATA_CLUSTER && cluster < FAT32_EOC {
+        if steps >= limit { break; }
+        steps += 1;
         let next = fat32_next_cluster(cluster).unwrap_or(FAT32_EOC);
         let _ = fat32_write_fat_entry(cluster, 0); // Mark as free
         cluster = next;
@@ -630,7 +824,7 @@ fn fat32_write_cluster(cluster: u32, data: &[u8]) -> Result<(), ()> {
         let v = FAT32.lock();
         (v.secs_per_clus, v.data_start)
     };
-    let first_sector = data_start + (cluster - 2) * spc;
+    let first_sector = cluster_first_sector(data_start, cluster, spc).ok_or(())?;
     let mut written = 0usize;
     for s in 0..spc {
         let mut sec_buf = [0u8; SECTOR_SIZE];
@@ -639,6 +833,7 @@ fn fat32_write_cluster(cluster: u32, data: &[u8]) -> Result<(), ()> {
         if to_copy > 0 {
             sec_buf[..to_copy].copy_from_slice(&data[written..written + to_copy]);
         }
+        // s < spc, and cluster_first_sector proved first_sector + spc fits.
         write_sector(first_sector + s, &sec_buf)?;
         written += to_copy;
         if written >= data.len() { break; }
@@ -649,15 +844,25 @@ fn fat32_write_cluster(cluster: u32, data: &[u8]) -> Result<(), ()> {
 /// Write a new 32-byte directory entry into the first free slot (0x00 or 0xE5)
 /// of the root directory.
 fn fat32_creat_root_dirent(name83: &[u8; 11], cluster: u32, size: u32) -> Result<(), ()> {
-    let (root_cluster, spc, data_start) = {
+    let (root_cluster, spc, data_start, fat_sz32) = {
         let v = FAT32.lock();
-        (v.root_cluster, v.secs_per_clus, v.data_start)
+        (v.root_cluster, v.secs_per_clus, v.data_start, v.fat_sz32)
     };
+    // Cycle guard — see `chain_walk_limit`.
+    let limit = chain_walk_limit(fat_sz32);
+    let mut steps = 0u32;
+
     let mut dir_cluster = root_cluster;
-    while dir_cluster >= 2 && dir_cluster < FAT32_EOC {
-        let first_sector = data_start + (dir_cluster - 2) * spc;
+    while dir_cluster >= FAT32_FIRST_DATA_CLUSTER && dir_cluster < FAT32_EOC {
+        if steps >= limit { return Err(()); }
+        steps += 1;
+        let first_sector = match cluster_first_sector(data_start, dir_cluster, spc) {
+            Some(v) => v,
+            None => return Err(()),
+        };
         for s in 0..spc {
             let mut sec_buf = [0u8; SECTOR_SIZE];
+            // s < spc, and cluster_first_sector proved first_sector + spc fits.
             read_sector(first_sector + s, &mut sec_buf).ok();
             for e in 0..16usize {
                 let off        = e * 32;
@@ -708,15 +913,25 @@ fn fat32_creat_root_dirent(name83: &[u8; 11], cluster: u32, size: u32) -> Result
 ///   3. Write journal (COMMITTED)
 ///   4. Clear journal
 pub fn fat32_unlink_root(name83: &[u8; 11]) -> Result<(), ()> {
-    let (root_cluster, spc, data_start) = {
+    let (root_cluster, spc, data_start, fat_sz32) = {
         let v = FAT32.lock();
-        (v.root_cluster, v.secs_per_clus, v.data_start)
+        (v.root_cluster, v.secs_per_clus, v.data_start, v.fat_sz32)
     };
+    // Cycle guard — see `chain_walk_limit`.
+    let limit = chain_walk_limit(fat_sz32);
+    let mut steps = 0u32;
+
     let mut cluster = root_cluster;
-    while cluster >= 2 && cluster < FAT32_EOC {
-        let first_sector = data_start + (cluster - 2) * spc;
+    while cluster >= FAT32_FIRST_DATA_CLUSTER && cluster < FAT32_EOC {
+        if steps >= limit { return Err(()); }
+        steps += 1;
+        let first_sector = match cluster_first_sector(data_start, cluster, spc) {
+            Some(v) => v,
+            None => return Err(()),
+        };
         for s in 0..spc {
             let mut sec_buf = [0u8; SECTOR_SIZE];
+            // s < spc, and cluster_first_sector proved first_sector + spc fits.
             if read_sector(first_sector + s, &mut sec_buf).is_err() { continue; }
             for e in 0..16usize {
                 let off = e * 32;
@@ -923,16 +1138,26 @@ pub fn fat32_ls_root(mut cb: impl FnMut(&[u8], u32, bool)) {
     if !FAT32.lock().mounted { return; }
     let root_cluster = FAT32.lock().root_cluster;
 
+    let (spc, data_start, fat_sz32) = {
+        let v = FAT32.lock();
+        (v.secs_per_clus, v.data_start, v.fat_sz32)
+    };
+    // Cycle guard — see `chain_walk_limit`.
+    let limit = chain_walk_limit(fat_sz32);
+    let mut steps = 0u32;
+
     let mut cluster = root_cluster;
-    while cluster >= 2 && cluster < FAT32_EOC {
-        let (spc, data_start) = {
-            let v = FAT32.lock();
-            (v.secs_per_clus, v.data_start)
+    while cluster >= FAT32_FIRST_DATA_CLUSTER && cluster < FAT32_EOC {
+        if steps >= limit { return; }
+        steps += 1;
+        let first_sector = match cluster_first_sector(data_start, cluster, spc) {
+            Some(v) => v,
+            None => return,
         };
-        let first_sector = data_start + (cluster - 2) * spc;
 
         'outer: for s in 0..spc {
             let mut sec_buf = [0u8; SECTOR_SIZE];
+            // s < spc, and cluster_first_sector proved first_sector + spc fits.
             if read_sector(first_sector + s, &mut sec_buf).is_err() { break 'outer; }
 
             for e in 0..16 {
@@ -1053,6 +1278,15 @@ pub struct Fat32DirIter {
     sector_in_cluster: u32,
     entry_in_sector: usize,
     done: bool,
+    /// Clusters visited so far by this iterator, checked against
+    /// `chain_walk_limit` on every advance.
+    ///
+    /// This has to live in the struct, not as a local in `next()`: the loop is
+    /// re-entered on each call, so a local would reset every time and a
+    /// directory cycle whose sectors contain only deleted (0xE5) entries —
+    /// which never produce a `return` — would still spin forever inside a
+    /// single `next()`.
+    clusters_walked: u32,
 }
 
 /// Internal per-open-file state.
@@ -1180,15 +1414,24 @@ struct DirentLocation {
 /// Search a directory (given by its starting cluster) for an entry matching
 /// `name83`.
 fn dir_find_in(dir_cluster: u32, name83: &[u8; 11]) -> Result<DirentLocation, FsError> {
-    let (spc, data_start) = {
+    let (spc, data_start, fat_sz32) = {
         let v = FAT32.lock();
-        (v.secs_per_clus, v.data_start)
+        (v.secs_per_clus, v.data_start, v.fat_sz32)
     };
+    // Cycle guard — see `chain_walk_limit`. This is the walker a ring-3
+    // `open()` reaches first, so a `FAT[n] = n` cycle here hangs the hart that
+    // serviced the syscall with no I/O and no yield.
+    let limit = chain_walk_limit(fat_sz32);
+    let mut steps = 0u32;
 
     let mut cluster = dir_cluster;
     while cluster >= FAT32_FIRST_DATA_CLUSTER && cluster < FAT32_EOC {
-        let first_sector = data_start + (cluster - FAT32_FIRST_DATA_CLUSTER) * spc;
+        if steps >= limit { return Err(FsError::Io); }
+        steps += 1;
+        let first_sector = cluster_first_sector(data_start, cluster, spc)
+            .ok_or(FsError::Io)?;
         for s in 0..spc {
+            // s < spc, and cluster_first_sector proved first_sector + spc fits.
             let sec_num = first_sector + s;
             let mut buf = [0u8; SECTOR_SIZE];
             read_sector(sec_num, &mut buf).map_err(|()| FsError::Io)?;
@@ -1271,17 +1514,28 @@ fn dir_insert(
     size: u32,
     attr: u8,
 ) -> Result<(u32, u16), FsError> {
-    let (spc, data_start) = {
+    let (spc, data_start, fat_sz32) = {
         let v = FAT32.lock();
-        (v.secs_per_clus, v.data_start)
+        (v.secs_per_clus, v.data_start, v.fat_sz32)
     };
+    // Cycle guard — see `chain_walk_limit`. Here the cap MUST return an error
+    // rather than fall out of the loop: the code below the loop extends the
+    // directory by allocating a fresh cluster and splicing it in with
+    // `fat32_write_fat_entry(last_cluster, new_clus)`. Exiting the loop on a
+    // cycle would graft a real allocation onto an attacker-controlled ring.
+    let limit = chain_walk_limit(fat_sz32);
+    let mut steps = 0u32;
 
     // Walk the chain looking for a free (end or deleted) slot.
     let mut cluster = dir_cluster;
     let mut last_cluster = cluster;
     while cluster >= FAT32_FIRST_DATA_CLUSTER && cluster < FAT32_EOC {
-        let first_sector = data_start + (cluster - FAT32_FIRST_DATA_CLUSTER) * spc;
+        if steps >= limit { return Err(FsError::Io); }
+        steps += 1;
+        let first_sector = cluster_first_sector(data_start, cluster, spc)
+            .ok_or(FsError::Io)?;
         for s in 0..spc {
+            // s < spc, and cluster_first_sector proved first_sector + spc fits.
             let sec_num = first_sector + s;
             let mut buf = [0u8; SECTOR_SIZE];
             read_sector(sec_num, &mut buf).map_err(|()| FsError::Io)?;
@@ -1313,8 +1567,10 @@ fn dir_insert(
     fat32_write_fat_entry(last_cluster, new_clus).map_err(|()| FsError::Io)?;
     fat32_write_fat_entry(new_clus, FAT32_END_OF_CHAIN).map_err(|()| FsError::Io)?;
     let zero = [0u8; SECTOR_SIZE];
-    let first_sector = data_start + (new_clus - FAT32_FIRST_DATA_CLUSTER) * spc;
+    let first_sector = cluster_first_sector(data_start, new_clus, spc)
+        .ok_or(FsError::Io)?;
     for s in 0..spc {
+        // s < spc, and cluster_first_sector proved first_sector + spc fits.
         write_sector(first_sector + s, &zero).map_err(|()| FsError::Io)?;
     }
     let mut buf = [0u8; SECTOR_SIZE];
@@ -1378,6 +1634,12 @@ fn dir_update_meta(
 /// position, returns `Err(FsError::NotFound)`.
 fn chain_nth(first_cluster: u32, n: u32) -> Result<u32, FsError> {
     if first_cluster < FAT32_FIRST_DATA_CLUSTER { return Err(FsError::NotFound); }
+    // A chain longer than the FAT has entries is a cycle. `n` is already
+    // bounded by the u32 file position, so this is not a hang, but a crafted
+    // cycle would otherwise make one `fat32_read` grind through millions of
+    // FAT lookups and then hand back data from a cluster the file never owned.
+    let fat_sz32 = { FAT32.lock().fat_sz32 };
+    if n >= chain_walk_limit(fat_sz32) { return Err(FsError::Io); }
     let mut cur = first_cluster;
     for _ in 0..n {
         let next = fat32_next_cluster(cur).map_err(|()| FsError::Io)?;
@@ -1394,6 +1656,11 @@ fn chain_nth(first_cluster: u32, n: u32) -> Result<u32, FsError> {
 /// end-of-chain.  Returns the cluster number at position `n`.
 fn chain_nth_or_extend(first_cluster: u32, n: u32) -> Result<u32, FsError> {
     if first_cluster < FAT32_FIRST_DATA_CLUSTER { return Err(FsError::InvalidArg); }
+    // Same bound as `chain_nth`: no legitimate chain can be longer than the
+    // number of entries the FAT holds, and refusing early stops a crafted
+    // cycle from turning one write into millions of FAT lookups.
+    let fat_sz32 = { FAT32.lock().fat_sz32 };
+    if n >= chain_walk_limit(fat_sz32) { return Err(FsError::Io); }
     let mut cur = first_cluster;
     for _ in 0..n {
         let next = fat32_next_cluster(cur).map_err(|()| FsError::Io)?;
@@ -1516,10 +1783,14 @@ pub fn fat32_read(file: Fat32File, buf: &mut [u8]) -> Result<usize, FsError> {
     if e.flags & open_flags::READ == 0 { return Err(FsError::InvalidArg); }
     if e.pos >= e.size || buf.is_empty() { return Ok(0); }
 
-    let bytes_per_clus = FAT32.lock().bytes_per_clus;
+    // One lock for the whole geometry: `sector_index < spc` below is only
+    // provable if `bytes_per_clus == spc * 512` was read atomically. Three
+    // separate locks let a concurrent (re)mount interleave and break that.
+    let (bytes_per_clus, spc, data_start) = {
+        let v = FAT32.lock();
+        (v.bytes_per_clus, v.secs_per_clus, v.data_start)
+    };
     if bytes_per_clus == 0 { return Err(FsError::NotMounted); }
-    let spc = FAT32.lock().secs_per_clus;
-    let data_start = FAT32.lock().data_start;
 
     let max = (e.size - e.pos) as usize;
     let mut remaining = buf.len().min(max);
@@ -1529,8 +1800,12 @@ pub fn fat32_read(file: Fat32File, buf: &mut [u8]) -> Result<usize, FsError> {
         let cluster_index = e.pos / bytes_per_clus;
         let offset_in_cluster = (e.pos % bytes_per_clus) as usize;
         let cluster = chain_nth(e.first_cluster, cluster_index)?;
-        let first_sector = data_start + (cluster - FAT32_FIRST_DATA_CLUSTER) * spc;
+        let first_sector = cluster_first_sector(data_start, cluster, spc)
+            .ok_or(FsError::Io)?;
 
+        // offset_in_cluster < bytes_per_clus == spc * 512, so
+        // sector_index < spc, and cluster_first_sector proved
+        // first_sector + spc fits in u32 — this add cannot overflow.
         let sector_index = (offset_in_cluster / SECTOR_SIZE) as u32;
         let offset_in_sector = offset_in_cluster % SECTOR_SIZE;
         let sec_num = first_sector + sector_index;
@@ -1567,10 +1842,13 @@ pub fn fat32_write(file: Fat32File, buf: &[u8]) -> Result<usize, FsError> {
     // APPEND: jump to current size before every write.
     if e.flags & open_flags::APPEND != 0 { e.pos = e.size; }
 
-    let bytes_per_clus = FAT32.lock().bytes_per_clus;
+    // One lock for the whole geometry — see the matching comment in
+    // `fat32_read`; `sector_index < spc` depends on a consistent snapshot.
+    let (bytes_per_clus, spc, data_start) = {
+        let v = FAT32.lock();
+        (v.bytes_per_clus, v.secs_per_clus, v.data_start)
+    };
     if bytes_per_clus == 0 { return Err(FsError::NotMounted); }
-    let spc = FAT32.lock().secs_per_clus;
-    let data_start = FAT32.lock().data_start;
 
     // Ensure we have at least one cluster allocated (for empty files).
     if e.first_cluster < FAT32_FIRST_DATA_CLUSTER {
@@ -1585,8 +1863,11 @@ pub fn fat32_write(file: Fat32File, buf: &[u8]) -> Result<usize, FsError> {
         let cluster_index = e.pos / bytes_per_clus;
         let offset_in_cluster = (e.pos % bytes_per_clus) as usize;
         let cluster = chain_nth_or_extend(e.first_cluster, cluster_index)?;
-        let first_sector = data_start + (cluster - FAT32_FIRST_DATA_CLUSTER) * spc;
+        let first_sector = cluster_first_sector(data_start, cluster, spc)
+            .ok_or(FsError::Io)?;
 
+        // sector_index < spc (offset_in_cluster < spc * 512) and
+        // cluster_first_sector proved first_sector + spc fits in u32.
         let sector_index = (offset_in_cluster / SECTOR_SIZE) as u32;
         let offset_in_sector = offset_in_cluster % SECTOR_SIZE;
         let sec_num = first_sector + sector_index;
@@ -1706,6 +1987,7 @@ pub fn fat32_opendir(_vol: Volume, path: &[u8]) -> Result<Fat32DirIter, FsError>
         sector_in_cluster: 0,
         entry_in_sector: 0,
         done: false,
+        clusters_walked: 0,
     })
 }
 
@@ -1713,17 +1995,31 @@ impl Fat32DirIter {
     /// Return the next valid directory entry, or `None` at end.
     pub fn next(&mut self) -> Option<DirEntryInfo> {
         if self.done { return None; }
-        let (spc, data_start) = {
+        let (spc, data_start, fat_sz32) = {
             let v = FAT32.lock();
-            (v.secs_per_clus, v.data_start)
+            (v.secs_per_clus, v.data_start, v.fat_sz32)
         };
+        let limit = chain_walk_limit(fat_sz32);
         loop {
             if self.cluster < FAT32_FIRST_DATA_CLUSTER || self.cluster >= FAT32_EOC {
                 self.done = true;
                 return None;
             }
-            let first_sector = data_start + (self.cluster - FAT32_FIRST_DATA_CLUSTER) * spc;
+            // Cycle guard — see `chain_walk_limit` and `clusters_walked`.
+            // Counted at the advance below, so re-entering `next()` on the
+            // same cluster does not consume budget.
+            if self.clusters_walked >= limit {
+                self.done = true;
+                return None;
+            }
+            // `None` = crafted cluster that does not map into the sector space.
+            let first_sector = match cluster_first_sector(data_start, self.cluster, spc) {
+                Some(v) => v,
+                None => { self.done = true; return None; }
+            };
             while self.sector_in_cluster < spc {
+                // sector_in_cluster < spc, and cluster_first_sector proved
+                // first_sector + spc fits in u32.
                 let sec_num = first_sector + self.sector_in_cluster;
                 let mut buf = [0u8; SECTOR_SIZE];
                 if read_sector(sec_num, &mut buf).is_err() {
@@ -1772,6 +2068,7 @@ impl Fat32DirIter {
                 self.sector_in_cluster += 1;
             }
             self.sector_in_cluster = 0;
+            self.clusters_walked = self.clusters_walked.saturating_add(1);
             self.cluster = match fat32_next_cluster(self.cluster) {
                 Ok(n) => n,
                 Err(()) => { self.done = true; return None; }
@@ -1796,7 +2093,8 @@ pub fn fat32_mkdir(_vol: Volume, path: &[u8]) -> Result<(), FsError> {
         let v = FAT32.lock();
         (v.secs_per_clus, v.data_start)
     };
-    let first_sector = data_start + (new_clus - FAT32_FIRST_DATA_CLUSTER) * spc;
+    let first_sector = cluster_first_sector(data_start, new_clus, spc)
+        .ok_or(FsError::Io)?;
     let mut buf = [0u8; SECTOR_SIZE];
     // '.' entry -> new_clus itself.
     let mut dot_name = [b' '; 11];
@@ -1821,6 +2119,7 @@ pub fn fat32_mkdir(_vol: Volume, path: &[u8]) -> Result<(), FsError> {
     // Zero remaining sectors in the cluster so iteration terminates.
     let zero = [0u8; SECTOR_SIZE];
     for s in 1..spc {
+        // s < spc, and cluster_first_sector proved first_sector + spc fits.
         write_sector(first_sector + s, &zero).map_err(|()| FsError::Io)?;
     }
 

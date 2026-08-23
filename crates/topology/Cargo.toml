@@ -1,0 +1,20 @@
+[package]
+name = "robot_os_topology"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "PHANES static topology — RFC-0005. Parses signed CAPS.TOML + SCHED.TOML into a fixed-pool, alloc-free representation."
+
+[lib]
+name = "robot_os_topology"
+
+[dependencies]
+robot_os_abi = { workspace = true }
+robot_os_crypto = { workspace = true }
+robot_os_limits = { workspace = true }
+
+[features]
+default = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }

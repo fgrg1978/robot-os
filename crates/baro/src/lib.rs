@@ -19,6 +19,15 @@ const REG_CTRL_MEAS:  u8 = 0xF4;
 const REG_CONFIG:     u8 = 0xF5;
 const REG_PRESS_MSB:  u8 = 0xF7; // 6 bytes: pressure(3) + temperature(3)
 const REG_CALIB_00:   u8 = 0x88; // 26 bytes of calibration data
+const REG_STATUS:     u8 = 0xF3; // bit 3 = "measuring", bit 0 = "im_update"
+
+/// Bounded upper bound on STATUS-register polls while waiting for a
+/// forced-mode conversion to finish (worst case ~40ms at osrs_t=x2 +
+/// osrs_p=x16). This is a generous ceiling, not a timed guarantee — if
+/// the sensor never clears the "measuring" bit (disconnected, wedged),
+/// we give up and let the caller's existing bad-sample handling deal
+/// with the stale/garbage read that follows.
+const BARO_MEASURING_POLL_MAX_ITERS: u32 = 1000;
 
 /// Barometer reading with calibrated values.
 #[derive(Clone, Copy)]
@@ -100,8 +109,14 @@ pub fn baro_init(bus: u8, addr: u8) -> bool {
 
     // Configure: osrs_t=x2 (010), osrs_p=x16 (101), mode=forced (01)
     // ctrl_meas = 0b010_101_01 = 0x55 (forced mode, triggers one measurement)
-    i2c::i2c_write(bus, addr, &[REG_CONFIG, 0x00]);   // no filter, no standby
-    i2c::i2c_write(bus, addr, &[REG_CTRL_MEAS, 0x55]);
+    if i2c::i2c_write(bus, addr, &[REG_CONFIG, 0x00]) < 0 {   // no filter, no standby
+        robot_os_drivers::kprintln!("[BARO] Failed to write CONFIG register");
+        return false;
+    }
+    if i2c::i2c_write(bus, addr, &[REG_CTRL_MEAS, 0x55]) < 0 {
+        robot_os_drivers::kprintln!("[BARO] Failed to write CTRL_MEAS register");
+        return false;
+    }
 
     BARO_BUS.store(bus, Ordering::Relaxed);
     BARO_ADDR.store(addr, Ordering::Relaxed);
@@ -125,6 +140,17 @@ pub fn baro_read() -> Option<BaroData> {
     // Trigger a forced-mode measurement
     i2c::i2c_write(bus, addr, &[REG_CTRL_MEAS, 0x55]);
 
+    // Wait for the conversion to finish (STATUS bit 3 = "measuring").
+    // Bounded poll — if the sensor never clears the bit (disconnected,
+    // wedged), give up rather than spinning forever; the stale/garbage
+    // read that follows is caught by the caller same as any other bad
+    // sample.
+    let mut status = [0u8; 1];
+    for _ in 0..BARO_MEASURING_POLL_MAX_ITERS {
+        if i2c::i2c_read(bus, addr, REG_STATUS, &mut status) < 1 { break; }
+        if status[0] & 0x08 == 0 { break; } // bit 3 clear = conversion done
+    }
+
     // Read 6 bytes: pressure MSB/LSB/XLSB + temperature MSB/LSB/XLSB
     let mut raw = [0u8; 6];
     if i2c::i2c_read(bus, addr, REG_PRESS_MSB, &mut raw) < 6 {
@@ -136,11 +162,13 @@ pub fn baro_read() -> Option<BaroData> {
 
     let cal = *BARO_CALIB.lock();
 
-    // Temperature compensation (BMP280 datasheet Section 4.2.3)
-    let var1 = ((((adc_t >> 3) - ((cal.dig_t1 as i32) << 1))) * (cal.dig_t2 as i32)) >> 11;
-    let var2 = (((((adc_t >> 4) - (cal.dig_t1 as i32)) *
-                  ((adc_t >> 4) - (cal.dig_t1 as i32))) >> 12) *
-                (cal.dig_t3 as i32)) >> 14;
+    // Temperature compensation (BMP280 datasheet Section 4.2.3).
+    // Computed in i64: with a marginal/corrupt calibration block the i32
+    // products (diff*dig_t2, diff*diff) can overflow and abort the kernel.
+    let var1 = ((((adc_t >> 3) as i64 - ((cal.dig_t1 as i64) << 1))
+                 * (cal.dig_t2 as i64)) >> 11) as i32;
+    let dt = (adc_t >> 4) as i64 - (cal.dig_t1 as i64);
+    let var2 = ((((dt * dt) >> 12) * (cal.dig_t3 as i64)) >> 14) as i32;
     let t_fine = var1 + var2;
     let temp_cdeg = ((t_fine * 5 + 128) >> 8) as i32; // in 0.01 C
 
@@ -160,7 +188,11 @@ pub fn baro_read() -> Option<BaroData> {
         p = (((p << 31) - var2_p) * 3125) / var1_p;
         let v1 = ((cal.dig_p9 as i64) * (p >> 13) * (p >> 13)) >> 25;
         let v2 = ((cal.dig_p8 as i64) * p) >> 19;
-        ((p + v1 + v2) >> 8) as u32 / 256 // Pa with Q24.8 → integer Pa
+        let p_with_p7 = ((p + v1 + v2) >> 8) + ((cal.dig_p7 as i64) << 4);
+        // Clamp before the u32 cast: a negative compensated pressure would
+        // wrap to a ~16.7 MPa reading and publish a grotesque altitude.
+        let p_clamped = if p_with_p7 < 0 { 0 } else { p_with_p7 };
+        (p_clamped as u32) / 256 // Pa with Q24.8 → integer Pa
     };
 
     Some(BaroData { pressure_pa, temp_cdeg })

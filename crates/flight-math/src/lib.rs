@@ -1,0 +1,18 @@
+//! Pure no_std drone math, shared by the kernel `flight` crate and host tests.
+//!
+//! This crate has **zero kernel dependencies** so it builds both for the
+//! workspace's `riscv64imac-unknown-none-elf` target (as part of the kernel)
+//! and for the developer host (where `flight-math-tests` runs its `cargo test`
+//! suite). Keeping the math here — rather than inside `crates/flight`, which
+//! pulls in `robot_os_drivers` and is therefore not host-buildable — is what
+//! makes it unit-testable.
+//!
+//! Modules:
+//! - [`trig`]: integer sine/cosine lookup tables (centi-degrees, ×1000 scale).
+//! - [`wind`]: acceleration-residual wind/disturbance estimator (D04).
+
+#![no_std]
+
+pub mod position;
+pub mod trig;
+pub mod wind;

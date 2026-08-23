@@ -3,6 +3,19 @@ resolver = "2"
 exclude = [
     "userspace/brain_client",
     "userspace/reflex",
+    # uhello — minimal Rust user-space ELF (E11.AQ3 phase-1 de-risk).
+    "userspace/uhello",
+    # gpio_drv — userspace GPIO driver process (E11.AQ3).
+    "userspace/gpio_drv",
+    # captest — ring-3 capability + syscall ABI test. Asserts both halves:
+    # a granted resource works, an ungranted one is still denied.
+    "userspace/captest",
+    # latbench — ring-3 syscall latency microbenchmark.
+    "userspace/latbench",
+    "userspace/abitest",
+    # ipctest — ring-3 IPC probe: fast-path round trip, server impersonation,
+    # and the shm/port/io_ring ownership gates.
+    "userspace/ipctest",
     # flight-sim is a host-side (std) test crate — run separately:
     #   cargo test --target aarch64-apple-darwin -p robot_os_flight_sim
     # It cannot be a workspace member because the workspace target is riscv64-none-elf.
@@ -10,12 +23,113 @@ exclude = [
     # ota-tests is a host-side test crate for the pure OTA logic (OT01).
     # Run with:  cd crates/ota-tests && cargo test
     "crates/ota-tests",
+    "crates/dfu-tests",
+    # msc-tests — host-side tests for USB MSC (DEV03). Same pattern.
+    # Run with:  cd crates/msc-tests && cargo test
+    "crates/msc-tests",
+    # crypto-tests — host-side NIST/RFC vectors for SHA-256, AES-128,
+    # X25519. Pins current HMAC-stub sig_verify behaviour until task
+    # #212 replaces it with real Ed25519.
+    # Run with:  cd crates/crypto-tests && cargo test
+    "crates/crypto-tests",
+    # dtb-tests — host-side tests for the Flattened Device Tree parser.
+    # Run with:  cd crates/dtb-tests && cargo test
+    "crates/dtb-tests",
+    # gguf-tests — host-side tests for the GGUF model-file parser.
+    # Run with:  cd crates/gguf-tests && cargo test
+    "crates/gguf-tests",
+    # config-tests — host-side tests for INI parser + runtime atomics.
+    # Run with:  cd crates/config-tests && cargo test
+    "crates/config-tests",
+    # efi-tests — host-side tests for BootInfo + EfiMemoryIter + PE/COFF.
+    # Run with:  cd crates/efi-tests && cargo test
+    "crates/efi-tests",
+    # arch-api-tests — host-side tests for the cross-ISA trait surface
+    # + PagePerms constants + arch_name strings. Includes a Stub impl
+    # that proves the traits are dyn-compatible and self-consistent.
+    # Run with:  cd crates/arch-api-tests && cargo test
+    "crates/arch-api-tests",
     # regression-tests pins specific bug fixes so future refactors can't
     # silently reintroduce them. Run with:  /bin/zsh scripts/test_regression.sh
     "crates/regression-tests",
+    # topology-tests is a host-side test crate for the W2 topology parser.
+    # Run with:  cd crates/topology-tests && cargo test
+    "crates/topology-tests",
+    # abi-tests is a host-side test crate for the W1 ABI freeze.
+    # Run with:  cd crates/abi-tests && cargo +stable test
+    "crates/abi-tests",
+    # cap-tests pulls crates/ipc/src/cap.rs into a host crate so the
+    # embedded #[cfg(test)] suite runs on the developer host.
+    # Run with:  cd crates/cap-tests && cargo +stable test
+    "crates/cap-tests",
+    # sched-policy-tests pulls W4 scheduler sources via #[path] so the
+    # policy + APS suites run on the developer host.
+    # Run with:  cd crates/sched-policy-tests && cargo +stable test
+    "crates/sched-policy-tests",
+    # drivers-api-tests exercises the host-compatible
+    # `robot_os_drivers_api` crate.
+    # Run with:  cd crates/drivers-api-tests && cargo +stable test \
+    #              --target aarch64-apple-darwin
+    "crates/drivers-api-tests",
+    # B1.boot — standalone aarch64 boot binary. Excluded because
+    # its own .cargo/config.toml pins it to
+    # aarch64-unknown-none-softfloat which the workspace target
+    # (riscv64gc-unknown-none-elf) cannot build for.
+    # Run with:  make qemu-aarch64-hello
+    # B2.boot — standalone x86_64 boot binary (Multiboot1).
+    # Targets x86_64-unknown-none via its own .cargo/config.toml.
+    # Run with:  make qemu-x86_64-hello
+    # tftp-tests exercises the host-compatible `robot_os_tftp` crate.
+    # Run with:  cd crates/tftp-tests && cargo +stable test \
+    #              --target aarch64-apple-darwin
+    "crates/tftp-tests",
+    # flight-math-tests — host-side tests for the pure drone math (D04 trig +
+    # wind estimator). Run with:  cd crates/flight-math-tests && cargo test
+    "crates/flight-math-tests",
+    # auth-envelope-bench — host-side benchmark for the HMAC-SHA-256 envelope
+    # (crates/behavior/src/auth_envelope.rs wire format). Re-implements the
+    # pure math locally; depends only on robot_os_crypto (host-buildable).
+    # Run with:  cd crates/auth-envelope-bench && cargo +stable test --release -- --nocapture
+    "crates/auth-envelope-bench",
+    # aead-link-tests — host-side cross-side compat pin for RFC-0019 AEAD
+    # link. Verifies that frames produced by robot-brain/secure_channel.py
+    # decrypt correctly with crates/crypto::secure_channel.
+    # Run with:  cd crates/aead-link-tests && cargo +stable test --release
+    "crates/aead-link-tests",
+    # encrypt-link-tests — host-side cross-side compat pin for the
+    # RFC-0019 handshake state machine in `crates/encrypt-link`.
+    # Verifies byte-for-byte agreement with robot-brain/secure_channel.py
+    # using deterministic ephemeral keys.
+    # Run with:  cd crates/encrypt-link-tests && cargo +stable test --release
+    "crates/encrypt-link-tests",
+    # cam-ring-tests — host-side SPSC frame ring tests (S1/S6 multi-stream).
+    # Run with:  cd crates/cam-ring-tests && cargo +stable test
+    "crates/cam-ring-tests",
+    # multi-stream-tests — host-side RFC-0021 wire format tests.
+    # Run with:  cd crates/multi-stream-tests && cargo +stable test
+    "crates/multi-stream-tests",
+    # phanes-config — build-time Kconfig reader + Rust const emitter (RFC-0026 C1).
+    # Host-only (std); excluded from riscv64-none-elf workspace compilation.
+    # Run with:  cd crates/phanes-config && cargo test
+    "crates/phanes-config",
+    # wcet-macro — RFC-0027 proc-macro for #[wcet(N_us)] WCET budget annotations.
+    # Host-only (proc-macro); excluded from riscv64-none-elf workspace compilation.
+    # Run with:  cd crates/wcet-macro && cargo test
+    "crates/wcet-macro",
+    # ── Suites de host del subsistema IPC (auditoría 2026-08-22) ──
+    # Mismo patrón que cap-tests: el crate `robot_os_ipc` entero no compila
+    # para el host (arrastra dependencias sólo-RV64), así que cada suite tira
+    # del módulo que le toca con `#[path]` y ejecuta su `#[cfg(test)] mod tests`.
+    # Run with:  cd crates/<suite> && cargo test
+    "crates/ipc-fast-tests",
+    "crates/ipc-lease-tests",
+    "crates/ipc-chan-tests",
+    "crates/sched-wake-tests",
 ]
 members = [
     "kernel",
+    "crates/abi",
+    "crates/topology",
     "crates/common",
     "crates/arch",
     "crates/sync",
@@ -29,8 +143,10 @@ members = [
     "crates/service",
     "crates/robot",
     "crates/shell",
+    "crates/bench",
     "crates/ml",
     "crates/camera",
+    "crates/display",
     "crates/config",
     "crates/imu",
     "crates/baro",
@@ -40,6 +156,8 @@ members = [
     "crates/ahrs",
     "crates/gps",
     "crates/flight",
+    # Pure no_std drone math (D04 trig + wind), host-tested via flight-math-tests.
+    "crates/flight-math",
     "crates/telemetry",
     "crates/nav",
     "crates/libsys",
@@ -49,6 +167,39 @@ members = [
     "crates/trace",
     "crates/efi",
     "crates/driver_server",
+    # Driver framework API surface (host-testable, no riscv deps).
+    "crates/drivers-api",
+    # RFC 1350 TFTP client (DEV01 fast-iteration netboot prep).
+    "crates/tftp",
+    # DFU 1.1 protocol state machine + USB descriptors (DEV02 recovery mode).
+    "crates/dfu",
+    # USB MSC gadget — Bulk-Only Transport + minimal SCSI (DEV03 debug mount).
+    "crates/msc",
+    # RFC-0019 forward-secret link handshake state machine + AEAD wrapper.
+    # Pure no_std, host-buildable. Cross-tested in crates/encrypt-link-tests.
+    "crates/encrypt-link",
+    # Cross-ISA arch trait surface (B0 — Phase 2 prep for aarch64/x86_64).
+    "crates/arch-api",
+    # B1 — aarch64 ISA impl. Real code is cfg(target_arch="aarch64");
+    # on the workspace's riscv64 target this builds as essentially empty.
+    # B2 — x86_64 ISA impl. Same shape as B1 for the third ISA.
+    # Item 2 Stage 1/2 — riscv64 ISA impl moved out of crates/arch;
+    # crates/arch is now a per-target_arch facade re-exporting one of
+    # arch-riscv64 (aarch64 y x86_64 aparcadas en newfeatures/, 2026-08-20).
+    "crates/arch-riscv64",
+    # S1/S6 — lock-free SPSC camera frame ring for zero-copy pipelines.
+    # Pure no_std; host-tested via crates/cam-ring-tests.
+    "crates/cam-ring",
+    # RFC-0021 — stream-ID-prefixed wire multiplexer for the brain↔kernel link.
+    # Pure no_std; host-tested via crates/multi-stream-tests.
+    "crates/multi-stream",
+    # RFC-0026 Phase C2 — generated compile-time constants from .config.
+    # no_std; build.rs reads .config via phanes-config and emits generated.rs.
+    "crates/limits",
+    # RFC-0037 degrade taxonomy + speed-ceiling mapping. Dep-free leaf crate;
+    # owned here so both ipc (TCB) and behavior (safety domain) can depend on it
+    # without putting motor policy in the TCB.
+    "crates/degrade-policy",
 ]
 
 [workspace.dependencies]
@@ -58,6 +209,7 @@ static_assertions = "1.1"
 linked_list_allocator = { version = "0.10", default-features = false }
 
 # Internal crates
+robot_os_abi = { path = "crates/abi" }
 robot_os_common = { path = "crates/common" }
 robot_os_arch = { path = "crates/arch" }
 robot_os_sync = { path = "crates/sync" }
@@ -73,6 +225,7 @@ robot_os_robot = { path = "crates/robot" }
 robot_os_shell  = { path = "crates/shell" }
 robot_os_ml     = { path = "crates/ml" }
 robot_os_camera = { path = "crates/camera" }
+robot_os_display = { path = "crates/display" }
 robot_os_config = { path = "crates/config" }
 robot_os_imu    = { path = "crates/imu" }
 robot_os_baro   = { path = "crates/baro" }
@@ -82,19 +235,39 @@ robot_os_channel  = { path = "crates/channel" }
 robot_os_ahrs     = { path = "crates/ahrs" }
 robot_os_gps       = { path = "crates/gps" }
 robot_os_flight    = { path = "crates/flight" }
+robot_os_flight_math = { path = "crates/flight-math" }
 robot_os_telemetry = { path = "crates/telemetry" }
 robot_os_nav       = { path = "crates/nav" }
 robot_os_libsys    = { path = "crates/libsys" }
 robot_os_ota       = { path = "crates/ota" }
+robot_os_dfu       = { path = "crates/dfu" }
+robot_os_msc       = { path = "crates/msc" }
+robot_os_encrypt_link = { path = "crates/encrypt-link" }
 robot_os_pubsub    = { path = "crates/pubsub" }
 robot_os_trace     = { path = "crates/trace" }
 robot_os_efi       = { path = "crates/efi" }
 robot_os_driver_server = { path = "crates/driver_server" }
+robot_os_crypto    = { path = "crates/crypto" }
+robot_os_topology  = { path = "crates/topology" }
+robot_os_drivers_api = { path = "crates/drivers-api" }
+robot_os_tftp        = { path = "crates/tftp" }
+robot_os_arch_api    = { path = "crates/arch-api" }
+robot_os_arch_riscv64 = { path = "crates/arch-riscv64" }
+robot_os_cam_ring      = { path = "crates/cam-ring" }
+robot_os_multi_stream  = { path = "crates/multi-stream" }
+robot_os_limits        = { path = "crates/limits" }
+robot_os_degrade_policy = { path = "crates/degrade-policy" }
 
 [profile.release]
 opt-level = 2
 debug = true       # Keep debug info for GDB
-lto = false        # LTO breaks global_asm sometimes
+# LTO breaks global_asm sometimes. ALSO load-bearing for correctness:
+# `cap_store::resolve_only_untrusted` (crates/ipc/src/cap_store.rs) relies on
+# its two `idx_for_tid` scans surviving as two distinct scans — verified on
+# the release artifact under lto = false. Enabling LTO could let the compiler
+# CSE the confirmation pass into nothing; re-audit that function before
+# flipping this.
+lto = false
 panic = "abort"
 overflow-checks = true   # Detect integer overflow at runtime (safety > speed)
 

@@ -2,12 +2,12 @@
 name = "robot_os_shell"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [features]
 rvv     = ["robot_os_arch/rvv", "robot_os_ml/rvv", "robot_os_camera/rvv"]
 no-ml   = ["robot_os_behavior/no-ml"]
 no-mmu  = []
-esp32c3 = ["no-mmu", "no-ml"]
 
 [dependencies]
 robot_os_fs = { workspace = true }
@@ -30,3 +30,8 @@ robot_os_flight    = { workspace = true }
 robot_os_telemetry = { workspace = true }
 robot_os_nav       = { workspace = true }
 robot_os_ota       = { workspace = true }
+# Synthetic per-subsystem microbenches (exposed via `bench` shell cmd).
+# `all` enables every subsystem; if a subsystem isn't ready its module
+# is a stub that emits a `<name>.placeholder` line so the wiring is
+# visible end-to-end and gaps are obvious.
+robot_os_bench     = { path = "../bench", features = ["all"] }

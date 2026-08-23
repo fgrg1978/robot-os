@@ -25,6 +25,40 @@ HELLO_DIR     := userspace/hello
 HELLO_ELF     := build/hello.elf
 SYSTEST_DIR   := userspace/syscall_test
 SYSTEST_ELF   := build/syscall_test.elf
+# E11.AQ3 — ring-3 GPIO driver (Rust no_std ELF, built standalone).
+GPIO_DRV_DIR  := userspace/gpio_drv
+GPIO_DRV_BUILT:= $(GPIO_DRV_DIR)/target/riscv64imac-unknown-none-elf/release/gpio_drv
+GPIO_DRV_ELF  := build/gpio_drv.elf
+# Three more standalone Rust ring-3 ELFs. They compiled and were never once
+# executed: nothing built them (they are absent from the `userspace:` target
+# below), so nothing copied them to a disk image and nothing could exec them.
+# Same shape of hole SYSTEST.ELF sat in for months.
+UHELLO_DIR    := userspace/uhello
+UHELLO_BUILT  := $(UHELLO_DIR)/target/riscv64imac-unknown-none-elf/release/uhello
+UHELLO_ELF    := build/uhello.elf
+REFLEX_DIR    := userspace/reflex
+REFLEX_BUILT  := $(REFLEX_DIR)/target/riscv64imac-unknown-none-elf/release/reflex
+REFLEX_ELF    := build/reflex.elf
+BRAINCLI_DIR  := userspace/brain_client
+BRAINCLI_BUILT:= $(BRAINCLI_DIR)/target/riscv64imac-unknown-none-elf/release/brain_client
+BRAINCLI_ELF  := build/brain_client.elf
+# captest — ring-3 capability test (positive AND negative halves).
+CAPTEST_DIR   := userspace/captest
+CAPTEST_BUILT := $(CAPTEST_DIR)/target/riscv64imac-unknown-none-elf/release/captest
+CAPTEST_ELF   := build/captest.elf
+# latbench — ring-3 syscall latency microbenchmark.
+LATBENCH_DIR  := userspace/latbench
+LATBENCH_BUILT:= $(LATBENCH_DIR)/target/riscv64imac-unknown-none-elf/release/latbench
+LATBENCH_ELF  := build/latbench.elf
+# abitest — conformidad del ABI de syscalls desde ring 3.
+ABITEST_DIR   := userspace/abitest
+ABITEST_BUILT := $(ABITEST_DIR)/target/riscv64imac-unknown-none-elf/release/abitest
+ABITEST_ELF   := build/abitest.elf
+# ipctest — sonda de IPC desde ring 3: ida y vuelta del camino rapido,
+# suplantacion de servidor, y las puertas de propiedad de shm/port/io_ring.
+IPCTEST_DIR   := userspace/ipctest
+IPCTEST_BUILT := $(IPCTEST_DIR)/target/riscv64imac-unknown-none-elf/release/ipctest
+IPCTEST_ELF   := build/ipctest.elf
 
 # VisionFive 2 configuration (Phase 10)
 # Override these from the command line as needed:
@@ -59,13 +93,15 @@ K1_BIN      := build/kernel-k1.bin
 # K1 uses VLEN=256 natively (not QEMU emulated).
 QEMU_RVV_CPU := rv64,v=true,vlen=128,vext_spec=v1.0
 
-# ESP32-C3 configuration (Phase G2)
-ESP32C3_LINKER   := kernel/linker-esp32c3.ld
-ESP32C3_RUSTFLAGS := -C link-arg=-T$(ESP32C3_LINKER)
+# Fleet profile (RFC-0026): gateway boards with ≥ 1 GiB RAM.
+# Static tables + 256 MiB heap don't fit the default 8 MiB linker.
+# linker-fleet.ld carves a 1022 MiB RAM region above OpenSBI.
+FLEET_LINKER   := kernel/linker-fleet.ld
+FLEET_RUSTFLAGS := -C link-arg=-T$(FLEET_LINKER)
 
-.PHONY: all build build-rvv clean qemu qemu-smp qemu-full-smp \
-        qemu-rvv qemu-full-smp-rvv userspace syscall-test make-mlp make-gguf \
-        vf2 flash-vf2 k1 flash-k1 k1-console esp32c3 ci
+.PHONY: all build build-rvv build-fleet clean qemu qemu-smp qemu-full-smp qemu-net-pair \
+        qemu-rvv qemu-full-smp-rvv qemu-systest qemu-dhcp-smoke qemu-pi-smoke userspace syscall-test make-mlp make-gguf \
+        vf2 flash-vf2 k1 flash-k1 k1-console ci
 
 all: build
 
@@ -76,8 +112,82 @@ build:
 build-rvv:
 	$(CARGO) build $(CARGO_FLAGS) --features rvv,qemu
 
-# Build the minimal hello.elf user-space test binary.
-userspace: $(HELLO_ELF) $(SYSTEST_ELF)
+# Build kernel with PROFILE_FLEET defconfig and the fleet linker script
+# (1022 MiB RAM region for the 256 MiB heap + per-task tables that
+# overflow the default 8 MiB linker).  This target is the kernel side of
+# the RFC-0026 fleet defconfig and runs only on gateway boards with
+# >= 1 GiB RAM.  Not part of the default `build` target — opt-in.
+build-fleet:
+	@$(MAKE) defconfig-fleet
+	RUSTFLAGS="$(FLEET_RUSTFLAGS)" \
+	$(CARGO) build $(CARGO_FLAGS) \
+		$$(python3 tools/kconfig_to_cargo.py .config | tr -s ' ')
+	@echo "[FLEET] kernel built — use a gateway board with >= 1 GiB RAM"
+
+# Build the minimal hello.elf user-space test binary + GPIO ring-3 driver.
+userspace: $(HELLO_ELF) $(SYSTEST_ELF) $(GPIO_DRV_ELF) \
+           $(UHELLO_ELF) $(REFLEX_ELF) $(BRAINCLI_ELF) $(CAPTEST_ELF) \
+           $(LATBENCH_ELF) $(ABITEST_ELF) $(IPCTEST_ELF)
+
+# E11.AQ3 ring-3 driver — Rust no_std ELF.  Builds via the crate's own
+# .cargo/config.toml which pins target=riscv64imac-unknown-none-elf and
+# the user.ld linker script.  The output is copied (not stripped) into
+# build/gpio_drv.elf for the disk image to pick up.
+$(GPIO_DRV_ELF): $(GPIO_DRV_DIR)/src/main.rs $(GPIO_DRV_DIR)/Cargo.toml $(GPIO_DRV_DIR)/user.ld
+	@mkdir -p build
+	cd $(GPIO_DRV_DIR) && $(CARGO) +nightly build --release
+	cp $(GPIO_DRV_BUILT) $@
+	@echo "[USPACE] Built $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+# Same standalone pattern as gpio_drv: each crate carries its own
+# .cargo/config.toml pinning the target, user.ld and build-std.
+$(UHELLO_ELF): $(UHELLO_DIR)/src/main.rs $(UHELLO_DIR)/Cargo.toml $(UHELLO_DIR)/user.ld
+	@mkdir -p build
+	cd $(UHELLO_DIR) && $(CARGO) +nightly build --release
+	cp $(UHELLO_BUILT) $@
+	@echo "[USPACE] Built $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+$(REFLEX_ELF): $(REFLEX_DIR)/src/main.rs $(REFLEX_DIR)/Cargo.toml $(REFLEX_DIR)/user.ld
+	@mkdir -p build
+	cd $(REFLEX_DIR) && $(CARGO) +nightly build --release
+	cp $(REFLEX_BUILT) $@
+	@echo "[USPACE] Built $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+$(BRAINCLI_ELF): $(BRAINCLI_DIR)/src/main.rs $(BRAINCLI_DIR)/Cargo.toml $(BRAINCLI_DIR)/user.ld
+	@mkdir -p build
+	cd $(BRAINCLI_DIR) && $(CARGO) +nightly build --release
+	cp $(BRAINCLI_BUILT) $@
+	@echo "[USPACE] Built $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+$(CAPTEST_ELF): $(CAPTEST_DIR)/src/main.rs $(CAPTEST_DIR)/Cargo.toml $(CAPTEST_DIR)/user.ld
+	@mkdir -p build
+	cd $(CAPTEST_DIR) && $(CARGO) +nightly build --release
+	cp $(CAPTEST_BUILT) $@
+	@echo "[USPACE] Built $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+$(LATBENCH_ELF): $(LATBENCH_DIR)/src/main.rs $(LATBENCH_DIR)/Cargo.toml $(LATBENCH_DIR)/user.ld
+	@mkdir -p build
+	cd $(LATBENCH_DIR) && $(CARGO) +nightly build --release
+	cp $(LATBENCH_BUILT) $@
+	@echo "[USPACE] Built $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+$(ABITEST_ELF): $(ABITEST_DIR)/src/main.rs $(ABITEST_DIR)/Cargo.toml $(ABITEST_DIR)/user.ld
+	@mkdir -p build
+	cd $(ABITEST_DIR) && $(CARGO) +nightly build --release
+	cp $(ABITEST_BUILT) $@
+	@echo "[USPACE] Built $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+# NOTA: cargo NO rastrea los ficheros .ld. `user.ld` esta en los requisitos
+# para que make relance cargo, pero cargo respondera "Fresh" y NO reenlazara.
+# Tras tocar el linker script hay que forzar la recompilacion (touch al
+# main.rs o `cargo clean -p ipctest`) y comprobar las cabeceras PT_LOAD del
+# ELF resultante con `riscv64-unknown-elf-readelf -l build/ipctest.elf`:
+# ningun PT_LOAD puede llevar W y X a la vez.
+$(IPCTEST_ELF): $(IPCTEST_DIR)/src/main.rs $(IPCTEST_DIR)/Cargo.toml $(IPCTEST_DIR)/user.ld
+	@mkdir -p build
+	cd $(IPCTEST_DIR) && $(CARGO) +nightly build --release
+	cp $(IPCTEST_BUILT) $@
+	@echo "[USPACE] Built $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
 
 $(HELLO_ELF): $(HELLO_DIR)/hello.S $(HELLO_DIR)/user.ld
 	@mkdir -p build
@@ -121,6 +231,33 @@ qemu-full-smp: build userspace build/disk.img
 		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=tcp::8080-:8080 \
 		-device virtio-net-device,netdev=net0
 
+# Boot with a disk whose CONFIG.INI autoruns SYSTEST.ELF instead of the GPIO
+# driver, so the syscall test actually executes. It exercises the ring-3 path
+# end to end: ELF load from FAT32, exec, getpid/write/brk/exit via ecall.
+# Prints `[SYSCALL_TEST] ALL PASSED!` or `FAILED!`.
+qemu-systest: build userspace build/disk-systest.img
+	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) \
+		-smp 4 \
+		-global virtio-mmio.force-legacy=false \
+		-drive file=build/disk-systest.img,if=none,format=raw,id=hd0 \
+		-device virtio-blk-device,drive=hd0
+
+# DHCP against QEMU's built-in user-mode server. Asserts we reach Bound and
+# end up with an address from the 10.0.2.x pool, not just that the call
+# returned. Prints `[DHCPSMOKE] PASS ...` or `FAIL <reason>`.
+qemu-dhcp-smoke:
+	$(CARGO) build --release --features qemu,dhcp-smoke
+	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) \
+		-netdev user,id=net0 -device virtio-net-device,netdev=net0
+
+# K-A14 — PiMutex donation on a single hart: a low-priority holder and a
+# higher-priority waiter pinned to the same CPU. The old spinning mutex
+# deadlocked here; the waiter never released the hart, so the owner it had
+# just boosted could not run. Prints `[PISMOKE] PASS ...` or `FAIL <reason>`.
+qemu-pi-smoke:
+	$(CARGO) build --release --features qemu,pi-smoke
+	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF)
+
 # RVV: single CPU with Vector extension
 qemu-rvv: build-rvv
 	$(QEMU) $(QEMU_FLAGS) -cpu $(QEMU_RVV_CPU) -kernel $(KERNEL_ELF)
@@ -147,13 +284,33 @@ make-mlp build/mlp.rmlp: tools/make_mlp.py
 	python3 tools/make_mlp.py
 	@echo "[ML] Weight file: build/mlp.rmlp ($$(wc -c < build/mlp.rmlp | tr -d ' ') bytes)"
 
-build/disk.img: $(HELLO_ELF) $(SYSTEST_ELF) build/mlp.rmlp build/policy.gguf
+# Two disk images from one recipe, differing only in which ELF `autorun` starts.
+# disk.img keeps GPIODRV (the ring-3 driver demo); disk-systest.img runs the
+# syscall test, which was built and copied onto the disk for months without
+# anything ever invoking it.
+build/disk.img:         AUTORUN_ELF := /fat/GPIODRV.ELF
+build/disk-systest.img: AUTORUN_ELF := /fat/SYSTEST.ELF
+build/disk-uhello.img:  AUTORUN_ELF := /fat/UHELLO.ELF
+build/disk-reflex.img:  AUTORUN_ELF := /fat/REFLEX.ELF
+build/disk-braincli.img: AUTORUN_ELF := /fat/BRAINCLI.ELF
+build/disk-captest.img: AUTORUN_ELF := /fat/CAPTEST.ELF
+build/disk-latbench.img: AUTORUN_ELF := /fat/LATBENCH.ELF
+build/disk-abitest.img: AUTORUN_ELF := /fat/ABITEST.ELF
+build/disk-ipctest.img: AUTORUN_ELF := /fat/IPCTEST.ELF
+
+build/disk.img build/disk-systest.img build/disk-uhello.img \
+build/disk-reflex.img build/disk-braincli.img build/disk-captest.img \
+build/disk-latbench.img build/disk-abitest.img build/disk-ipctest.img: \
+		$(HELLO_ELF) $(SYSTEST_ELF) $(GPIO_DRV_ELF) $(UHELLO_ELF) \
+		$(REFLEX_ELF) $(BRAINCLI_ELF) $(CAPTEST_ELF) $(LATBENCH_ELF) $(ABITEST_ELF) \
+		$(IPCTEST_ELF) \
+		build/mlp.rmlp build/policy.gguf
 	@mkdir -p build
 	dd if=/dev/zero of=$@ bs=1M count=32
 	mkfs.fat -F 32 -n "ROBTOS" $@
 	@printf "Hello from Robot OS FAT32!\n" > /tmp/_robtos_hello.txt
 	@printf "Robot OS Phase 18 — Persistent configuration + dynamic model loading\n" > /tmp/_robtos_readme.txt
-	@printf "# Robot OS Configuration\nml_enabled=1\nlog_level=1\nmotor_max_speed=100\nwatchdog_ms=500\n" \
+	@printf "# Robot OS Configuration\nml_enabled=1\nlog_level=1\nmotor_max_speed=100\nwatchdog_ms=500\nnet_ip=10.0.2.15\nnet_gateway=10.0.2.2\nnet_mask=255.255.255.0\nbehavior_server_ip=10.0.2.2\nbehavior_server_port=9000\nbehavior_l1_enabled=1\nbehavior_l2_enabled=1\nbehavior_l3_enabled=1\nautorun=$(AUTORUN_ELF)\n" \
 		> /tmp/_robtos_config.ini
 	@printf "active_slot=a\nboot_count=0\nlast_good=a\nfw_version_a=0\nfw_version_b=0\n" \
 		> /tmp/_robtos_bootmeta
@@ -161,12 +318,94 @@ build/disk.img: $(HELLO_ELF) $(SYSTEST_ELF) build/mlp.rmlp build/policy.gguf
 	mcopy -i $@ /tmp/_robtos_readme.txt ::README.TXT
 	mcopy -i $@ $(HELLO_ELF) ::HELLO.ELF
 	mcopy -i $@ $(SYSTEST_ELF) ::SYSTEST.ELF
+	mcopy -i $@ $(GPIO_DRV_ELF) ::GPIODRV.ELF
+	mcopy -i $@ $(UHELLO_ELF) ::UHELLO.ELF
+	mcopy -i $@ $(REFLEX_ELF) ::REFLEX.ELF
+	mcopy -i $@ $(BRAINCLI_ELF) ::BRAINCLI.ELF
+	mcopy -i $@ $(CAPTEST_ELF) ::CAPTEST.ELF
+	mcopy -i $@ $(LATBENCH_ELF) ::LATBENCH.ELF
+	mcopy -i $@ $(ABITEST_ELF) ::ABITEST.ELF
+	mcopy -i $@ $(IPCTEST_ELF) ::IPCTEST.ELF
 	mcopy -i $@ build/mlp.rmlp ::MLP.RMLP
 	mcopy -i $@ build/policy.gguf ::POLICY.GGF
 	mcopy -i $@ /tmp/_robtos_config.ini ::CONFIG.INI
 	mcopy -i $@ /tmp/_robtos_bootmeta ::BOOTMETA
 	@rm -f /tmp/_robtos_hello.txt /tmp/_robtos_readme.txt /tmp/_robtos_config.ini /tmp/_robtos_bootmeta
-	@echo "[DISK] FAT32 image: $@ (HELLO.TXT + README.TXT + HELLO.ELF + SYSTEST.ELF + MLP.RMLP + POLICY.GGF + CONFIG.INI + BOOTMETA)"
+	@echo "[DISK] FAT32 image: $@ (autorun=$(AUTORUN_ELF))"
+
+# Same image, plus a /fat/LINK.KEY, used to prove the `link-auth-enforced`
+# gate ACCEPTS a valid key. A gate exercised only by its negative test is
+# indistinguishable from a gate that always refuses, so CI runs both halves.
+build/disk-linkkey.img: build/disk.img
+	cp build/disk.img $@
+	@dd if=/dev/urandom of=/tmp/_robtos_linkkey bs=32 count=1 2>/dev/null
+	mcopy -i $@ /tmp/_robtos_linkkey ::LINK.KEY
+	@rm -f /tmp/_robtos_linkkey
+	@echo "[DISK] FAT32 image with LINK.KEY: $@"
+
+# ── Secure-boot fixtures (Ed25519 accept / reject) ───────────────────────────
+#
+# `build/disk.img` carries no KERN_A.BIN and no KERN_A.SIG, so the only
+# secure-boot scenario it can support is "signature file absent" — which
+# `secure_boot_verify_slot_detailed()` answers before touching any crypto.
+# These two images add the missing halves: one with a VALID signature (the
+# Ed25519 verifier must run and accept) and one whose signature is
+# mathematically wrong (the verifier must run and reject). Same argument as
+# `build/disk-linkkey.img` above: a gate only ever observed refusing is
+# indistinguishable from a gate wired to always refuse.
+#
+# The signing key is a TEST pair generated on demand into tools/keys/ and
+# never committed — see tools/gen_test_key.py for why generating beats
+# shipping a fixed pair. `tools/keys/.gitignore` already excludes both halves.
+TEST_PRIV_KEY := tools/keys/test_priv.bin
+TEST_PUB_KEY  := tools/keys/test_pub.bin
+
+# One recipe, two outputs. gen_test_key.py is idempotent (keeps an intact
+# private key, always re-derives the public half), so make invoking it once per
+# target is harmless.
+$(TEST_PRIV_KEY) $(TEST_PUB_KEY): tools/gen_test_key.py
+	python3 tools/gen_test_key.py
+
+# The signed slot payload. Content is arbitrary as far as Ed25519 cares, so it
+# is generated rather than pulled from a build artifact: no dependency on
+# riscv64-unknown-elf-objcopy (not installed everywhere), and no risk of the
+# fixture changing size under us. Deterministic seed so a rebuild produces
+# byte-identical output and cargo/make stay quiet.
+#
+# 256 KiB is chosen, not arbitrary: it is comfortably under both
+# SECURE_BOOT_MAX_IMAGE_SIZE and MAX_VERIFY_SIZE (2 MiB each — exceeding either
+# yields ImageTooLargeToVerify or a bogus SignatureInvalid), while spanning 64
+# SECURE_BOOT_READ_CHUNK_SIZE reads, so the chunked `read_slot_image()` loop is
+# exercised rather than short-circuited by a single-chunk file.
+build/KERN_A.BIN:
+	@mkdir -p build
+	python3 -c "import random; random.seed(0x52424F53); open('build/KERN_A.BIN','wb').write(random.randbytes(262144))"
+	@echo "[SECBOOT] slot payload: $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+build/KERN_A.SIG: build/KERN_A.BIN $(TEST_PRIV_KEY)
+	python3 tools/sign_ota.py build/KERN_A.BIN --priv $(TEST_PRIV_KEY) --out $@
+
+# Bad signature: well-formed RSIG header, trusted public key, wrong scalar.
+# Anything cruder (missing file, broken magic, foreign key) is rejected before
+# sig_verify is ever called. See tools/corrupt_sig.py.
+build/KERN_BAD.SIG: build/KERN_A.SIG tools/corrupt_sig.py
+	python3 tools/corrupt_sig.py build/KERN_A.SIG $@
+
+# ACCEPT fixture: image + matching signature at the FAT volume ROOT. Root, not
+# a /fat subdirectory — `secure_boot.rs` reaches the FAT32 driver directly
+# rather than through the VFS mount point, and U-Boot's `fatload` (tools/boot.cmd)
+# can only produce the root layout anyway.
+build/disk-signed.img: build/disk.img build/KERN_A.BIN build/KERN_A.SIG
+	cp build/disk.img $@
+	mcopy -o -i $@ build/KERN_A.BIN ::KERN_A.BIN
+	mcopy -o -i $@ build/KERN_A.SIG ::KERN_A.SIG
+	@echo "[DISK] FAT32 image with signed slot A: $@"
+
+# REJECT fixture: identical, except KERN_A.SIG has one flipped bit in s.
+build/disk-badsig.img: build/disk-signed.img build/KERN_BAD.SIG
+	cp build/disk-signed.img $@
+	mcopy -o -i $@ build/KERN_BAD.SIG ::KERN_A.SIG
+	@echo "[DISK] FAT32 image with CORRUPTED slot A signature: $@"
 
 # ── VisionFive 2 targets ──────────────────────────────────────────────────────
 
@@ -238,16 +477,6 @@ k1-console:
 	picocom -b $(K1_BAUD) $(K1_SERIAL) || \
 	minicom -b $(K1_BAUD) -D $(K1_SERIAL)
 
-# ── ESP32-C3 targets (Phase G2 — skeleton only) ─────────────────────────────
-
-# Build kernel for ESP32-C3 (RV32IMC, no MMU, no ML).
-# NOTE: Skeleton only — requires ESP32-C3 target triple (riscv32imc-unknown-none-elf)
-#       and custom boot.S / UART driver for actual hardware.
-ESP32C3_TARGET := riscv32imac-unknown-none-elf
-
-esp32c3:
-	$(CARGO) build --release --features esp32c3 --target $(ESP32C3_TARGET)
-
 # OTA: send firmware to robot over TCP.
 # Usage: make ota-send ROBOT=10.0.2.15 [PORT=8080] [PLATFORM=qemu] [FW_VER=1]
 ROBOT    ?= 10.0.2.15
@@ -273,7 +502,173 @@ boot-scr: tools/boot.cmd
 	mkimage -C none -A riscv -T script -d tools/boot.cmd build/boot.scr
 	@echo "[OTA] boot.scr generated"
 
-# CI: build all feature combinations (0 errors, 0 warnings).
+# DEV01 — TFTP fast-iteration netboot for the freshly-built kernel.
+# `tftp-serve`: builds + raw-binarifies + serves on udp/$(TFTP_PORT).
+# Default port is 6969 (unprivileged); override with TFTP_PORT=69 if
+# you run as root.
+TFTP_PORT ?= 6969
+tftp-serve: $(OTA_BIN)
+	python3 scripts/tftp_serve.py $(OTA_BIN) --port $(TFTP_PORT)
+
+# DEV01.4 — QEMU built-in TFTP smoke. QEMU's user-mode network
+# gateway (10.0.2.2) serves files from build/tftp/; the kernel,
+# built with `--features tftp-smoke`, calls tftp_fetch at boot
+# and prints `[TFTP] fetched N bytes ... OK`. No external server
+# needed — `-netdev user,tftp=...` does it all in-process.
+TFTP_SMOKE_DIR := build/tftp
+TFTP_SMOKE_FILE := $(TFTP_SMOKE_DIR)/TFTP.BIN
+TFTP_SMOKE_BYTES := 256
+
+$(TFTP_SMOKE_FILE):
+	@mkdir -p $(TFTP_SMOKE_DIR)
+	@head -c $(TFTP_SMOKE_BYTES) /dev/urandom > $@
+	@echo "[TFTP] payload $@ ($$(wc -c < $@ | tr -d ' ') bytes)"
+
+# ── Two-node network smoke (DEV01.5) ─────────────────────────────────────────
+# Boots two kernel instances wired by QEMU's `socket` net backend and asserts a
+# 256-byte TCP payload round-trips byte-for-byte. Unlike qemu-tftp-smoke (UDP,
+# one direction, peer is QEMU's own TFTP server) both ends here are our kernel,
+# so it covers TCP handshake + RX checksum validation in both directions.
+# Fails the build on FAIL, panic, or timeout.
+qemu-net-pair:
+	$(CARGO) build --release --features qemu,net-smoke
+	QEMU=$(QEMU) bash tools/net_pair_smoke.sh
+
+qemu-tftp-smoke: $(TFTP_SMOKE_FILE)
+	$(CARGO) build --release --features qemu,tftp-smoke
+	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) \
+		-netdev user,id=net0,tftp=$(TFTP_SMOKE_DIR) \
+		-device virtio-net-device,netdev=net0
+
+# ── ISA aparcadas (2026-08-20) ───────────────────────────────────────────────
+# aarch64 y x86_64 viven en newfeatures/ y NO están en el workspace ni en CI.
+# Estos targets se conservan a propósito, apuntando a su nueva ruta: la línea
+# de QEMU de abajo (EL2, gic-version=3, -smp 2 para B1.gic.smp) es conocimiento
+# caro de reconstruir y no cuesta nada dejarlo escrito. No implican soporte.
+# Ver newfeatures/REVISAR-arch.md.
+
+# B1.boot — minimal aarch64 boot binary. Requires:
+#   rustup target add aarch64-unknown-none-softfloat
+#   (+ qemu-system-aarch64 in PATH)
+AARCH64_HELLO_BIN := newfeatures/aarch64-hello/target/aarch64-unknown-none-softfloat/release/aarch64_hello
+
+$(AARCH64_HELLO_BIN):
+	cd newfeatures/aarch64-hello && $(CARGO) +nightly build --release \
+	    -Z build-std=core,compiler_builtins \
+	    -Z build-std-features=compiler-builtins-mem
+
+qemu-aarch64-hello: $(AARCH64_HELLO_BIN)
+	# Boots at EL2 (no virtualization=off) so HVC #0 → QEMU's
+	# emulated PSCI. We drop to EL1 via _drop_to_el1 before any
+	# GIC programming. `-smp 2` is required for B1.gic.smp.
+	qemu-system-aarch64 -M virt,gic-version=3 \
+	    -cpu cortex-a72 -smp 2 -nographic -kernel $(AARCH64_HELLO_BIN)
+
+# B2.boot — minimal x86_64 boot binary (Multiboot1).
+X86_64_HELLO_BIN := newfeatures/x86_64-hello/target/x86_64-unknown-none/release/x86_64_hello
+
+$(X86_64_HELLO_BIN):
+	cd newfeatures/x86_64-hello && $(CARGO) +nightly build --release \
+	    -Z build-std=core,compiler_builtins \
+	    -Z build-std-features=compiler-builtins-mem
+
+qemu-x86_64-hello: $(X86_64_HELLO_BIN)
+	qemu-system-x86_64 -M q35 -nographic -kernel $(X86_64_HELLO_BIN)
+
+# ── x86_64-hello GRUB ISO boot path (task #152 workaround attempt) ──
+#
+# QEMU's `-kernel` loader rejects our 64-bit ELF binary, regardless of
+# whether it carries PVH / multiboot1 / multiboot2 headers, on QEMU
+# 10.1 macOS + Linux QEMU 8.2. The standard workaround is to wrap the
+# kernel in a GRUB-bootable ISO so the multiboot1 magic gets handed to
+# GRUB instead of QEMU's `-kernel` loader.
+#
+# Build path WORKS — xorriso reports a valid El-Torito + MBR + GPT
+# bootable image. Boot path BLOCKED — SeaBIOS on macOS QEMU 10.1 fails
+# with "Could not read from CDROM (code 0009)" on every ISO type
+# tested (q35, pc, microvm, virtio-blk, ide, sata). Issue is in the
+# QEMU/SeaBIOS combination shipped with brew qemu 10.1, not in our
+# binary or ISO. Same ISO mounts + verifies fine via `xorriso -ls`.
+#
+# Prerequisites:  brew install xorriso x86_64-elf-grub
+#
+# Use this target to (a) verify the GRUB ISO build pipeline stays
+# working for when a fixed QEMU lands, and (b) hand the ISO to a
+# different VMM (UTM, VMware Fusion, virtualbox) that doesn't share
+# the SeaBIOS CDROM bug.
+PHANES_ISO := build/phanes_x86_64.iso
+
+$(PHANES_ISO): $(X86_64_HELLO_BIN)
+	@mkdir -p build/iso/boot/grub
+	@cp $(X86_64_HELLO_BIN) build/iso/boot/phanes_x86_64.elf
+	@printf 'set timeout=0\nset default=0\nmenuentry "PHANES x86_64" {\n    multiboot /boot/phanes_x86_64.elf\n    boot\n}\n' > build/iso/boot/grub/grub.cfg
+	x86_64-elf-grub-mkrescue -o $(PHANES_ISO) build/iso
+
+x86_64-hello-iso: $(PHANES_ISO)
+	@echo "Built $(PHANES_ISO). To boot:"
+	@echo "  qemu-system-x86_64 -M q35 -cdrom $(PHANES_ISO) -nographic"
+	@echo "Note: on macOS QEMU 10.1 the boot itself fails at SeaBIOS"
+	@echo "CDROM read — known environment bug (task #152)."
+
+qemu-x86_64-iso: $(PHANES_ISO)
+	qemu-system-x86_64 -M q35 -cpu max -nographic -no-reboot -cdrom $(PHANES_ISO)
+
+# B2.target.spec — hard-float build of x86_64-hello. Uses the
+# custom `targets/x86_64-phanes-kernel.json` spec which enables
+# SSE+SSE2 and disables soft-float so impl Vector for X86_64
+# emits real `xmm` instructions instead of scalar polyfill.
+X86_64_HELLO_HARDFLOAT_BIN := newfeatures/x86_64-hello/target/x86_64-phanes-kernel/release/x86_64_hello
+
+$(X86_64_HELLO_HARDFLOAT_BIN):
+	cd newfeatures/x86_64-hello && \
+	    RUSTFLAGS="-C link-arg=-T./x86_64-q35.ld -C relocation-model=static -C link-arg=--no-pie" \
+	    $(CARGO) +nightly build --release \
+	    --target ../../targets/x86_64-phanes-kernel.json \
+	    -Z build-std=core,compiler_builtins \
+	    -Z build-std-features=compiler-builtins-mem \
+	    -Z unstable-options -Z json-target-spec
+
+x86_64-hello-hardfloat: $(X86_64_HELLO_HARDFLOAT_BIN)
+	@echo "Built $(X86_64_HELLO_HARDFLOAT_BIN) with SSE2 hard-float ABI."
+
+# ── RFC-0026 Kconfig targets ─────────────────────────────────────────────────
+# Phase C1 skeleton.  See docs/CONFIG.md (C7) for full documentation.
+# Install kconfiglib first:
+#   /opt/homebrew/bin/python3 -m pip install --user --break-system-packages kconfiglib
+
+KCONFIG_CONFIG     ?= .config
+KCONFIG_DEFCONFIG_DIR := defconfigs
+PYTHON             ?= /opt/homebrew/bin/python3
+
+.PHONY: menuconfig config nconfig oldconfig olddefconfig
+menuconfig:
+	$(PYTHON) -m menuconfig
+
+config: menuconfig
+
+nconfig:
+	$(PYTHON) -m menuconfig --style=nconfig
+
+oldconfig:
+	$(PYTHON) -m oldconfig
+
+olddefconfig:
+	$(PYTHON) -m olddefconfig
+
+defconfig-%:
+	@cp $(KCONFIG_DEFCONFIG_DIR)/$*.config $(KCONFIG_CONFIG)
+	@$(PYTHON) -m olddefconfig
+	@echo "[CONFIG] active = $*"
+
+.PHONY: savedefconfig
+savedefconfig:
+	$(PYTHON) -m savedefconfig --out $(KCONFIG_DEFCONFIG_DIR)/last_saved.config
+
+$(KCONFIG_CONFIG):
+	@echo "[CONFIG] no .config — falling back to edge defconfig"
+	@$(MAKE) defconfig-edge
+
+# ── CI: build all feature combinations (0 errors, 0 warnings). ───────────────
 ci:
 	@bash tools/ci_check.sh
 
@@ -297,6 +692,13 @@ help:
 	@echo "  qemu-rvv          - Run in QEMU with RVV 1.0 (1 CPU, --features rvv)"
 	@echo "  qemu-full-smp-rvv - RVV 1.0 + 4 CPUs + disk + net"
 	@echo ""
+	@echo "Secure-boot fixtures (used by tools/ci_check.sh):"
+	@echo "  build/disk-signed.img - FAT32 + KERN_A.BIN and a VALID KERN_A.SIG"
+	@echo "  build/disk-badsig.img - same, with one bit flipped in the signature"
+	@echo "  Boot either with --features qemu,secure-boot-enforced and"
+	@echo "  PROD_PUBKEY_PATH=\$$PWD/tools/keys/test_pub.bin (absolute: cargo runs"
+	@echo "  build scripts from crates/ota, so a relative path silently misses)."
+	@echo ""
 	@echo "Options:"
 	@echo "  PROFILE=debug   - Build in debug mode (default: release)"
 	@echo ""
@@ -317,6 +719,3 @@ help:
 	@echo "K1 options:"
 	@echo "  K1_SD=<dev>     SD card device  (default: /dev/sdb)"
 	@echo "  K1_SERIAL=<dev> UART device     (default: /dev/ttyUSB0)"
-	@echo ""
-	@echo "ESP32-C3 targets (Phase G2 — skeleton):"
-	@echo "  esp32c3        - Build kernel for ESP32-C3 (RV32IMC, no MMU/ML)"

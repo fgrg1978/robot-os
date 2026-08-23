@@ -1,0 +1,29 @@
+[package]
+name = "robot_os_cap_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for the Cap<T> + CapTable logic in crates/ipc/src/cap.rs and the delegation logic in crates/ipc/src/cap_store.rs. Excluded from workspace."
+
+# `cap.rs` carries `#[cfg(kani)]` proof harnesses; the kernel's own
+# `crates/ipc/Cargo.toml` declares the same check-cfg. Without it the host
+# build emits an `unexpected_cfg` warning, and warnings count as failures in
+# this project.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
+
+[dependencies]
+robot_os_abi = { path = "../abi" }
+# cap.rs now pub-uses DEGRADE_LEVEL_* and DEGRADE_SPEED_CAP_* from this leaf.
+robot_os_degrade_policy = { path = "../degrade-policy" }
+# cap.rs uses wcet_macro::wcet; proc-macro must be available for host compilation.
+wcet-macro = { path = "../wcet-macro" }
+
+# Host stand-ins for the two RV64-only kernel crates `cap_store.rs` calls
+# into. Renamed so the module source compiles unmodified — see each shim's
+# crate doc for why the real crate cannot be used on the host, and what the
+# `sched` shim deliberately exposes that the real scheduler does not.
+robot_os_sync = { path = "shims/sync", package = "cap_test_sync" }
+robot_os_sched = { path = "shims/sched", package = "cap_test_sched" }
+
+[dev-dependencies]

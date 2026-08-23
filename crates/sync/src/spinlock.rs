@@ -111,8 +111,16 @@ impl<T> SpinLock<T> {
     /// Unsafe: get a mutable reference without locking.
     /// Only use during single-threaded init before SMP starts.
     ///
+    /// Also (intentionally) used after SMP is up by panic-path `*_panic`
+    /// helpers (e.g. `motor::motor_stop_panic`, `gpio::gpio_write_panic`,
+    /// `pwm::pwm_set_duty_pct_panic`) that must never block on a lock
+    /// another hart might be holding at panic time — see those functions'
+    /// doc comments for the "torn state is fine, a hung panic handler is
+    /// not" rationale. Not a bug if you see it called from there.
+    ///
     /// # Safety
-    /// Caller must ensure no concurrent access.
+    /// Caller must ensure no concurrent access, OR (panic path only)
+    /// accept a possible torn read/write racing a concurrent lock holder.
     pub unsafe fn get_mut_unchecked(&self) -> &mut T {
         &mut *self.data.get()
     }

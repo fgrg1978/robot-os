@@ -175,7 +175,7 @@ fn write_str(buf: &mut [u8], s: &str) -> usize {
 
 fn gen_uptime(buf: &mut [u8]) -> usize {
     // Read RISC-V `time` CSR (rdtime pseudo-instruction, S-mode readable).
-    // On ESP32-C3 (rv32) there is no rdtime; substitute 0.
+    // Non-riscv64 builds (host unit tests) have no rdtime; substitute 0.
     #[cfg(target_arch = "riscv64")]
     let ticks: u64 = { let t: u64; unsafe { core::arch::asm!("rdtime {}", out(reg) t); } t };
     #[cfg(not(target_arch = "riscv64"))]

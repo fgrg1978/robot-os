@@ -1,0 +1,332 @@
+# Kconfig.arch — ISA / architecture selection
+#
+# RFC-0026 Phase C1.  Controls architecture-specific defaults downstream.
+# Board choices (Kconfig.platform) must be consistent with the ISA selected.
+
+menu "Architecture"
+
+# ---------------------------------------------------------------------------
+# ISA choice
+# ---------------------------------------------------------------------------
+
+choice
+    prompt "Instruction Set Architecture"
+    default ARCH_RISCV64
+    help
+      Select the target ISA for this kernel build.  All downstream defaults
+      (stack sizes, FP context, page sizes, WCET bounds) adjust automatically.
+      Changing this choice requires a full `cargo clean` before rebuilding.
+
+    config ARCH_RISCV64
+        bool "RISC-V 64-bit (rv64imac / rv64gc)"
+        help
+          RISC-V 64-bit — the primary PHANES target.  Supports all five
+          build profiles (edge/vf2, edge/k1, QEMU virt).
+          ISA base: rv64imac minimum; optional extensions via Kconfig.
+
+    config ARCH_AARCH64
+        bool "Aarch64 (ARMv8.0-A and later)"
+        help
+          64-bit ARM — secondary target, demonstrated on cortex-a72 QEMU.
+          Phase 2 multi-arch support.  Kernel builds but E2E robot loop
+          is deferred to Phase 3 hardware bring-up.
+
+    config ARCH_X86_64
+        bool "x86_64 (Haswell-class and later)"
+        help
+          64-bit x86 — tertiary target, Phase 2 substrate complete.
+          PVH QEMU boot confirmed; full kernel loop deferred to hardware
+          access.  Use mainly for host-simulation and CI diversity.
+
+endchoice
+
+# ---------------------------------------------------------------------------
+# Derived constants — auto-computed, no user prompt needed for most.
+# ---------------------------------------------------------------------------
+
+config CACHE_LINE_BYTES
+    int
+    default 64  if ARCH_RISCV64
+    default 64  if ARCH_X86_64
+    default 128 if ARCH_AARCH64
+    help
+      L1 cache-line width used for #[repr(align(N))] on cross-CPU-shared
+      atomics.  Cortex-A72 L2 prefetcher works on 128-byte lines.
+      Not user-configurable — derived from ISA.
+
+config ATOMIC_MAX_BYTES
+    int
+    default 8  if ARCH_RISCV64
+    default 16 if ARCH_AARCH64
+    default 16 if ARCH_X86_64
+    help
+      Largest single-instruction atomic CAS available on the ISA.
+      rv64: amoswap.d = 8 bytes.  ARMv8.0: LDXP/STXP = 16 bytes (paired).
+      x86_64: CMPXCHG16B = 16 bytes.
+      Lock-free data structures use this to decide between packed u64
+      and SpinLock-guarded wider state.
+
+# ---------------------------------------------------------------------------
+# RISC-V specific options
+# ---------------------------------------------------------------------------
+
+if ARCH_RISCV64
+
+config HAS_RVV
+    bool "RISC-V Vector Extension (V 1.0) present"
+    default y if BOARD_K1
+    default n if BOARD_VF2
+    default n if BOARD_QEMU
+    default n
+    help
+      Enable when the target SoC includes RVV 1.0 hardware (e.g. SpacemiT K1
+      with VLEN=256).  Activates RVV code paths in ml/, camera/, and vector
+      math helpers.  JH7110 (VF2) does NOT have RVV.  QEMU can emulate it
+      with `-cpu rv64,v=true` — opt-in only.
+
+config HAS_F_EXT
+    bool "RISC-V F extension (single-precision FP)"
+    default y
+    help
+      RISC-V F extension — 32 × 32-bit FP registers.  Required for
+      drone attitude math.  Part of rv64gc standard; disable only for
+      very minimal microcontroller targets.
+
+config HAS_D_EXT
+    bool "RISC-V D extension (double-precision FP)"
+    default y if HAS_F_EXT
+    depends on HAS_F_EXT
+    help
+      RISC-V D extension — 32 × 64-bit FP registers (extends F).
+      Default save area for kernel task context.  Part of rv64gc.
+
+config RV_PRIV_LEVELS
+    string
+    default "MSU" if !NO_MMU
+    default "MU"  if NO_MMU
+    help
+      Privilege levels compiled into the kernel.  MSU = Machine, Supervisor,
+      User (full separation + VM).  MU = Machine, User (no-mmu mode).
+      Not a user option — derived from NO_MMU.
+
+config NO_MMU
+    bool "No MMU mode (M+U only, no Sv39)"
+    default n
+    help
+      Disables virtual-memory support and builds a flat-address kernel.
+      For targets with no MMU hardware.  Incompatible with
+      PROFILE_EDGE and PROFILE_FLEET.
+
+endif # ARCH_RISCV64
+
+# ---------------------------------------------------------------------------
+# Aarch64 specific options
+# ---------------------------------------------------------------------------
+
+if ARCH_AARCH64
+
+config HAS_NEON
+    bool
+    default y
+    help
+      Aarch64 NEON SIMD — always present on ARMv8.0-A.  Enables NEON
+      code paths in the kernel's vector math helpers.
+
+config HAS_SVE
+    bool "Aarch64 SVE (Scalable Vector Extension)"
+    default n
+    help
+      SVE adds variable-length vector registers (128-2048 bits) on
+      Neoverse and later Cortex-A cores.  Disabled by default; enabling
+      increases FP save-frame size proportionally.
+
+config HAS_PAC
+    bool "Aarch64 PAC (Pointer Authentication)"
+    default n
+    help
+      Pointer Authentication Code — ARMv8.3-A extension.  Hardens
+      return addresses against ROP chains.  Requires toolchain support
+      (-mbranch-protection=standard).
+
+config HAS_BTI
+    bool "Aarch64 BTI (Branch Target Identification)"
+    default n
+    help
+      Branch Target Identification — ARMv8.5-A extension.  Marks
+      valid branch targets to prevent JOP attacks.  Requires
+      -mbranch-protection=bti or combined.
+
+config AARCH64_BOOT_EL
+    int "Boot entry exception level"
+    default 2
+    range 1 3
+    help
+      Exception level at which the kernel receives control from firmware.
+      2 = EL2 (standard for QEMU virt and most SBCs — kernel configures
+      GICv3 distributor then drops to EL1).  1 = EL1 (already set up by
+      secure-boot + ATF).  3 = EL3 (Trusted Firmware-A entry; unusual).
+
+endif # ARCH_AARCH64
+
+# ---------------------------------------------------------------------------
+# x86_64 specific options
+# ---------------------------------------------------------------------------
+
+if ARCH_X86_64
+
+config HAS_SSE2
+    bool
+    default y
+    help
+      x86_64 SSE2 — mandatory on all x86_64 CPUs.  Always enabled.
+      Sets the baseline XSAVE region size.
+
+config HAS_AVX2
+    bool "x86_64 AVX2 (requires Haswell+ or equivalent)"
+    default n
+    help
+      AVX2 adds 256-bit integer and FP SIMD.  Enable for host-simulation
+      and perf testing.  Increases XSAVE context ~1.2 KiB.
+
+config KPTI
+    bool "KPTI (Kernel Page-Table Isolation — Meltdown mitigation)"
+    default n
+    help
+      Separates kernel and user address spaces at context switch to
+      mitigate the Meltdown hardware vulnerability.  Adds ~200 ns
+      per syscall.  Disable for embedded / bare-metal-only workloads
+      where external network access is absent.
+
+config SMEP
+    bool "SMEP (Supervisor Mode Execution Prevention)"
+    default y
+    help
+      Prevents the kernel from accidentally executing code in user-mode
+      pages.  Hardware-enforced on Ivy Bridge+.  Low overhead; always on.
+
+config SMAP
+    bool "SMAP (Supervisor Mode Access Prevention)"
+    default y
+    help
+      Prevents the kernel from reading user pages unless CLAC/STAC
+      brackets the access.  Hardens against privilege escalation.
+
+endif # ARCH_X86_64
+
+# ---------------------------------------------------------------------------
+# Floating-point context
+# ---------------------------------------------------------------------------
+
+choice
+    prompt "Floating-point context save format"
+    default FP_HARDFLOAT_D if ARCH_RISCV64
+    default FP_NEON        if ARCH_AARCH64
+    default FP_XSAVE_AVX2  if ARCH_X86_64
+    help
+      Selects the FP register save format used in each task's TCB.
+      Larger contexts cost more RAM per task; smaller contexts limit
+      which FP instructions user code can use.
+
+    config FP_SOFTFLOAT
+        bool "No FP save area (soft-float)"
+        help
+          Minimal TCB; valid only if NO userspace code uses FP.
+          Use for deeply embedded targets where FP is emulated in
+          software and context save is unnecessary.
+
+    config FP_HARDFLOAT_F
+        bool "RISC-V F extension (32 × f32 = 128 B)"
+        depends on ARCH_RISCV64 && HAS_F_EXT
+        help
+          Saves only the 32 single-precision FP registers.  Sufficient
+          if userspace never uses double-precision or vector ops.
+
+    config FP_HARDFLOAT_D
+        bool "RISC-V D extension (32 × f64 = 256 B, default rv64)"
+        depends on ARCH_RISCV64 && HAS_D_EXT
+        help
+          Saves all 32 double-precision FP registers.  The standard
+          choice for rv64gc targets.  Required for drone attitude math.
+
+    config FP_RVV
+        bool "RISC-V V extension (32 × vlen-bit + control regs)"
+        depends on ARCH_RISCV64 && HAS_RVV
+        help
+          Full RVV save area.  Context size depends on VLEN (K1: 256 bits
+          = 1 KiB; QEMU default 128 bits = 512 B).  Use only when
+          userspace RVV programs need preemptive multitasking.
+
+    config FP_NEON
+        bool "Aarch64 NEON (32 × 128-bit q-regs = 512 B)"
+        depends on ARCH_AARCH64
+        help
+          Standard Aarch64 FP/SIMD save area.  Required for any user-mode
+          code using NEON intrinsics or Rust's SIMD types.
+
+    config FP_SVE
+        bool "Aarch64 SVE (variable-length, up to 2048-bit per reg)"
+        depends on ARCH_AARCH64 && HAS_SVE
+        help
+          Saves the full SVE register file.  Context size is
+          VLEN-dependent and determined at runtime.  Adds allocation
+          overhead to task creation.
+
+    config FP_XSAVE_SSE
+        bool "x86_64 SSE2 XSAVE region (~512 B)"
+        depends on ARCH_X86_64
+        help
+          Minimal XSAVE region covering XMM0-15.  Sufficient for
+          basic floating-point; incompatible with AVX code.
+
+    config FP_XSAVE_AVX2
+        bool "x86_64 AVX2 XSAVE region (~1.2 KiB)"
+        depends on ARCH_X86_64 && HAS_AVX2
+        help
+          XSAVE region covering YMM0-15 (256-bit AVX).  Required
+          for any user process using AVX2 intrinsics.  Default for
+          x86_64 kernel builds.
+
+    config FP_XSAVE_AVX512
+        bool "x86_64 AVX-512 XSAVE region (~3 KiB)"
+        depends on ARCH_X86_64
+        help
+          Full XSAVE region for ZMM0-31 (512-bit AVX-512).  Very large
+          context; increases task-switch cost noticeably on servers.
+
+endchoice
+
+# ---------------------------------------------------------------------------
+# MMU page size
+# ---------------------------------------------------------------------------
+
+choice
+    prompt "MMU page size"
+    depends on !NO_MMU
+    default MMU_PAGE_4K
+    help
+      Physical page granule for the hardware MMU.  Most ISAs support
+      only 4 KiB; Aarch64 also supports 16 KiB and 64 KiB granules.
+
+    config MMU_PAGE_4K
+        bool "4 KiB pages"
+        help
+          The only size RISC-V Sv39/Sv48 supports.  Also standard on
+          Aarch64 and x86_64.  Maximises address-space granularity.
+
+    config MMU_PAGE_16K
+        bool "16 KiB pages (Aarch64 only)"
+        depends on ARCH_AARCH64
+        help
+          Reduces TLB miss frequency for workloads with large working
+          sets.  Wastes more memory for small objects.
+
+    config MMU_PAGE_64K
+        bool "64 KiB pages (Aarch64 only)"
+        depends on ARCH_AARCH64
+        help
+          Used on IBM POWER-derived SoCs ported to aarch64.  Very low
+          TLB pressure; large internal fragmentation for small mappings.
+
+endchoice
+
+endmenu # Architecture

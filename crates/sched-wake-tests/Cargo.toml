@@ -1,0 +1,13 @@
+[package]
+name = "robot_os_sched_wake_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for the K-C10 TID-directed wake logic in crates/sched/src/wait.rs. Excluded from workspace."
+
+[dependencies]
+# task.rs re-exports MAX_TASKS from this leaf; it has no runtime dependencies
+# of its own, so it compiles for the host unchanged.
+robot_os_limits = { path = "../limits" }
+
+[dev-dependencies]

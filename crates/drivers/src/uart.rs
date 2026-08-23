@@ -1,7 +1,6 @@
 /// UART driver.
 ///
 /// NS16550A for QEMU virt / VisionFive 2 / SpacemiT K1.
-/// ESP32-C3 UART0 for ESP32-C3.
 ///
 /// Phase 5: Added SMP-safe spinlock via AtomicBool.
 /// Before `enable_smp_lock()` is called, no spinning occurs (safe for early boot).
@@ -32,18 +31,40 @@ static UART_LOCK: AtomicBool = AtomicBool::new(false);
 static SMP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// RAII guard that releases the UART lock on drop.
-pub struct UartGuard;
+///
+/// K-A16: IRQ-safe by construction (mirrors `CpuLockGuard` in
+/// `crates/sched/src/scheduler.rs`): disables `sstatus.SIE` for the duration
+/// the lock is held and restores the previous interrupt state on drop.
+/// `acquire()` used to be a plain spin — a tick firing on the same hart
+/// while a task held it (e.g. mid-`kprintln!`) could enter the timer ISR,
+/// which itself prints (WCET probes, panic/fault paths), and spin forever
+/// on a lock only the preempted holder could release — a same-hart
+/// deadlock. Also applied to `try_acquire()`'s successful case: it never
+/// spins so it was never *itself* deadlock-prone, but without this a tick
+/// firing while a trap/panic handler is mid-print through its guard could
+/// still nest into another UART caller — keeping both entry points on the
+/// same IRQ-safe discipline is what makes it safe to add a new caller later
+/// without re-opening this hazard.
+pub struct UartGuard {
+    prev_sstatus: usize,
+}
 
 impl Drop for UartGuard {
     fn drop(&mut self) {
         if SMP_ACTIVE.load(Ordering::Relaxed) {
             UART_LOCK.store(false, Ordering::Release);
         }
+        let current = robot_os_arch::csr::read_sstatus();
+        let restored = (current & !robot_os_arch::csr::SSTATUS_SIE)
+            | (self.prev_sstatus & robot_os_arch::csr::SSTATUS_SIE);
+        robot_os_arch::csr::write_sstatus(restored);
     }
 }
 
 /// Acquire exclusive access to the UART.
 pub fn acquire() -> UartGuard {
+    let prev_sstatus = robot_os_arch::csr::read_sstatus();
+    robot_os_arch::csr::write_sstatus(prev_sstatus & !robot_os_arch::csr::SSTATUS_SIE);
     if SMP_ACTIVE.load(Ordering::Relaxed) {
         while UART_LOCK
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -52,21 +73,29 @@ pub fn acquire() -> UartGuard {
             core::hint::spin_loop();
         }
     }
-    UartGuard
+    UartGuard { prev_sstatus }
 }
 
 /// Try to acquire the UART lock without blocking.
 /// Returns `None` if the lock is already held (e.g. called from ISR context).
 pub fn try_acquire() -> Option<UartGuard> {
+    let prev_sstatus = robot_os_arch::csr::read_sstatus();
+    robot_os_arch::csr::write_sstatus(prev_sstatus & !robot_os_arch::csr::SSTATUS_SIE);
     if SMP_ACTIVE.load(Ordering::Relaxed) {
         if UART_LOCK
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            // Restore interrupts before reporting failure — no guard will be
+            // returned to do it for us.
+            let current = robot_os_arch::csr::read_sstatus();
+            let restored = (current & !robot_os_arch::csr::SSTATUS_SIE)
+                | (prev_sstatus & robot_os_arch::csr::SSTATUS_SIE);
+            robot_os_arch::csr::write_sstatus(restored);
             return None;
         }
     }
-    Some(UartGuard)
+    Some(UartGuard { prev_sstatus })
 }
 
 /// Enable the SMP UART lock.
@@ -78,7 +107,6 @@ pub fn enable_smp_lock() {
 // NS16550A UART (QEMU / VF2 / K1)
 // ============================================================
 
-#[cfg(not(feature = "esp32c3"))]
 mod ns16550a {
     use super::*;
 
@@ -150,6 +178,43 @@ mod ns16550a {
         write_reg(REG_THR, c);
     }
 
+    /// Size of the 16550A transmit FIFO, enabled in [`init`] via
+    /// `FCR_ENABLE_FIFO`.
+    const TX_FIFO_DEPTH: usize = 16;
+
+    /// Write a whole slice, polling the line-status register once per FIFO
+    /// load instead of once per byte.
+    ///
+    /// `LSR_THR_EMPTY` with the FIFO on means "the transmit FIFO can accept
+    /// data", not "one byte fits" — so after a single successful poll it is
+    /// safe to push up to [`TX_FIFO_DEPTH`] bytes. Doing it a byte at a time
+    /// costs one MMIO read per byte for no reason, and MMIO is exactly what
+    /// is expensive here: under QEMU TCG every access traps to the device
+    /// model, and on real hardware the poll spins until the shift register
+    /// drains at the line rate.
+    ///
+    /// Measured from ring 3 before this existed (`userspace/latbench`):
+    /// `write(fd, 64 bytes)` cost 241 us against a 2.3 us syscall floor —
+    /// about 3.7 us per byte, all of it MMIO polling. At 115200 baud on real
+    /// hardware the same line is ~5.6 ms, against reflex's 25 ms control
+    /// period.
+    ///
+    /// This does not make console output asynchronous — a full FIFO still
+    /// blocks the caller. Fixing that properly means a TX ring drained by the
+    /// THR-empty interrupt, which trades away the guarantee that a panic
+    /// message reaches the wire before the board resets.
+    pub fn write_bytes(bytes: &[u8]) {
+        let mut i = 0;
+        while i < bytes.len() {
+            while !can_write() {}
+            let n = (bytes.len() - i).min(TX_FIFO_DEPTH);
+            for &b in &bytes[i..i + n] {
+                write_reg(REG_THR, b);
+            }
+            i += n;
+        }
+    }
+
     pub fn getc_raw() -> u8 {
         while !can_read_hw() {}
         read_reg(REG_RBR)
@@ -175,62 +240,6 @@ mod ns16550a {
 }
 
 // ============================================================
-// ESP32-C3 UART0
-// ============================================================
-
-#[cfg(feature = "esp32c3")]
-mod esp_uart {
-    use super::*;
-
-    // ESP32-C3 UART register offsets (from UART_BASE = 0x6000_0000)
-    const FIFO_REG: usize = 0x00;
-    const STATUS_REG: usize = 0x1C;
-    // TXFIFO_CNT in bits [23:16], RXFIFO_CNT in bits [7:0]
-
-    #[inline(always)]
-    fn read32(off: usize) -> u32 {
-        unsafe { core::ptr::read_volatile((UART_BASE + off) as *const u32) }
-    }
-
-    #[inline(always)]
-    fn write32(off: usize, val: u32) {
-        unsafe { core::ptr::write_volatile((UART_BASE + off) as *mut u32, val) }
-    }
-
-    pub fn init() {
-        // ROM bootloader already configured 115200 baud — nothing to do.
-    }
-
-    #[inline]
-    pub fn can_write() -> bool {
-        (read32(STATUS_REG) >> 16) & 0xFF < 128
-    }
-
-    #[inline]
-    pub fn can_read_hw() -> bool {
-        read32(STATUS_REG) & 0xFF > 0
-    }
-
-    pub fn putc_raw(c: u8) {
-        while !can_write() {}
-        write32(FIFO_REG, c as u32);
-    }
-
-    pub fn getc_raw() -> u8 {
-        while !can_read_hw() {}
-        (read32(FIFO_REG) & 0xFF) as u8
-    }
-
-    pub fn enable_irq() {
-        // No PLIC on ESP32-C3 — IRQ mode not supported (polling only)
-    }
-
-    pub fn irq_handler() {
-        // No-op: no PLIC-driven UART IRQ on ESP32-C3
-    }
-}
-
-// ============================================================
 // Public API (dispatches to platform module)
 // ============================================================
 
@@ -239,19 +248,13 @@ pub const UART_IRQ: u32 = 10;
 
 /// Initialize the UART hardware.
 pub fn init() {
-    #[cfg(not(feature = "esp32c3"))]
     ns16550a::init();
-    #[cfg(feature = "esp32c3")]
-    esp_uart::init();
 }
 
 /// Returns true if the transmitter is ready.
 #[inline]
 pub fn can_write() -> bool {
-    #[cfg(not(feature = "esp32c3"))]
-    { ns16550a::can_write() }
-    #[cfg(feature = "esp32c3")]
-    { esp_uart::can_write() }
+    ns16550a::can_write()
 }
 
 /// Returns true if there is data ready to read.
@@ -260,19 +263,13 @@ pub fn can_read() -> bool {
     if IRQ_MODE.load(Ordering::Relaxed) {
         RX_TAIL.load(Ordering::Relaxed) != RX_HEAD.load(Ordering::Acquire)
     } else {
-        #[cfg(not(feature = "esp32c3"))]
-        { ns16550a::can_read_hw() }
-        #[cfg(feature = "esp32c3")]
-        { esp_uart::can_read_hw() }
+        ns16550a::can_read_hw()
     }
 }
 
 /// Write a single byte to the UART (blocking).
 pub fn putc(c: u8) {
-    #[cfg(not(feature = "esp32c3"))]
     ns16550a::putc_raw(c);
-    #[cfg(feature = "esp32c3")]
-    esp_uart::putc_raw(c);
     if c == b'\n' {
         putc(b'\r');
     }
@@ -286,17 +283,30 @@ pub fn getc() -> u8 {
             core::hint::spin_loop();
         }
     } else {
-        #[cfg(not(feature = "esp32c3"))]
-        { ns16550a::getc_raw() }
-        #[cfg(feature = "esp32c3")]
-        { esp_uart::getc_raw() }
+        ns16550a::getc_raw()
     }
 }
 
 /// Write a string to the UART.
 pub fn puts(s: &str) {
-    for b in s.bytes() {
-        putc(b);
+    write_str_translated(s.as_bytes());
+}
+
+/// Write bytes to the UART, expanding `\n` to `\r\n`, using the FIFO-aware
+/// batched path. Splits the input at newlines so the CRLF translation that
+/// [`putc`] does per byte is preserved without paying a line-status poll per
+/// byte.
+pub fn write_str_translated(bytes: &[u8]) {
+    let mut start = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\n' {
+            ns16550a::write_bytes(&bytes[start..i]);
+            ns16550a::write_bytes(b"\n\r");
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        ns16550a::write_bytes(&bytes[start..]);
     }
 }
 
@@ -335,18 +345,12 @@ macro_rules! kprintln {
 
 /// Enable UART RX interrupt.
 pub fn enable_irq() {
-    #[cfg(not(feature = "esp32c3"))]
     ns16550a::enable_irq();
-    #[cfg(feature = "esp32c3")]
-    esp_uart::enable_irq();
 }
 
 /// UART IRQ handler — called from the PLIC external interrupt path.
 pub fn irq_handler() {
-    #[cfg(not(feature = "esp32c3"))]
     ns16550a::irq_handler();
-    #[cfg(feature = "esp32c3")]
-    esp_uart::irq_handler();
 }
 
 /// Returns the number of characters available in the RX ring buffer.

@@ -57,6 +57,86 @@ EDK2 is heavyweight (~1 GB build env). We do this when we have
 a target board that boots UEFI — until then the stub guards the
 scaffolding from rotting.
 
+## ARM64 and x86-64 — Resume After Hardware Tests
+
+Parked in `newfeatures/` on 2026-08-20 per user decision: first close real RISC-V
+hardware (VF2 / K1), then return to these two.
+
+- Not parked for being broken: 5,322 lines of peripherals written (GIC/MMU/PSCI
+  and ACPI/APIC/4-level paging), with 13 tests passing on the x86 side.
+- Parked because **a kernel was never built with them**: missing boot assembler,
+  kernel linker script, and CI entry.
+- The `crates/arch-api` abstraction **stays in the tree** with its 17 tests,
+  because `arch-riscv64` implements it. While the cross-ISA contract is still
+  exercised against one real architecture, reactivating another is adding a
+  crate.
+- Order when resuming: (1) linker script + boot.S, (2) secondary hart start,
+  (3) **entry in ci_check.sh before claiming anything supported**.
+
+See `newfeatures/REVISAR-arch.md`.
+
+## Userspace: Runtime and Fast Path kernel<->user
+
+User decision 2026-08-20: **after hardware**. And a language constraint: **no C
+will be used**, so porting glibc/newlib/picolibc or exposing a C ABI is ruled out.
+
+### Userspace Runtime (No libc)
+
+`crates/libsys` is 1,325 lines and 134 functions, but stops at syscall boundary:
+zero `malloc`/`free`/`memcpy`/`strlen`/`printf`. Cost measured same day:
+`captest` and `latbench` had to hand-implement integer-to-decimal conversion, and
+`brain_client` its own INI parser and line buffer.
+
+Direction: grow `libsys` toward Rust "std-lite" — a `GlobalAlloc` on `brk`/`mmap`
+(both already exist as syscalls) gives `Vec`/`String`/`Box` in ring 3 without a
+line of C, and an `impl core::fmt::Write` gives `write!`/`format!`.
+
+Needed by RFC-0020 (drivers to userspace): ring 3 driver will want dynamic
+buffers and today cannot have them.
+
+### Fast path: vDSO + io_ring
+
+**Measured starting point** (`userspace/latbench`, QEMU TCG, `rdtime`):
+the floor of a syscall is **~3,300 ns**. That is the number a ring avoids.
+
+**Already built and TURNED OFF** — the important finding:
+- `crates/ipc/src/io_ring.rs` exists in full, with SQ/CQ, `dispatch_sqe` and
+  opcodes (`OP_MOTOR_SPEED`, `OP_WRITE_GPIO`, `OP_I2C_WRITE`).
+- The syscall numbers are reserved: `SYS_IO_SETUP` (503),
+  `SYS_IO_SUBMIT` (504), `SYS_IO_SUBMIT_ASYNC` (519),
+  `SYS_IORING_CREATE_TYPED` (536), `SYS_IORING_SUBMIT_TYPED`.
+- But `io_ring_register_ops` has **zero callers**, so `OPS` is `None`
+  and `io_ring_submit` returns `IO_ERR_NO_OPS`. It has never been turned on.
+- The vDSO exists and exposes only three fields: `uptime_ticks`, `uptime_ms`,
+  `kernel_version`.
+
+**Do NOT turn on without fixing this first** (security audit 2026-08-20):
+1. `IO_RINGS` is a `static mut` **without a lock** — the only table in the
+   crate left out when the other four were fixed (`HANDLES`, `PORTS`,
+   `SHM_REGIONS`, `LEASES`, all with a comment saying this race was closed
+   for them). Two harts can claim the same slot; `io_ring_destroy`
+   racing with `io_ring_submit` is a use-after-free.
+2. `dispatch_sqe` executes `OP_MOTOR_SPEED` / `OP_WRITE_GPIO` / `OP_I2C_WRITE`
+   **without any `cap_check`**. The day someone registers the ops table,
+   io_ring becomes a complete bypass of the capability system.
+3. `IoRingState::owner_task` is written and **never read**.
+
+### Proposed order
+
+1. Close the three points above (they are security, not performance).
+2. Extend the vDSO: the cheap, risk-free part. Every read-only datum that
+   costs a trap today — time, ids, counters, degraded state — onto the
+   shared page. ~0 cost and it eliminates the whole trap.
+3. Turn on io_ring for the actuation path, which is the one with a fixed
+   cadence (the control loop runs at 40 Hz) and where amortizing the trap
+   across several SQEs actually pays off.
+4. **Measure with `userspace/latbench` before and after.** It already exists
+   and separates the syscall floor from each layer's cost; extend it with a
+   ring case.
+5. A `ci_check.sh` scenario that exercises it. Without a gate, history
+   repeats: this mechanism has been built for a long time and nobody has
+   ever executed it.
+
 ## Decision log
 
 | Date       | Decision                                         |

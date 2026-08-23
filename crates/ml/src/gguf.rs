@@ -70,7 +70,7 @@ impl GgmlType {
     /// Total byte size for `n` elements of this type.
     pub fn byte_size(self, n: usize) -> usize {
         let (blk, bpb) = self.block_params();
-        (n + blk - 1) / blk * bpb
+        (n.saturating_add(blk - 1) / blk).saturating_mul(bpb)
     }
 }
 
@@ -163,8 +163,9 @@ impl<'a> GgufFile<'a> {
             if t.name_bytes() != name { continue; }
             let n     = t.n_elements();
             let bytes = t.ggml_type.byte_size(n);
-            let start = self.data_offset + t.offset as usize;
-            let end   = start + bytes;
+            // Checked: `offset`/`bytes` come from the file and could overflow.
+            let start = self.data_offset.checked_add(t.offset as usize)?;
+            let end   = start.checked_add(bytes)?;
             if end > self.data.len() { return None; }
             return Some((&self.data[start..end], t.ggml_type, n));
         }
@@ -261,6 +262,7 @@ fn parse_tensor_info(data: &[u8], pos: usize) -> Option<(TensorInfo, usize)> {
     // n_dims: u32
     if pos + 4 > data.len() { return None; }
     let n_dims = u32_le(&data[pos..]);
+    if n_dims as usize > info.dims.len() { return None; } // dims is [u64; 4]
     info.n_dims = n_dims;
     let pos = pos + 4;
 

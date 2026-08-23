@@ -1,0 +1,146 @@
+# Kconfig.development — Debug probes, trace ring, verbose logging, panic
+#
+# RFC-0026 Phase C1.  Developer-facing options; should generally be off
+# in production defconfigs.
+
+menu "Development & Debug"
+
+# ---------------------------------------------------------------------------
+# TCP trace probes
+# ---------------------------------------------------------------------------
+
+choice
+    prompt "TCP per-segment trace probes"
+    default TCP_TRACE_OFF
+    help
+      Inserts kprintln! trace points at key TCP state transitions
+      (SYN, SYN-ACK, ACK, FIN, RST, retransmit).  Useful for
+      debugging the sensor-pump E2E path (#39).
+      Has measurable performance impact — disable in production.
+
+    config TCP_TRACE_OFF
+        bool "Off (no trace output)"
+        help
+          Default.  Zero overhead on the hot TCP path.
+
+    config TCP_TRACE_QEMU_ONLY
+        bool "QEMU only (enabled when BOARD_QEMU)"
+        help
+          Trace probes active only under QEMU.  Automatically
+          disabled in VF2/K1 builds by the build.rs feature guard.
+          Good for CI debugging without affecting hardware builds.
+
+    config TCP_TRACE_ALWAYS
+        bool "Always (real hardware + QEMU)"
+        help
+          All builds include trace probes.  Use only for deep
+          hardware bring-up debugging — performance impact is real
+          (~3-5% slower TCP throughput per segment due to UART output).
+
+endchoice
+
+# ---------------------------------------------------------------------------
+# Trace ring
+# ---------------------------------------------------------------------------
+
+config TRACE_RING_SIZE
+    int "Trace event ring buffer capacity (entries)"
+    range 16 65536
+    default 512
+    help
+      Number of 32-byte event records in the in-memory trace ring.
+      When full, oldest entries are overwritten (FIFO eviction).
+      512 × 32 B = 16 KiB.  Increase for longer post-mortem windows;
+      decrease for very memory-constrained builds.
+      Current codebase: 512 (crates/trace/src/lib.rs TRACE_RING_CAPACITY).
+
+# ---------------------------------------------------------------------------
+# Verbose logging
+# ---------------------------------------------------------------------------
+
+config KPRINTLN_VERBOSE
+    bool "Verbose kprintln! output"
+    default n
+    help
+      Enables extra kprintln! calls throughout the kernel (scheduler
+      decisions, driver init, packet drops).  Significantly increases
+      UART output bandwidth and can make timing-sensitive code
+      non-deterministic.  Off by default.
+
+# ---------------------------------------------------------------------------
+# WCET reporting
+# ---------------------------------------------------------------------------
+
+choice
+    prompt "WCET violation reporting"
+    default WCET_REPORT_NEVER
+    help
+      Controls when the WCET subsystem reports accumulated violation
+      statistics.
+
+    config WCET_REPORT_NEVER
+        bool "Never (production default)"
+        help
+          WCET records violations in an in-memory counter only.
+          No periodic output — avoids timing perturbation.
+
+    config WCET_REPORT_ON_SHUTDOWN
+        bool "On shutdown / panic"
+        help
+          Dumps accumulated violation counts to UART when the kernel
+          exits or panics.  Useful for end-of-run post-mortem.
+
+    config WCET_REPORT_PERIODIC
+        bool "Periodically (every N scheduler ticks)"
+        help
+          Dumps WCET stats at regular intervals.  Adds UART output
+          overhead proportional to reporting frequency.
+
+endchoice
+
+# ---------------------------------------------------------------------------
+# Panic action
+# ---------------------------------------------------------------------------
+
+choice
+    prompt "Panic action"
+    default PANIC_HALT
+    help
+      What the kernel does after printing the panic message.
+
+    config PANIC_HALT
+        bool "Halt (infinite WFI loop)"
+        help
+          Kernel spins in WFI forever after panic.  Safe default —
+          no automatic restart, operator must intervene.
+
+    config PANIC_REBOOT
+        bool "Reboot after delay"
+        help
+          Kernel reboots after PANIC_REBOOT_DELAY_MS milliseconds.
+          Allows reading the panic message before the reset.
+          Useful for unattended field deployments where a stuck robot
+          is worse than an automatically-recovering one.
+
+    config PANIC_DUMP_HALT
+        bool "Dump register state then halt"
+        help
+          Dumps full CPU register file (all GPRs + CSRs) to UART
+          before entering WFI.  Maximum debug information;
+          largest output.  Use during active debugging only.
+
+endchoice
+
+config PANIC_REBOOT_DELAY_MS
+    int "Panic reboot delay (ms)"
+    range 0 60000
+    default 5000
+    depends on PANIC_REBOOT
+    help
+      Milliseconds to wait after a panic message before triggering
+      a system reset.  5000 ms gives 5 seconds to read the UART output
+      before the board reboots.  Runtime override: CONFIG.INI
+      key `panic_reboot_ms`.
+      Current codebase default: 0 (disabled = halt, CFG_PANIC_REBOOT_DELAY_MS).
+
+endmenu # Development & Debug

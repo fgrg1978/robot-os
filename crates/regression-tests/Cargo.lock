@@ -313,6 +313,7 @@ name = "robot_os_regression_tests"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "wcet-macro",
 ]
 
 [[package]]
@@ -489,6 +490,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "wcet-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

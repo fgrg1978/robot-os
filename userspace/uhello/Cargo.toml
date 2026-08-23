@@ -1,0 +1,14 @@
+[package]
+name = "uhello"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Minimal Rust user-space ELF — proves the Rust no_std/no_main userspace build + exec path works (E11.AQ3 phase 1 de-risk). Excluded from workspace; built standalone."
+
+[dependencies]
+robot_os_libsys = { path = "../../crates/libsys" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

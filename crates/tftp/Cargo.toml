@@ -1,0 +1,12 @@
+[package]
+name = "robot_os_tftp"
+version = "0.1.0"
+edition = "2021"
+description = "RFC 1350 TFTP client — pure no_std state machine for DEV01 fast-iteration netboot."
+license = "Apache-2.0"
+repository = "https://github.com/phanes-project/phanes"
+
+[lib]
+name = "robot_os_tftp"
+
+[dependencies]

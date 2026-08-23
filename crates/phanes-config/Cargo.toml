@@ -1,0 +1,21 @@
+[package]
+name = "phanes-config"
+version = "0.1.0"
+edition = "2021"
+description = "Build-time Kconfig reader and Rust const emitter for PHANES (RFC-0026)"
+license = "Apache-2.0"
+
+# This crate is host-built (std) — it runs as part of the workspace build.rs
+# pipeline.  It is EXCLUDED from the workspace members so it does not
+# participate in cross-compilation to riscv64-none-elf.
+# Add to workspace Cargo.toml exclude list if not already present.
+
+[lib]
+name = "phanes_config"
+
+[dependencies]
+# Phase C1: no external deps.
+# Phase C2 will add: toml = "0.8", serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Phase C2 will add test utilities here.

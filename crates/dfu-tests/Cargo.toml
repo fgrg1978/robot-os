@@ -1,0 +1,14 @@
+[package]
+name = "robot_os_dfu_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side unit tests for robot_os_dfu (DEV02 DFU 1.1 protocol). Excluded from workspace."
+
+# Mirror of ota-tests / tftp-tests pattern. Run with:
+#   cd crates/dfu-tests && cargo test
+# Pinned to stable via rust-toolchain.toml — see crates/arch-x86_64-tests
+# Cargo.toml for the broken-nightly build-std backstory.
+
+[dependencies]
+robot_os_dfu = { path = "../dfu" }

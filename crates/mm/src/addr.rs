@@ -2,14 +2,7 @@
 ///
 /// These prevent accidentally mixing physical and virtual addresses.
 
-#[cfg(not(feature = "esp32c3"))]
 use robot_os_arch::mmu::{PAGE_SIZE, PAGE_SHIFT};
-
-// ESP32-C3: mmu module is gated out — define page constants locally.
-#[cfg(feature = "esp32c3")]
-const PAGE_SIZE: usize = 4096;
-#[cfg(feature = "esp32c3")]
-const PAGE_SHIFT: usize = 12;
 
 /// A physical address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

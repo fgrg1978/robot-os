@@ -26,7 +26,6 @@ PLATFORMS = {
     "qemu":    0,
     "vf2":     1,
     "k1":      2,
-    "esp32c3": 3,
 }
 
 

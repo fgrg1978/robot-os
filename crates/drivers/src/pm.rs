@@ -249,8 +249,8 @@ pub fn thermal_read_temp_mdeg() -> i32 {
         };
         // JH7110: raw value to milli-degrees conversion (approximate)
         // T(°C) ≈ (raw - 1328) * 100 / 2874 + 70 (from datasheet)
-        let temp_c = ((raw as i32).saturating_sub(1328) * 100 / 2874) + 70;
-        temp_c * 1000 // convert to milli-degrees
+        let temp_c = ((raw as i32).saturating_sub(1328).saturating_mul(100) / 2874) + 70;
+        temp_c.saturating_mul(1000) // convert to milli-degrees
     }
     #[cfg(not(feature = "vf2"))]
     {

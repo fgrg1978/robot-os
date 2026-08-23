@@ -1,0 +1,14 @@
+[package]
+name = "ipctest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Ring-3 IPC probe: exercises the fast-path IPC round trip, the server-impersonation gate, and the shm/port/io_ring ownership gates that no user-space program had ever executed."
+
+[dependencies]
+robot_os_libsys = { path = "../../crates/libsys" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

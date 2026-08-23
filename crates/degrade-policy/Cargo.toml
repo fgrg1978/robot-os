@@ -1,0 +1,10 @@
+[package]
+name = "robot_os_degrade_policy"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "RFC-0037 degrade taxonomy and speed-ceiling mapping. Dep-free leaf crate; no_std in production, std in tests."
+
+[dependencies]
+
+[dev-dependencies]

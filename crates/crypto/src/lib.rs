@@ -5,6 +5,7 @@
 
 #![no_std]
 
+pub mod ct;
 pub mod sha256;
 pub mod aes;
 pub mod x25519;

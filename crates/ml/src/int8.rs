@@ -114,9 +114,13 @@ pub fn conv2d_int8(
     output_params: &QuantParams,
     output: &mut [i8],
 ) {
-    if stride == 0 { return; }
-    let out_h = (in_h + 2 * pad - k_h) / stride + 1;
-    let out_w = (in_w + 2 * pad - k_w) / stride + 1;
+    // Guard against `k > in + 2*pad` underflow (usize) → abort on a crafted
+    // model; conv2d (f32) has these guards, conv2d_int8 was missing them.
+    let padded_h = in_h.saturating_add(pad.saturating_mul(2));
+    let padded_w = in_w.saturating_add(pad.saturating_mul(2));
+    if stride == 0 || k_h > padded_h || k_w > padded_w { return; }
+    let out_h = (padded_h - k_h) / stride + 1;
+    let out_w = (padded_w - k_w) / stride + 1;
     let patch_size = in_c * k_h * k_w;
 
     for oc in 0..out_c {
@@ -151,12 +155,26 @@ pub fn conv2d_int8(
                     }
                 }
 
-                // Requantize to output i8
-                let real_val = acc as f32 * output_params.scale;
+                // Requantize to output i8 (integer-only, fused ReLU).
+                //
+                // Behaviour-preserving cleanup (RFC-0032): the old code computed
+                // `acc as f32 * scale` and then `quantize()` divided by the same
+                // `scale` — `scale` cancels, so the requant was really
+                // `relu(acc) + zero_point`, paid for with a redundant per-output
+                // float multiply + float DIVIDE (the divide dominated requant
+                // cost). This computes the identical result in integers, no FP.
+                //
+                // CORRECTNESS LIMITATION (unchanged, flagged for a future API
+                // change): a correct per-layer requant needs the combined
+                // multiplier M = input_scale * weight_scale / output_scale with
+                // a fixed-point multiply+shift (TFLite/gemmlowp style). This
+                // signature lacks the input/weight scales, so no true rescale is
+                // performed and outputs saturate for large accumulators. Fixing
+                // that means threading M into the signature — out of scope here.
+                let relu = if acc < 0 { 0 } else { acc };
+                let q = (relu + output_params.zero_point as i32).clamp(-128, 127);
                 let out_idx = oc * out_h * out_w + oh * out_w + ow;
-                // ReLU fused
-                let clamped = if real_val < 0.0 { 0.0 } else { real_val };
-                output[out_idx] = output_params.quantize(clamped);
+                output[out_idx] = q as i8;
             }
         }
     }

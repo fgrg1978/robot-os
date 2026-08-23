@@ -2,6 +2,8 @@
 name = "robot_os_pubsub"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [dependencies]
 robot_os_sync = { workspace = true }
+robot_os_limits = { workspace = true }

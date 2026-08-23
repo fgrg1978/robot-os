@@ -7,7 +7,7 @@
 //! verification where the signer is a trusted build system. For
 //! production TLS, consider a full Ed25519 implementation.
 
-use crate::sha256::{Sha256, Digest};
+use crate::sha256::Digest;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,15 +73,17 @@ pub fn sig_parse_header(data: &[u8]) -> Option<FirmwareSignature> {
     })
 }
 
-/// Verify a firmware image against a trusted public key.
+/// Verify a firmware image against a trusted public key using
+/// **real Ed25519** (RFC 8032) via the vetted `ed25519-dalek` crate.
 ///
-/// Simplified scheme: signature = HMAC-SHA256(secret_derived_from_key, firmware_hash).
-/// This is NOT real Ed25519 (which requires curve arithmetic), but provides
-/// integrity verification for the secure boot chain.
+/// Replaces the pre-2026-05 HMAC-SHA256 stub (task #213) which was
+/// trivially forgeable by anyone holding the public key. The
+/// signature now signs the firmware bytes directly per the RFC —
+/// no pre-hash, no proprietary scheme — so it interoperates with
+/// any standard `ed25519` signer (e.g. `tools/sign_ota.py`).
 ///
-/// For production: replace with full Ed25519 verify using curve25519 arithmetic.
-///
-/// Returns `true` if the firmware hash matches the signature.
+/// Returns `true` if the signature is valid for `firmware_data`
+/// under `trusted_key`.
 pub fn sig_verify(
     trusted_key: &[u8; ED25519_PUBLIC_KEY_SIZE],
     signature: &[u8; ED25519_SIGNATURE_SIZE],
@@ -90,16 +92,13 @@ pub fn sig_verify(
     if firmware_data.len() > MAX_VERIFY_SIZE {
         return false;
     }
-
-    // Compute SHA-256 of firmware
-    let firmware_hash = crate::sha256::sha256(firmware_data);
-
-    // Verify: first 32 bytes of signature should match
-    // HMAC-SHA256(trusted_key, firmware_hash)
-    let expected = hmac_sha256_verify(trusted_key, &firmware_hash);
-
-    // Constant-time comparison of first 32 bytes
-    constant_time_eq(&signature[..32], &expected)
+    let vk = match ed25519_dalek::VerifyingKey::from_bytes(trusted_key) {
+        Ok(v) => v,
+        Err(_) => return false,  // malformed pubkey bytes
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(signature);
+    // strict variant rejects non-canonical signatures (point + scalar).
+    vk.verify_strict(firmware_data, &sig).is_ok()
 }
 
 /// Compute SHA-256 hash of firmware data (for signing on the build system).
@@ -127,7 +126,7 @@ pub fn verify_boot_image(
     }
 
     // Check public key matches trusted key
-    if !constant_time_eq(&sig_header.public_key, trusted_key) {
+    if !crate::ct::ct_eq(&sig_header.public_key, trusted_key) {
         return false;
     }
 
@@ -144,43 +143,16 @@ pub fn verify_boot_image(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// HMAC-SHA-256 for verification (simplified, using 32-byte key).
-fn hmac_sha256_verify(key: &[u8; 32], data: &[u8; 32]) -> [u8; 32] {
-    /// SHA-256 block size.
-    const BLOCK_SIZE: usize = 64;
-    const IPAD: u8 = 0x36;
-    const OPAD: u8 = 0x5C;
+// (Removed dead `hmac_sha256_verify` — leftover from the pre-#213 HMAC-SHA-256
+// signature stub. `sig_verify` now uses real Ed25519 via `ed25519-dalek`.)
 
-    let mut k_padded = [0u8; BLOCK_SIZE];
-    k_padded[..32].copy_from_slice(key);
-
-    // Inner: SHA-256((K ^ ipad) || data)
-    let mut inner_key = [0u8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        inner_key[i] = k_padded[i] ^ IPAD;
-    }
-    let mut h = Sha256::new();
-    h.update(&inner_key);
-    h.update(data);
-    let inner = h.finalize();
-
-    // Outer: SHA-256((K ^ opad) || inner)
-    let mut outer_key = [0u8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        outer_key[i] = k_padded[i] ^ OPAD;
-    }
-    let mut h = Sha256::new();
-    h.update(&outer_key);
-    h.update(&inner);
-    h.finalize()
-}
-
-/// Constant-time comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
-}
+// The local `constant_time_eq` that used to live here guarded the
+// secure-boot trusted-public-key comparison — the single highest-value
+// comparison in the tree — and was one of the three copies missing the
+// `black_box` barrier that `auth_envelope.rs` and `ota/secure_boot.rs`
+// already had. It now calls `crate::ct::ct_eq`.
+//
+// The leak this closes is modest (the trusted key is not itself a secret),
+// but an early-exiting compare against the trusted key lets an attacker
+// with signing-free image control learn the key byte-by-byte from timing,
+// which is a strictly worse position than the one we intended.

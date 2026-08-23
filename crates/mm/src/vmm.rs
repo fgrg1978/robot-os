@@ -12,6 +12,82 @@ use robot_os_common::error::{KResult, KernelError};
 use crate::addr::PhysAddr;
 use crate::pmm;
 
+/// Lowest user VA a page-fault handler is allowed to materialize a page at.
+///
+/// Everything strictly below this is a **null guard region**: no fault in it
+/// is ever resolvable, so the faulting task dies instead of continuing.
+///
+/// Why 64 KiB, and why this is not an invented number:
+///   - Every ring-3 `user.ld` in `userspace/*/` starts its first section at
+///     `. = 0x10000`, and the ten ELFs currently in `build/` all report
+///     `min PT_LOAD p_vaddr = 0x10000` (entry points at `0x10000..0x10bb2`).
+///     So `0x10000` is exactly the lowest VA any legitimate binary uses —
+///     the guard is as wide as it can be without touching a real image.
+///   - Everything else a user address space contains sits far above it:
+///     the `brk` heap grows up from the image and is capped at
+///     `USER_LOW_MAX = 0x0200_0000`, the vDSO is at `0x5000_0000`, the
+///     driver/shm MMIO window at `0x6000_0000`, the stack just under
+///     `USER_STACK_TOP = 0x8000_0000` (see `sched::process`).
+///
+/// What it closes: an instruction fetch or a load/store at VA 0 is the most
+/// common bug there is (null pointer / jump through a null function
+/// pointer). Before this, the fault path tried COW, then demand paging, and
+/// a demand-marked PTE at a low VA — `sys_alloc_demand` bases its
+/// reservation at `update_user_brk(0)`, which is 0 for a task whose brk was
+/// never initialized — made the *demand* attempt SUCCEED: the kernel mapped
+/// a zero page over the null pointer and let ring 3 keep running on it.
+/// A null dereference then executes zeros silently instead of killing the
+/// task. On a robot that is a control task that never stops and never
+/// reports; a dead task at least trips the supervisor.
+///
+/// If this is ever widened, check `userspace/*/user.ld` first: a binary
+/// linked below the new limit stops loading (it will fault on its own entry
+/// point and be killed, which is the correct-but-confusing symptom).
+pub const USER_GUARD_LIMIT: usize = 0x1_0000; // 64 KiB — lowest legit user VA
+
+/// True when `vaddr` falls in the null guard region (see [`USER_GUARD_LIMIT`]).
+#[inline]
+pub fn in_null_guard(vaddr: usize) -> bool {
+    vaddr < USER_GUARD_LIMIT
+}
+
+/// Faults resolved without any UART output, split by kind.
+///
+/// Bumped by the kernel's page-fault arm (`kernel/src/main.rs`) on the paths
+/// that used to print a `[PAGE FAULT]` banner for a fault that was about to
+/// be fixed. They exist so removing that print does not remove the evidence:
+/// the counters are dumped in the post-mortem block of an *unresolved* fault
+/// (and by `trace_dump` consumers), so a crash report still says "this
+/// system fixed N COW faults and M demand faults before dying here".
+///
+/// Cost on the common path is one relaxed `fetch_add` — no lock, no UART.
+static COW_FAULTS_RESOLVED:    core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DEMAND_FAULTS_RESOLVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record one silently-resolved COW fault. See [`faults_resolved`].
+#[inline]
+pub fn note_cow_resolved() {
+    COW_FAULTS_RESOLVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one silently-resolved demand-paging fault. See [`faults_resolved`].
+#[inline]
+pub fn note_demand_resolved() {
+    DEMAND_FAULTS_RESOLVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(cow, demand)` faults resolved since boot, system-wide.
+///
+/// Consulted from the unresolved-fault post-mortem in `kernel/src/main.rs`
+/// (both the U-mode kill path and the S-mode fatal path). Free to call from
+/// a shell command too — it is a pair of relaxed loads.
+pub fn faults_resolved() -> (u64, u64) {
+    (
+        COW_FAULTS_RESOLVED.load(core::sync::atomic::Ordering::Relaxed),
+        DEMAND_FAULTS_RESOLVED.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Maximum number of page tables we track for reference counting.
 const MAX_PT_TRACKED: usize = 128;
 
@@ -47,6 +123,24 @@ fn meta_add(pt: usize) -> KResult<()> {
         }
     }
     Err(KernelError::CapacityFull)
+}
+
+/// Drop a page table's tracking slot.
+///
+/// Must be called by every teardown path that frees a root page table
+/// obtained from [`create_pagetable`]. `PT_META` has only `MAX_PT_TRACKED`
+/// (128) slots and `meta_add` never reclaims them on its own: a loader that
+/// frees the root page but leaves the slot occupied turns a repeatable
+/// ring-3 failure (a malformed ELF handed to `exec`) into a permanent kernel
+/// resource kill — after 128 attempts `create_pagetable` returns
+/// `CapacityFull` forever and no process can ever be created again.
+fn meta_remove(pt: usize) {
+    if pt == 0 { return; }
+    let mut meta = PT_META.lock();
+    if let Some(idx) = meta_find(&meta, pt) {
+        meta[idx].pt = 0;
+        meta[idx].refcount = 0;
+    }
 }
 
 /// Increment reference count for a page table.
@@ -91,7 +185,14 @@ pub fn pt_getref(pt: usize) -> Option<i32> {
 pub fn create_pagetable() -> KResult<usize> {
     let page = pmm::alloc_page()?; // alloc_page already zeroes the page
     let pt_phys = page.as_usize();
-    meta_add(pt_phys)?;
+    // Give the page back if we cannot track it. Propagating `?` here used to
+    // drop the freshly allocated frame on the floor: once `PT_META` is full
+    // every further `create_pagetable` both fails *and* burns a physical page,
+    // so a ring-3 fork/exec loop drains the PMM rather than just being denied.
+    if let Err(e) = meta_add(pt_phys) {
+        let _ = pmm::free_page(page);
+        return Err(e);
+    }
     Ok(pt_phys)
 }
 
@@ -201,6 +302,66 @@ pub fn map_mega(pt_phys: usize, vaddr: usize, paddr: usize, flags: PteFlags) -> 
 /// If `vaddr` falls inside a 2 MiB megapage, the megapage is split into
 /// 512 individual 4 KiB pages first, then the target page is unmapped.
 /// This avoids accidentally invalidating the entire 2 MiB region.
+/// Add permission bits to an existing **user** leaf mapping, refusing any
+/// combination that would produce a writable-executable page.
+///
+/// Exists because a single 4 KiB page can be shared by two ELF `PT_LOAD`
+/// segments: the loader maps the page when the first segment touches it and,
+/// until this function existed, never revisited the flags. An ELF laid out as
+///
+/// ```text
+///     LOAD 0x10b48  R    (ends 0x11391 — page 0x11)
+///     LOAD 0x11394  RW   (starts    — page 0x11)
+/// ```
+///
+/// therefore ran with page 0x11 read-only, and the first store to a `static
+/// mut` living there took a Store/AMO page fault. That is not hypothetical:
+/// `userspace/abitest` hit it the first time it ran, and `userspace/captest`
+/// has the same layout and survives only because it never writes its failure
+/// counter — the bug was latent behind a passing test.
+///
+/// **W^X is preserved deliberately.** Granting WRITE on a page that already
+/// carries EXEC is refused, so an `.rodata`/`.data` overlap can be repaired
+/// while a `.text`/`.data` overlap still cannot — the second is a genuinely
+/// unsafe layout and should fail loudly rather than silently produce a W+X
+/// page. Returns `Err(KernelError::InvalidArg)` in that case.
+///
+/// Only ever widens: bits already present are kept, and the USER bit is
+/// required up front so this cannot be aimed at a kernel mapping.
+pub fn add_user_leaf_perms(pt_phys: usize, vaddr: usize, add: PteFlags) -> KResult<()> {
+    let mut pt = pt_phys;
+    // Walk to the leaf. Only L0 leaves are produced by the user-image mapper,
+    // so a superpage here means the VA belongs to the kernel's merged entries
+    // and is not ours to touch.
+    for level in (0..3).rev() {
+        let vpn = match level {
+            2 => mmu::vpn2(vaddr),
+            1 => mmu::vpn1(vaddr),
+            _ => mmu::vpn0(vaddr),
+        };
+        let pte_ptr = (pt + vpn * 8) as *mut Pte;
+        let pte: Pte = unsafe { core::ptr::read_volatile(pte_ptr) };
+        if !pte.is_valid() { return Err(KernelError::InvalidArg); }
+        if pte.is_leaf() {
+            if level != 0 { return Err(KernelError::InvalidArg); }
+            let f = pte.flags();
+            if !f.contains(PteFlags::USER) { return Err(KernelError::InvalidArg); }
+            if add.contains(PteFlags::WRITE) && f.contains(PteFlags::EXEC) {
+                return Err(KernelError::InvalidArg);
+            }
+            let merged = f | add;
+            if merged == f { return Ok(()); } // already sufficient
+            unsafe {
+                core::ptr::write_volatile(pte_ptr, Pte::new(pte.phys_addr(), merged));
+            }
+            csr::sfence_vma_addr(vaddr);
+            return Ok(());
+        }
+        pt = pte.phys_addr();
+    }
+    Err(KernelError::InvalidArg)
+}
+
 pub fn unmap(pt_phys: usize, vaddr: usize) {
     // Walk L2 → L1 to detect megapage before reaching walk().
     let vpn2 = mmu::vpn2(vaddr);
@@ -282,6 +443,114 @@ pub fn translate(pt_phys: usize, vaddr: usize) -> Option<usize> {
     let l0_pte = unsafe { core::ptr::read_volatile((pt + vpn0 * 8) as *const Pte) };
     if !l0_pte.is_valid() { return None; }
     Some(l0_pte.phys_addr() + (vaddr & (PAGE_SIZE - 1)))
+}
+
+/// Translate a **user** virtual address for a `copy_from_user` /
+/// `copy_to_user` access, enforcing the permission bits that separate user
+/// memory from kernel/MMIO memory.
+///
+/// Unlike [`translate`] (which checks only `VALID`), this rejects any address
+/// whose leaf PTE lacks the `USER` bit. That distinction is load-bearing:
+/// [`copy_kernel_entries_to_user`] merges every kernel L2/L1 entry — kernel
+/// text/data **and all MMIO** (UART, CLINT, PLIC, …) — into every user page
+/// table. Those pages are `VALID` but not `USER`, so a plain `translate` of a
+/// kernel VA (e.g. `0x1000_0000` UART, `0x8020_xxxx` kernel text) succeeds and
+/// hands the syscall path a pointer it will read or write on the caller's
+/// behalf — a sandbox escape / arbitrary-write primitive. Requiring `USER`
+/// closes both directions.
+///
+/// The `USER` bit is the authoritative user/kernel boundary here; a numeric
+/// `vaddr < USER_STACK_TOP` split would be both redundant (the bit already
+/// separates them) and insufficient (MMIO at `0x0200_0000` / `0x1000_0000`
+/// lives *below* any such split).
+///
+/// Permission checked on the leaf PTE:
+///   - always: `VALID` + `USER` + `READ`
+///   - when `write`: also `WRITE`. A user page whose `WRITE` bit is clear but
+///     which carries the OS-defined `COW` marker (a shared page from a
+///     copy-on-write `fork`) is broken via [`crate::cow::handle_cow_fault`]
+///     and re-translated, so a legitimate post-fork write copies into a
+///     private page instead of spuriously failing (or corrupting the shared
+///     page, which is what the old unchecked `translate` path did). A
+///     genuinely read-only user page (e.g. the vDSO, `.text`) is rejected.
+///
+/// Returns the physical address on success, `None` on any permission failure
+/// or unmapped page. Never panics.
+pub fn translate_user(pt_phys: usize, vaddr: usize, write: bool) -> Option<usize> {
+    let mut pt = pt_phys;
+
+    // L2 — kernel gigapages reach this leaf (copied wholesale into user PTs),
+    // so the USER check must be applied here too.
+    let vpn2 = mmu::vpn2(vaddr);
+    let l2_pte = unsafe { core::ptr::read_volatile((pt + vpn2 * 8) as *const Pte) };
+    if !l2_pte.is_valid() { return None; }
+    if l2_pte.is_leaf() {
+        return user_leaf_ok(pt_phys, vaddr, l2_pte, 0x3FFF_FFFF, write);
+    }
+    pt = l2_pte.phys_addr();
+
+    // L1 — kernel megapages (MMIO, kernel image) reach this leaf.
+    let vpn1 = mmu::vpn1(vaddr);
+    let l1_pte = unsafe { core::ptr::read_volatile((pt + vpn1 * 8) as *const Pte) };
+    if !l1_pte.is_valid() { return None; }
+    if l1_pte.is_leaf() {
+        return user_leaf_ok(pt_phys, vaddr, l1_pte, 0x1F_FFFF, write);
+    }
+    pt = l1_pte.phys_addr();
+
+    // L0 — ordinary 4 KiB user pages (and any 4 KiB kernel leaves).
+    let vpn0 = mmu::vpn0(vaddr);
+    let l0_pte = unsafe { core::ptr::read_volatile((pt + vpn0 * 8) as *const Pte) };
+    if !l0_pte.is_valid() { return None; }
+    user_leaf_ok(pt_phys, vaddr, l0_pte, PAGE_SIZE - 1, write)
+}
+
+/// Permission gate for one leaf PTE reached by [`translate_user`].
+/// `offset_mask` selects the in-page offset for the leaf's page size.
+#[inline]
+fn user_leaf_ok(
+    pt_phys: usize,
+    vaddr: usize,
+    pte: Pte,
+    offset_mask: usize,
+    write: bool,
+) -> Option<usize> {
+    let f = pte.flags();
+    // Reject kernel/MMIO (no USER bit) and unreadable pages outright.
+    if !f.contains(PteFlags::USER) || !f.contains(PteFlags::READ) {
+        return None;
+    }
+    if write && !f.contains(PteFlags::WRITE) {
+        // A copy-on-write page: break it (allocate a private copy) and re-walk.
+        // Any other read-only user page is genuinely not writable → reject.
+        if f.contains(PteFlags::COW) {
+            crate::cow::handle_cow_fault(pt_phys, vaddr).ok()?;
+            // Re-translate: the fresh leaf now has WRITE set. Guard against a
+            // pathological re-fault by using the plain permission read.
+            let mut pt = pt_phys;
+            let l2 = unsafe { core::ptr::read_volatile((pt + mmu::vpn2(vaddr) * 8) as *const Pte) };
+            if !l2.is_valid() { return None; }
+            if l2.is_leaf() {
+                return if l2.flags().contains(PteFlags::WRITE) {
+                    Some(l2.phys_addr() + (vaddr & 0x3FFF_FFFF))
+                } else { None };
+            }
+            pt = l2.phys_addr();
+            let l1 = unsafe { core::ptr::read_volatile((pt + mmu::vpn1(vaddr) * 8) as *const Pte) };
+            if !l1.is_valid() { return None; }
+            if l1.is_leaf() {
+                return if l1.flags().contains(PteFlags::WRITE) {
+                    Some(l1.phys_addr() + (vaddr & 0x1F_FFFF))
+                } else { None };
+            }
+            pt = l1.phys_addr();
+            let l0 = unsafe { core::ptr::read_volatile((pt + mmu::vpn0(vaddr) * 8) as *const Pte) };
+            if !l0.is_valid() || !l0.flags().contains(PteFlags::WRITE) { return None; }
+            return Some(l0.phys_addr() + (vaddr & (PAGE_SIZE - 1)));
+        }
+        return None;
+    }
+    Some(pte.phys_addr() + (vaddr & offset_mask))
 }
 
 /// Switch to a page table by writing the SATP register.
@@ -538,7 +807,27 @@ pub fn enable_paging() {
 // `demand`.  Re-export their public API here for backward compatibility
 // with callers that still reference them via `vmm::`.
 pub use crate::cow::{fork_cow, handle_cow_fault, page_addref, page_decref, page_getref};
-pub use crate::demand::{map_demand, map_demand_range, handle_demand_fault};
+pub use crate::demand::{map_demand, map_demand_range};
+
+/// Resolve a demand-paging fault, refusing anything in the null guard region.
+///
+/// This is the entry point the kernel's page-fault arm uses. It is a wrapper
+/// rather than a plain re-export of [`crate::demand::handle_demand_fault`]
+/// because that function will happily materialize a page for *any* VA that
+/// carries a `DEMAND`-marked PTE, VA 0 included — and a demand PTE at VA 0 is
+/// reachable (`sys_alloc_demand` bases its reservation at the task's `brk`,
+/// which is 0 for a task that never got one). Materializing it turns a jump
+/// through a null pointer into a task that keeps running on a page of zeros
+/// instead of dying. See [`USER_GUARD_LIMIT`] for the threshold's derivation.
+///
+/// `InvalidArg` (not `NotMapped`) on a guard hit, so the caller can tell
+/// "there was nothing to resolve here" from "I refuse to resolve this".
+pub fn handle_demand_fault(pt: usize, fault_addr: usize) -> KResult<()> {
+    if in_null_guard(fault_addr) {
+        return Err(KernelError::InvalidArg);
+    }
+    crate::demand::handle_demand_fault(pt, fault_addr)
+}
 
 /// Copy kernel page-table entries into a user page table.
 ///
@@ -556,6 +845,26 @@ pub use crate::demand::{map_demand, map_demand_range, handle_demand_fault};
 /// the two tables are merged at L1 level: kernel L1 entries (MMIO) are
 /// written into any empty slots in the user L1 table (user code occupies
 /// different VPN[1] slots, so there is no collision).
+///
+/// # Ordering invariant — call this LAST
+///
+/// This must run **after** every user mapping is installed, never before.
+/// On an empty user PT the wholesale branch below fires for *every* kernel
+/// L2 slot, so `user_pt.L2[vpn2]` ends up holding a pointer to the kernel's
+/// own L1 table — shared, not copied. Userspace links at `0x10000` and the
+/// kernel maps the CLINT at `0x0200_0000`; both are VPN[2]=0, so a
+/// subsequent `map(user_pt, 0x10000, ..)` allocates an L0 table *inside the
+/// kernel's L1* and installs USER leaves in the kernel page table. Every
+/// address space then inherits the previous process's mappings, user pages
+/// become visible to (and clobberable by) the kernel, and the next
+/// `load_elf` memcpy's over the live `.text` of an already-running process.
+/// Mapping first means the user PT owns its own L1 tables and the merge
+/// path below — the branch that keeps kernel and user separate — is the one
+/// that actually runs.
+///
+/// Because the copy grafts kernel-owned tables into `user_pt`, any teardown
+/// of that PT must go through [`destroy_user_pagetable`], which knows how to
+/// tell the borrowed kernel tables from the user's own.
 pub fn copy_kernel_entries_to_user(user_pt: usize) {
     let kpt = *KERNEL_PT.lock();
 
@@ -595,4 +904,213 @@ pub fn copy_kernel_entries_to_user(user_pt: usize) {
         }
         // Both sides have leaf entries (megapages) — kernel PT owns it, skip.
     }
+}
+
+/// The kernel's L1 table for VPN[2] slot `vpn2`, if the kernel PT has one.
+///
+/// Returns `None` when the kernel has no entry there, or when the entry is a
+/// gigapage leaf (no L1 table to speak of). Used by the teardown and COW
+/// walkers to recognise a table that is *borrowed* from the kernel PT rather
+/// than owned by the user PT they are traversing.
+pub(crate) fn kernel_l1_table(vpn2: usize) -> Option<usize> {
+    let kpt = *KERNEL_PT.lock();
+    if kpt == 0 || vpn2 >= PT_ENTRIES { return None; }
+    let kpte: Pte = unsafe { core::ptr::read_volatile((kpt + vpn2 * 8) as *const Pte) };
+    if kpte.is_valid() && !kpte.is_leaf() { Some(kpte.phys_addr()) } else { None }
+}
+
+/// Check, without writing anything, whether [`copy_kernel_entries_to_user`]
+/// would be able to install *every* kernel mapping into `user_pt`.
+///
+/// The merge only fills empty slots — it never overwrites a user mapping. That
+/// is the right precedence for memory safety, but it means a user layout that
+/// happens to occupy a VPN[2] (or VPN[2]/VPN[1]) slot the kernel also needs
+/// silently *loses* the kernel entry. The failure is not a fault at load time:
+/// the process starts, runs, and then the first timer interrupt or `kprintln`
+/// taken while its SATP is live faults in S-mode on a CLINT/UART address the
+/// kernel believes is identity-mapped. On a robot that is a hang with the
+/// actuators still energised.
+///
+/// So exec refuses the image instead. Returns `None` when everything fits, or
+/// `Some((vpn2, vpn1))` naming the first slot that collides (`vpn1 ==
+/// PT_ENTRIES` means the collision is at L2 itself). Call it *before*
+/// `copy_kernel_entries_to_user` so the rejection path still sees a page table
+/// that contains nothing but user-owned tables.
+///
+/// Note for platforms whose RAM base is 0 (K1: `RAM_BASE = 0x0000_0000`): the
+/// kernel identity-maps a megapage over the very VA range userspace links at
+/// (`0x10000`), so this predicate fires and exec fails. That is intentional and
+/// strictly better than today's behaviour there — see the report on the K1 VA
+/// layout; fixing it needs a user-image relocation, not a change here.
+pub fn kernel_entry_collision(user_pt: usize) -> Option<(usize, usize)> {
+    let kpt = *KERNEL_PT.lock();
+    if kpt == 0 { return None; }
+
+    for vpn2 in 0..PT_ENTRIES {
+        let kpte: Pte = unsafe {
+            core::ptr::read_volatile((kpt + vpn2 * 8) as *const Pte)
+        };
+        if !kpte.is_valid() { continue; }
+
+        let upte: Pte = unsafe {
+            core::ptr::read_volatile((user_pt + vpn2 * 8) as *const Pte)
+        };
+        if !upte.is_valid() {
+            continue; // wholesale copy will install it
+        }
+        if kpte.is_leaf() || upte.is_leaf() {
+            // A gigapage on either side cannot be merged — the kernel entry
+            // would be dropped entirely.
+            return Some((vpn2, PT_ENTRIES));
+        }
+
+        let k_l1 = kpte.phys_addr();
+        let u_l1 = upte.phys_addr();
+        for vpn1 in 0..PT_ENTRIES {
+            let kl1: Pte = unsafe {
+                core::ptr::read_volatile((k_l1 + vpn1 * 8) as *const Pte)
+            };
+            if !kl1.is_valid() { continue; }
+            let ul1: Pte = unsafe {
+                core::ptr::read_volatile((u_l1 + vpn1 * 8) as *const Pte)
+            };
+            if ul1.is_valid() {
+                return Some((vpn2, vpn1));
+            }
+        }
+    }
+    None
+}
+
+/// Tear down a **user** page table: free its own intermediate tables and its
+/// USER leaf pages, and release its `PT_META` slot.
+///
+/// This is the teardown [`destroy_pagetable`] cannot be: that one recurses
+/// into every valid non-leaf entry, which on a user PT that has been through
+/// [`copy_kernel_entries_to_user`] means walking into — and freeing — the
+/// kernel's own L1/L0 tables. Handing those frames back to the PMM while the
+/// kernel is still executing out of them is not a leak, it is a machine that
+/// stops.
+///
+/// Kernel tables are grafted in at two different depths and both must be
+/// recognised:
+///   - **L2**: a VPN[2] slot the user never touched holds a copy of the
+///     kernel's L2 PTE, i.e. a pointer to the kernel's L1 table.
+///   - **L1**: at VPN[2]=0 the user owns the L1 table, but individual slots
+///     inside it (CLINT, PLIC, UART, …) point at the kernel's L0 tables.
+///     A teardown that compared only at L2 would recurse into the user's own
+///     L1, reach slot 16, and free the kernel's CLINT L0 table — a corruption
+///     that surfaces at a random later moment, nowhere near this code.
+///
+/// Leaf pages are released through [`crate::cow::page_decref`], so a page
+/// still shared with a forked peer survives; an untracked (sole-owner) page is
+/// freed. The vDSO frame is kernel-owned and mapped USER_RO into every address
+/// space, so it is skipped explicitly.
+pub fn destroy_user_pagetable(pt_phys: usize) {
+    // No reserved window: on the construction paths nothing can have mapped
+    // shm/MMIO into this PT yet (see `destroy_user_pagetable_skip_range`).
+    destroy_user_pagetable_skip_range(pt_phys, 0, 0)
+}
+
+/// [`destroy_user_pagetable`] for a *post-construction* address space: leaf
+/// frames whose VA falls in `[skip_lo, skip_hi)` are left un-freed.
+///
+/// K-C22 wired teardown into exec replacement and task-slot reuse — page
+/// tables that have LIVED, which the plain variant was never safe for: a
+/// running process may have shm and MMIO frames mapped USER into its PT
+/// (`shm_map_user` / `mmio_map_user` in the sched crate), and those frames
+/// are not the address space's to free. Shm pages are PMM pages owned by the
+/// shm registry and possibly mapped by other processes — `page_decref` has
+/// never tracked them, so it would report "sole owner" and this walk would
+/// hand a page another process is actively using back to the allocator. MMIO
+/// frames merely bounce off `pmm::free_page`'s range check, but skipping
+/// them keeps the ownership rule uniform instead of leaning on that.
+///
+/// Both kinds only ever land in one VA window (`reserve_mmio_va` is the
+/// single allocator for it), so callers pass that window. The window's own
+/// L1/L0 *tables* were allocated by `vmm::map` on this PT and ARE freed —
+/// the mappings die with the address space; the frames survive under their
+/// real owner.
+///
+/// **Free order is load-bearing**: the ROOT frame is freed last, after the
+/// full 512-slot L2 walk. The reuse-time reclaim in the scheduler
+/// (`try_task_create_affinity`, K-C22(B)) may run while the hart that
+/// zombified this address space is still a few instructions short of its
+/// `csrw satp` away from it — kernel text/stack resolve through the
+/// *borrowed* kernel L1s (skipped below), so the root is the only frame
+/// that hart still translates through. Do not reorder the root free
+/// earlier.
+pub fn destroy_user_pagetable_skip_range(pt_phys: usize, skip_lo: usize, skip_hi: usize) {
+    if pt_phys == 0 { return; }
+
+    let kpt = *KERNEL_PT.lock();
+    let vdso_phys = crate::vdso::vdso_phys();
+
+    for vpn2 in 0..PT_ENTRIES {
+        let l2: Pte = unsafe {
+            core::ptr::read_volatile((pt_phys + vpn2 * 8) as *const Pte)
+        };
+        // Gigapage leaves are only ever created by the kernel mapper.
+        if !l2.is_valid() || l2.is_leaf() { continue; }
+        let u_l1 = l2.phys_addr();
+
+        // Which L1 table does the kernel use for this slot (if any)?
+        let k_l1 = if kpt != 0 {
+            let kpte: Pte = unsafe {
+                core::ptr::read_volatile((kpt + vpn2 * 8) as *const Pte)
+            };
+            if kpte.is_valid() && !kpte.is_leaf() { kpte.phys_addr() } else { 0 }
+        } else { 0 };
+
+        if k_l1 != 0 && k_l1 == u_l1 {
+            continue; // borrowed wholesale from the kernel PT — not ours to free
+        }
+
+        for vpn1 in 0..PT_ENTRIES {
+            let l1: Pte = unsafe {
+                core::ptr::read_volatile((u_l1 + vpn1 * 8) as *const Pte)
+            };
+            // Megapage leaves at L1 are kernel-created (map_mega is never used
+            // for user mappings) — leave them alone.
+            if !l1.is_valid() || l1.is_leaf() { continue; }
+            let u_l0 = l1.phys_addr();
+
+            if k_l1 != 0 {
+                let kl1: Pte = unsafe {
+                    core::ptr::read_volatile((k_l1 + vpn1 * 8) as *const Pte)
+                };
+                if kl1.is_valid() && !kl1.is_leaf() && kl1.phys_addr() == u_l0 {
+                    continue; // merged kernel L0 table — not ours to free
+                }
+            }
+
+            for vpn0 in 0..PT_ENTRIES {
+                let l0: Pte = unsafe {
+                    core::ptr::read_volatile((u_l0 + vpn0 * 8) as *const Pte)
+                };
+                if !l0.is_valid() || !l0.is_leaf() { continue; }
+                // A leaf without USER is a kernel mapping that found its way
+                // in — never ours to free.
+                //
+                // USER leaves installed by `shm_map_user`/`mmio_map_user` are
+                // *not* owned by this address space either — that is what
+                // `skip_lo..skip_hi` exists for (see the function doc); the
+                // construction-failure paths pass an empty window because no
+                // such mapping can exist before the loader/fork returns.
+                if !l0.flags().contains(PteFlags::USER) { continue; }
+                let va = (vpn2 << 30) | (vpn1 << 21) | (vpn0 << 12);
+                if va >= skip_lo && va < skip_hi { continue; }
+                let phys = l0.phys_addr();
+                if vdso_phys != 0 && phys == vdso_phys { continue; }
+                if crate::cow::page_decref(phys) {
+                    let _ = pmm::free_page(PhysAddr::new(phys));
+                }
+            }
+            let _ = pmm::free_page(PhysAddr::new(u_l0));
+        }
+        let _ = pmm::free_page(PhysAddr::new(u_l1));
+    }
+
+    meta_remove(pt_phys);
+    let _ = pmm::free_page(PhysAddr::new(pt_phys));
 }

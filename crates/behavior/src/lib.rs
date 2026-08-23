@@ -17,6 +17,7 @@ pub mod arbiter;
 pub mod remote;
 pub mod brain_protocol;
 pub mod auth_envelope;
+pub mod encrypt_link;
 pub mod offline;
 pub mod safety;
 pub mod balance;
@@ -62,14 +63,18 @@ pub use remote::{
 pub use brain_protocol::{
     build_packet, parse_packet, crc8,
     encode_sensor_packet, encode_status_packet, decode_actuator_cmd,
+    decode_predict_cmd, PredictCmd,
     encode_camera_header,
     decode_mode_cmd, decode_waypoint_cmd, decode_config_cmd,
     ActuatorCmd as BrainActuatorCmd,
     ModeCmd, WaypointCmd, ConfigCmd,
     PKT_SENSOR, PKT_CAMERA, PKT_STATUS, PKT_OTA_ACK,
     PKT_ACTUATOR, PKT_MODE, PKT_WAYPOINT, PKT_CONFIG, PKT_PAYLOAD,
-    PKT_OTA_BEGIN, PKT_OTA_CHUNK, PKT_OTA_END, PKT_ESTOP,
+    PKT_OTA_BEGIN, PKT_OTA_CHUNK, PKT_OTA_END, PKT_ESTOP, PKT_PREDICT, PKT_DEGRADE,
+    PKT_SEMANTIC_LEVEL,
     ESTOP_REASON_OPERATOR, ESTOP_REASON_SAFETY, ESTOP_REASON_GEOFENCE,
+    DEGRADE_CLEAR, DEGRADE_REASON_PERCEPTION_BLIND,
+    DEGRADE_REASON_SENSOR_INCOHERENT, DEGRADE_REASON_UNMODELLED_HAZARD,
     OTA_ACK_OK, OTA_ACK_ERROR,
     ROBOT_WHEELED, ROBOT_DRONE, ROBOT_HUMANOID, ROBOT_ACKERMANN,
     FLAG_EMERGENCY, FLAG_ALERT, ACT_DIFF_DRIVE,

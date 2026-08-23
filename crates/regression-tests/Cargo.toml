@@ -2,6 +2,7 @@
 name = "robot_os_regression_tests"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "Host-side regression tests for kernel bugs found and fixed. Excluded from workspace."
 
 # Excluded from workspace; runs on the host (Apple Silicon) via:
@@ -16,3 +17,9 @@ description = "Host-side regression tests for kernel bugs found and fixed. Exclu
 [dev-dependencies]
 # TS01 — property-based tests. Generates random inputs to check invariants.
 proptest = "1"
+
+# RFC-0027 — needed because `brain_protocol.rs` (pulled in via `#[path]`)
+# carries `#[wcet(...)]` annotations.  The macro emits cfg-gated calls that
+# resolve to no-ops on the host (target_os = "macos"/"linux"), but the
+# `use wcet_macro::wcet` import still has to satisfy the compiler.
+wcet-macro = { path = "../wcet-macro" }

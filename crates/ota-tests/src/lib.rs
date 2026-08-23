@@ -7,11 +7,26 @@
 #[path = "../../ota/src/pure.rs"]
 pub mod pure;
 
+// DEV02 — recovery-mode entry trigger logic. Same #[path] pattern.
+#[path = "../../ota/src/recovery.rs"]
+pub mod recovery;
+
 #[cfg(test)]
 mod tests {
     use super::pure::*;
 
     // ── Test fixtures ──────────────────────────────────────────────────
+
+    /// Acceptance ceiling used by these tests.
+    ///
+    /// The real ceiling is `robot_os_ota::OTA_MAX_IMAGE_SIZE`, which comes
+    /// from Kconfig (`OTA_MAX_IMAGE_SIZE_MB`). It deliberately does NOT live
+    /// in `pure`, because this crate `#[path]`-includes `pure.rs` directly and
+    /// that file must stay dependency-free — so `ota_validate_header` takes
+    /// the ceiling as a parameter. These tests exercise the boundary logic
+    /// with a fixed value of their own; they are testing the comparison, not
+    /// the configured number.
+    const TEST_MAX_IMAGE_SIZE: usize = 2 * 1024 * 1024;
 
     /// Build a header that should validate against the QEMU platform.
     fn good_header() -> OtaHeader {
@@ -117,37 +132,37 @@ mod tests {
     fn validate_rejects_platform_mismatch() {
         let h = OtaHeader { platform_id: OTA_PLATFORM_VF2, ..good_header() };
         // Running on QEMU, image targets VF2 → reject.
-        assert!(!ota_validate_header(&h, OTA_PLATFORM_QEMU));
+        assert!(!ota_validate_header(&h, OTA_PLATFORM_QEMU, TEST_MAX_IMAGE_SIZE));
         // Running on VF2 with VF2 image → accept.
-        assert!(ota_validate_header(&h, OTA_PLATFORM_VF2));
+        assert!(ota_validate_header(&h, OTA_PLATFORM_VF2, TEST_MAX_IMAGE_SIZE));
     }
 
     #[test]
     fn validate_accepts_matching_platform() {
         let h = good_header();
-        assert!(ota_validate_header(&h, OTA_PLATFORM_QEMU));
+        assert!(ota_validate_header(&h, OTA_PLATFORM_QEMU, TEST_MAX_IMAGE_SIZE));
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // OT01.E — Image size > OTA_MAX_IMAGE_SIZE is rejected
+    // OT01.E — Image size > the acceptance ceiling is rejected
     // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn validate_rejects_oversize_image() {
         let h = OtaHeader {
-            image_size: (OTA_MAX_IMAGE_SIZE + 1) as u32,
+            image_size: (TEST_MAX_IMAGE_SIZE + 1) as u32,
             ..good_header()
         };
-        assert!(!ota_validate_header(&h, OTA_PLATFORM_QEMU));
+        assert!(!ota_validate_header(&h, OTA_PLATFORM_QEMU, TEST_MAX_IMAGE_SIZE));
     }
 
     #[test]
     fn validate_accepts_image_at_exact_max_size() {
         let h = OtaHeader {
-            image_size: OTA_MAX_IMAGE_SIZE as u32,
+            image_size: TEST_MAX_IMAGE_SIZE as u32,
             ..good_header()
         };
-        assert!(ota_validate_header(&h, OTA_PLATFORM_QEMU));
+        assert!(ota_validate_header(&h, OTA_PLATFORM_QEMU, TEST_MAX_IMAGE_SIZE));
     }
 
     #[test]
@@ -156,13 +171,13 @@ mod tests {
             image_size: 0,
             ..good_header()
         };
-        assert!(!ota_validate_header(&h, OTA_PLATFORM_QEMU));
+        assert!(!ota_validate_header(&h, OTA_PLATFORM_QEMU, TEST_MAX_IMAGE_SIZE));
     }
 
     #[test]
     fn validate_rejects_compressed_flag_until_supported() {
         let h = OtaHeader { flags: OTA_FLAG_COMPRESSED, ..good_header() };
-        assert!(!ota_validate_header(&h, OTA_PLATFORM_QEMU));
+        assert!(!ota_validate_header(&h, OTA_PLATFORM_QEMU, TEST_MAX_IMAGE_SIZE));
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -179,6 +194,59 @@ mod tests {
         assert_eq!(outcome, BootValidateOutcome::Normal);
         assert_eq!(meta.boot_count, 1);
         assert_eq!(meta.active_slot, SLOT_B); // not yet rolled back
+    }
+
+    /// Regression: `boot_count` at `u32::MAX` must saturate, not overflow.
+    ///
+    /// `parse_u32_simple` saturates rather than rejecting, so
+    /// `boot_count=4294967295` in BOOTMETA survives parsing intact and
+    /// arrives here as a real value. The kernel builds with
+    /// `overflow-checks = true` and `panic = "abort"`, so the old
+    /// `meta.boot_count += 1` was a board reset on every boot — and
+    /// `ota_boot_validate()` runs unconditionally at boot, making it an
+    /// unrecoverable reset loop. BOOTMETA is writable over USB mass storage,
+    /// so this is reachable, not theoretical.
+    ///
+    /// NOTE: this test would abort the test process rather than fail if the
+    /// fix regressed, because the `+=` panics. `cargo test` reports that as a
+    /// failed test binary, which is the signal we want either way.
+    #[test]
+    fn boot_count_at_u32_max_saturates_instead_of_overflowing() {
+        let mut meta = BootMeta {
+            active_slot: SLOT_B, last_good: SLOT_A, boot_count: u32::MAX,
+            ..BootMeta::default()
+        };
+        let outcome = ota_boot_validate_pure(&mut meta, 3);
+        // u32::MAX > max_attempts, so the correct response is the rollback
+        // branch: return to last_good and restart the count at this attempt.
+        assert_eq!(outcome, BootValidateOutcome::RolledBack);
+        assert_eq!(meta.active_slot, SLOT_A);
+        assert_eq!(meta.boot_count, 1);
+    }
+
+    /// The saturation must hold for a value one below the ceiling too — that
+    /// is the case where a plain `+= 1` still fits and the *next* one does
+    /// not, i.e. the boot before the brick.
+    #[test]
+    fn boot_count_near_u32_max_rolls_back_without_wrapping() {
+        let mut meta = BootMeta {
+            active_slot: SLOT_B, last_good: SLOT_A, boot_count: u32::MAX - 1,
+            ..BootMeta::default()
+        };
+        let outcome = ota_boot_validate_pure(&mut meta, 3);
+        assert_eq!(outcome, BootValidateOutcome::RolledBack);
+        assert_eq!(meta.boot_count, 1);
+    }
+
+    /// A BOOTMETA carrying an out-of-range `boot_count` must round-trip
+    /// through the parser as `u32::MAX` (saturated) rather than wrapping —
+    /// this is the input half of the pair above, and the reason the value
+    /// can reach `ota_boot_validate_pure` at all.
+    #[test]
+    fn parser_saturates_absurd_boot_count_rather_than_wrapping() {
+        let text = b"active_slot=b\nboot_count=99999999999999999999\nlast_good=a\n";
+        let meta = parse_boot_meta(text);
+        assert_eq!(meta.boot_count, u32::MAX);
     }
 
     #[test]
@@ -287,10 +355,13 @@ mod tests {
             last_good:    SLOT_A,
             fw_version_a: 0x0100_0001,
             fw_version_b: 0x0100_0002,
+            fw_version_r: 0x0100_0000,
             image_size_a: 524288,
             image_size_b: 524300,
+            image_size_r: 524288,
             image_crc_a:  0xCAFE_BABE,
             image_crc_b:  0xDEAD_F00D,
+            image_crc_r:  0x1234_5678,
             min_fw_version: 0x0100_0001,
         };
 
@@ -325,6 +396,12 @@ mod tests {
         assert_eq!(meta.image_size_b, 200);
         assert_eq!(meta.image_crc_a,  300);
         assert_eq!(meta.image_crc_b,  400);
+        // OT04 — this text predates the `_r` fields entirely (as every
+        // BOOTMETA on disk today does). Absent keys must read back as 0,
+        // not panic or pick up garbage.
+        assert_eq!(meta.fw_version_r, 0);
+        assert_eq!(meta.image_size_r, 0);
+        assert_eq!(meta.image_crc_r,  0);
     }
 
     #[test]
@@ -356,17 +433,20 @@ mod tests {
     #[test]
     fn slot_helpers_on_bootmeta_pick_correct_field() {
         let meta = BootMeta {
-            fw_version_a: 1, fw_version_b: 2,
-            image_size_a: 10, image_size_b: 20,
-            image_crc_a: 100, image_crc_b: 200,
+            fw_version_a: 1, fw_version_b: 2, fw_version_r: 3,
+            image_size_a: 10, image_size_b: 20, image_size_r: 30,
+            image_crc_a: 100, image_crc_b: 200, image_crc_r: 300,
             ..BootMeta::default()
         };
         assert_eq!(meta.slot_version(SLOT_A), 1);
         assert_eq!(meta.slot_version(SLOT_B), 2);
+        assert_eq!(meta.slot_version(SLOT_R), 3);
         assert_eq!(meta.slot_size(SLOT_A),    10);
         assert_eq!(meta.slot_size(SLOT_B),    20);
+        assert_eq!(meta.slot_size(SLOT_R),    30);
         assert_eq!(meta.slot_crc(SLOT_A),     100);
         assert_eq!(meta.slot_crc(SLOT_B),     200);
+        assert_eq!(meta.slot_crc(SLOT_R),     300);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -399,10 +479,11 @@ mod tests {
                 active_slot: SLOT_B,
                 boot_count: 5,
                 last_good: SLOT_A,
-                fw_version_a: 1, fw_version_b: 2,
-                image_size_a: 100, image_size_b: 200,
+                fw_version_a: 1, fw_version_b: 2, fw_version_r: 3,
+                image_size_a: 100, image_size_b: 200, image_size_r: 300,
                 image_crc_a: 0xCAFE_BABE,
                 image_crc_b: 0xDEAD_F00D,
+                image_crc_r: 0xABCD_1234,
                 min_fw_version: 1,
             },
             seq: 42,
@@ -695,6 +776,111 @@ mod tests {
         // a writable A/B slot (not R itself).
         let inactive = ota_inactive_slot_pure(SLOT_R);
         assert!(inactive == SLOT_A || inactive == SLOT_B);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // OT04.B — BOOTMETA can now represent `active_slot`/`last_good` = R
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn active_slot_r_serializes_as_lowercase_r() {
+        let meta = BootMeta { active_slot: SLOT_R, ..BootMeta::default() };
+        let mut buf = [0u8; 512];
+        let n = serialize_boot_meta(&meta, &mut buf);
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.contains("active_slot=r\n"),
+            "expected 'active_slot=r' line, got: {text}");
+    }
+
+    #[test]
+    fn last_good_r_serializes_as_lowercase_r() {
+        let meta = BootMeta { last_good: SLOT_R, ..BootMeta::default() };
+        let mut buf = [0u8; 512];
+        let n = serialize_boot_meta(&meta, &mut buf);
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.contains("last_good=r\n"),
+            "expected 'last_good=r' line, got: {text}");
+    }
+
+    #[test]
+    fn parse_accepts_lowercase_and_uppercase_r() {
+        let lower = parse_boot_meta(b"active_slot=r\n");
+        let upper = parse_boot_meta(b"active_slot=R\n");
+        assert_eq!(lower.active_slot, SLOT_R);
+        assert_eq!(upper.active_slot, SLOT_R);
+    }
+
+    #[test]
+    fn parse_accepts_r_for_last_good_too() {
+        let meta = parse_boot_meta(b"last_good=r\n");
+        assert_eq!(meta.last_good, SLOT_R);
+    }
+
+    #[test]
+    fn bootmeta_r_serialize_parse_roundtrip() {
+        // Full roundtrip with active_slot=R AND populated `_r` fields —
+        // the state a hypothetical future factory-flashing tool would
+        // produce.
+        let original = BootMeta {
+            active_slot: SLOT_R,
+            last_good:   SLOT_R,
+            boot_count:  0,
+            fw_version_r: 0x0200_0000,
+            image_size_r: 1_048_576,
+            image_crc_r:  0x0BAD_F00D,
+            ..BootMeta::default()
+        };
+        let mut buf = [0u8; 512];
+        let n = serialize_boot_meta(&original, &mut buf);
+        let parsed = parse_boot_meta(&buf[..n]);
+        assert_eq!(original, parsed);
+        assert_eq!(parsed.slot_version(SLOT_R), 0x0200_0000);
+        assert_eq!(parsed.slot_size(SLOT_R),    1_048_576);
+        assert_eq!(parsed.slot_crc(SLOT_R),     0x0BAD_F00D);
+    }
+
+    #[test]
+    fn old_bootmeta_text_without_r_fields_parses_as_zero_and_stays_unselectable() {
+        // OT04 backward compatibility: a BOOTMETA written by pre-OT04 code
+        // (or any BOOTMETA where nothing has ever populated R, which is
+        // every BOOTMETA on disk today) has no `_r` keys at all. The
+        // parser must not choke on their absence, and the resulting
+        // `image_size_r == 0` is exactly the state that keeps
+        // `ota_verify_slot(SLOT_R)` (guarded by `expected_size == 0` in
+        // `crates/ota/src/lib.rs`) from ever treating R as verified.
+        let legacy_text = b"active_slot=b\n\
+                             boot_count=1\n\
+                             last_good=a\n\
+                             fw_version_a=1\n\
+                             fw_version_b=2\n\
+                             image_size_a=100\n\
+                             image_size_b=200\n\
+                             image_crc_a=10\n\
+                             image_crc_b=20\n";
+        let meta = parse_boot_meta(legacy_text);
+        assert_eq!(meta.fw_version_r, 0);
+        assert_eq!(meta.image_size_r, 0);
+        assert_eq!(meta.image_crc_r,  0);
+        assert_eq!(meta.slot_size(SLOT_R), 0);
+    }
+
+    #[test]
+    fn active_slot_r_read_by_pre_ot04_style_parser_would_be_a() {
+        // Documents the forward-compat / downgrade risk (not something
+        // this parser can fix): a NEW BOOTMETA with `active_slot=r`,
+        // read by an OLD parser that only recognizes "b" (else assumes
+        // "a"), would silently resolve to SLOT_A. We can't test the old
+        // parser here (it no longer exists in this tree), but we can
+        // pin the exact byte the new serializer emits, since that byte
+        // is the input the old parser's `val == b"b"` check would see.
+        let meta = BootMeta { active_slot: SLOT_R, ..BootMeta::default() };
+        let mut buf = [0u8; 512];
+        let n = serialize_boot_meta(&meta, &mut buf);
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        let line = text.lines().find(|l| l.starts_with("active_slot=")).unwrap();
+        assert_eq!(line, "active_slot=r");
+        // An old `if val == b"b" {SLOT_B} else {SLOT_A}` parser reading
+        // "r" takes the `else` branch: SLOT_A. That's the downgrade risk.
     }
 
     #[test]

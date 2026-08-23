@@ -1,0 +1,25 @@
+[package]
+name = "aarch64_hello"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "PHANES B1.boot — minimal aarch64 boot binary. Boots on qemu-system-aarch64 -M virt -cpu cortex-a72 and prints 'hello' through the PL011 UART. Proves the arch-aarch64 trait surface reaches actual silicon-class behaviour."
+
+# Excluded from the workspace because the workspace target is
+# riscv64gc-unknown-none-elf — this binary only makes sense for
+# aarch64-unknown-none-softfloat. Build + run with:
+#   make qemu-aarch64-hello
+
+[[bin]]
+name = "aarch64_hello"
+path = "src/main.rs"
+
+[dependencies]
+robot_os_arch_api     = { path = "../arch-api" }
+robot_os_arch_aarch64 = { path = "../arch-aarch64" }
+
+[profile.release]
+opt-level = 2
+debug     = true
+lto       = false
+panic     = "abort"

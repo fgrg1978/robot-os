@@ -81,6 +81,7 @@ fn cmd_help() {
     robot_os_drivers::kprintln!("  ps                - list current task");
     robot_os_drivers::kprintln!("  mem               - memory info");
     robot_os_drivers::kprintln!("  uptime            - system uptime ticks");
+    robot_os_drivers::kprintln!("  drvls             - list registered drivers (RFC-0002 registry)");
     robot_os_drivers::kprintln!("  ls [path]         - list directory");
     robot_os_drivers::kprintln!("  cat <path>        - print file");
     robot_os_drivers::kprintln!("  write <path> <t>  - write text to FAT32 file");
@@ -126,7 +127,7 @@ fn cmd_help() {
     robot_os_drivers::kprintln!("  range             - Phase M: rangefinder sensors (US+ToF)");
     robot_os_drivers::kprintln!("  nav [info]        - Phase N: navigation + waypoints");
     robot_os_drivers::kprintln!("  csi               - Phase M2: CSI camera info");
-    robot_os_drivers::kprintln!("  wifi [info|connect|disconnect] - Phase O: WiFi (ESP32-C3)");
+    robot_os_drivers::kprintln!("  wifi [info|connect|disconnect] - Phase O: WiFi (API stub)");
     robot_os_drivers::kprintln!("  spi info          - SPI bus info");
     robot_os_drivers::kprintln!("  can [info|send|recv] - CAN bus");
     robot_os_drivers::kprintln!("  dma info          - DMA controller info");
@@ -157,6 +158,37 @@ fn cmd_mem() {
 fn cmd_uptime() {
     let ticks = robot_os_drivers::clint::get_time();
     robot_os_drivers::kprintln!("[UPTIME] {} ticks (~{} ms)", ticks, ticks / 10000);
+}
+
+/// A4.next.2 — list registered drivers from the runtime registry
+/// (RFC-0002). Walks every kind ID 0..256 and prints the manifest
+/// of any driver currently registered.
+///
+/// Equivalent to `cat /sys/drivers` (which A4.next wired up via
+/// procfs); this gives the same view interactively without needing
+/// `cat` + an FS lookup, useful early in boot before procfs is
+/// mounted or when the FS is unhealthy.
+fn cmd_drvls() {
+    use robot_os_drivers::api::DriverIsolation;
+    use robot_os_drivers::runtime::registry::REGISTRY;
+    let reg = REGISTRY.lock();
+    let mut shown = 0u32;
+    for kind in 0u32..0x100 {
+        if let Some(d) = reg.find_by_kind(kind) {
+            let m = d.manifest();
+            let iso = match m.isolation {
+                DriverIsolation::InKernel       => "inkernel",
+                DriverIsolation::UserProcess { .. } => "userproc",
+                DriverIsolation::Hypervisor     => "hypervisor",
+            };
+            robot_os_drivers::kprintln!(
+                "[DRV] 0x{:04x}  {:<16}  {}  perms=0x{:02x}",
+                m.kind, m.name, iso, m.required_perms.bits(),
+            );
+            shown += 1;
+        }
+    }
+    robot_os_drivers::kprintln!("[DRV] {} drivers registered", shown);
 }
 
 fn cmd_ls(args: &[&[u8]; MAX_ARGS], argc: usize) {
@@ -432,8 +464,10 @@ fn cmd_exec(args: &[&[u8]; MAX_ARGS], argc: usize) {
         return;
     }
     // The shell is a kernel task — it cannot rely on the ecall/SRET mechanism.
-    // Instead, we take the prepared ExecContext and SRET to U-mode directly.
-    if let Some(ctx) = robot_os_sched::take_pending_exec() {
+    // Instead, we take the prepared hand-off and SRET to U-mode directly
+    // (K-C21: it lives on THIS task's own slot, and the taker has already
+    // installed the new satp — sret_to_user just re-writes the same value).
+    if let Some(ctx) = robot_os_sched::take_current_task_exec_ctx() {
         robot_os_drivers::kprintln!("[EXEC] SRET to user-space entry={:#x}", ctx.entry);
         unsafe {
             robot_os_sched::sret_to_user(
@@ -967,7 +1001,7 @@ fn cmd_ota_status() {
         robot_os_ota::OTA_PLATFORM_QEMU => "QEMU",
         robot_os_ota::OTA_PLATFORM_VF2  => "VisionFive 2",
         robot_os_ota::OTA_PLATFORM_K1   => "SpacemiT K1",
-        _ => "ESP32-C3",
+        _ => "unknown",
     });
 }
 
@@ -1151,18 +1185,45 @@ fn cmd_ota_recv(port: u16) {
         };
 
         // Validate header (platform, size bounds).
-        if !robot_os_ota::ota_validate_header(&hdr, platform) {
+        if !robot_os_ota::ota_validate_header(&hdr, platform,
+                                              robot_os_ota::OTA_MAX_IMAGE_SIZE) {
             robot_os_drivers::kprintln!("[OTA] Header validation failed (platform={}, size={})",
                 hdr.platform_id, hdr.image_size);
             robot_os_net::socket_close(cfd);
             continue 'accept_loop;
         }
 
-        // OT03 anti-rollback: reject firmware older than the floor.
+        // OT03 anti-rollback — ADVISORY ONLY. Read the comment before
+        // trusting this gate to do what its name says.
+        //
+        // Both of its inputs are attacker-controlled:
+        //
+        //  * `hdr.fw_version` is byte 16 of the 24-byte wire header. That
+        //    header is NOT signed and NOT covered by any signature we hold —
+        //    `FirmwareSignature` (crates/crypto/src/ed25519.rs) is magic /
+        //    algorithm / pubkey / signature / payload_size, with no version
+        //    field, and the signature itself is computed over the raw image
+        //    bytes only. So the sender picks this number freely: replaying a
+        //    genuinely-signed OLD image with `fw_version = 0xFFFFFFFF`
+        //    sails through here.
+        //  * `min_fw_version` comes from BOOTMETA, which lives on the FAT
+        //    volume `msc_gadget.rs` exports over USB mass storage. An
+        //    attacker with the USB port rewrites the floor to 0; if both
+        //    dual-file records are destroyed, `ota_read_boot_meta()`'s
+        //    unauthenticated legacy fallback hands back 0 anyway.
+        //
+        // It is kept because it costs nothing and rejects the honest-mistake
+        // case (an operator pushing a stale build) at the cheapest possible
+        // point — before a multi-MiB transfer. It is NOT the security gate.
+        // The gate that actually decides whether this image goes live is the
+        // Ed25519 verification of the staged payload further down; a version
+        // floor cannot be enforced against a signature that does not cover a
+        // version. See the report / OWNER DECISION note on binding the
+        // version into a signed manifest.
         let current_meta = robot_os_ota::ota_read_boot_meta();
         if !robot_os_ota::ota_check_rollback_pure(hdr.fw_version, current_meta.min_fw_version) {
             robot_os_drivers::kprintln!(
-                "[OTA] Anti-rollback: incoming fw={} < floor={} — rejected",
+                "[OTA] Anti-rollback (advisory): incoming fw={} < floor={} — rejected",
                 hdr.fw_version, current_meta.min_fw_version);
             robot_os_net::socket_close(cfd);
             continue 'accept_loop;
@@ -1248,6 +1309,110 @@ fn cmd_ota_recv(port: u16) {
         return;
     }
 
+    // ── F18 — authenticate the image BEFORE it is allowed anywhere near a
+    //          live slot. This is the gate; CRC-32 above is not one.
+    //
+    // Everything checked up to this point (magic, version, platform, size,
+    // flags, the version floor, and the CRC just above) is computed by the
+    // *sender*. CRC-32 is an integrity check against a noisy link, not an
+    // authenticator: anyone who can open a TCP connection to this port can
+    // produce a payload whose CRC matches, because they choose both. Without
+    // the check below, reaching this line meant "an arbitrary remote peer's
+    // kernel image is now the one this board boots" — unauthenticated remote
+    // code execution on a robot.
+    //
+    // Two properties matter about WHERE this check sits:
+    //
+    //  1. BEFORE `ota_promote_tmp_to_bin`. Verifying after promotion would
+    //     be far too late: promotion is what destroys the rollback target.
+    //     `target_slot` is the inactive slot, which is normally `last_good`
+    //     — the exact image `ota_boot_validate_pure()`'s boot-loop rollback
+    //     and `ota rollback` fall back to. If a refused update had already
+    //     overwritten it, merely *reaching* this port would destroy the
+    //     device's fallback without ever touching `active_slot`, turning the
+    //     next failure of the active slot into an unrecoverable brick. By
+    //     verifying `KERN_{A,B}.TMP`, a refused image leaves
+    //     `KERN_{A,B}.BIN` byte-identical to what it was.
+    //  2. BEFORE `meta.active_slot = target_slot`. On a
+    //     `secure-boot-enforced` build the boot gate in `kernel/src/main.rs`
+    //     halts at `loop { wfi() }` for anything that is not
+    //     `BootTrust::Verified`. Flipping the boot slot to an image that
+    //     gate will refuse is not a security failure, it is a brick — and it
+    //     would have happened on a perfectly legitimate update, because
+    //     nothing in this tree writes the `.SIG` sidecar yet. Refusing here
+    //     converts that brick into a recoverable "update rejected".
+    //
+    // Policy deliberately mirrors the boot gate's, and for the same reason
+    // it uses `secure_boot_enforced_at_compile_time()` rather than the
+    // runtime-relaxable `secure_boot_require_signature()`: the decision to
+    // *install* must agree with the decision to *boot*, or an enforced build
+    // can be talked into staging an image it will then refuse to run.
+    // Flush before verifying. The payload was written through `vfs_*` on the
+    // `/fat` mount point; the verifier reads the same file through
+    // `fat32_open()` on the volume root (`/KERN_X.TMP` — see
+    // `SECURE_BOOT_TMP_PATH_*` for why the prefixes differ). Both go through
+    // the one FAT32 driver, so this is belt-and-braces rather than strictly
+    // required — but "the bytes I verify are the bytes on disk" is not a
+    // property worth inferring from cache-layer reasoning on the path that
+    // decides whether unauthenticated code gets to run.
+    let _ = robot_os_fs::fat32_sync();
+
+    let (trust, trust_reason) =
+        robot_os_ota::secure_boot_verify_staged_detailed(target_slot, header.image_size);
+    let enforced = robot_os_ota::secure_boot_enforced_at_compile_time();
+
+    if trust != robot_os_ota::BootTrust::Verified {
+        // `Failed` means a `.SIG` IS present and does not verify (wrong key,
+        // wrong contents), or the image cannot be verified at all
+        // (`ImageTooLargeToVerify`). Refuse that in BOTH build flavours: a
+        // signature that is present and wrong is evidence, not an absence,
+        // and promoting over the rollback target on that evidence is never
+        // the right trade. Note this cannot fire on a dev build — with the
+        // all-zero `SECURE_BOOT_PUBKEY` the verifier short-circuits to
+        // `Unverified`/`NoTrustedKey` before ever reading a `.SIG`.
+        if enforced || trust == robot_os_ota::BootTrust::Failed {
+            robot_os_drivers::kprintln!(
+                "[OTA] REFUSED: staged image for slot {} is {} ({}) — \
+                 {}; live slot left untouched, deleting .TMP",
+                if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' },
+                trust.as_str(), trust_reason.as_str(),
+                if enforced {
+                    "secure-boot-enforced is compiled in, refusing to install"
+                } else {
+                    "a present-but-invalid or unverifiable signature is never installed"
+                });
+            // Name the sidecar by slot letter rather than printing the path
+            // slice: `secure_boot_sig_path` returns `&[u8]`, which `{:?}`
+            // renders as a list of decimal byte values — useless in a log.
+            robot_os_drivers::kprintln!(
+                "[OTA] REFUSED: sign the image with tools/sign_ota.py and place \
+                 the sidecar at /KERN_{}.SIG (FAT32 volume root) before retrying",
+                if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
+            let _ = robot_os_fs::fat32_unlink_path(target_path);
+            return;
+        }
+
+        // Not enforced, and no usable signature was found at all. Install —
+        // this is the dev/QEMU path and the pre-key-rollout path — but say so
+        // unmistakably. "CRC OK" must never be mistaken for "authenticated".
+        robot_os_drivers::kprintln!(
+            "[OTA] ##### WARNING: INSTALLING AN UNAUTHENTICATED IMAGE #####");
+        robot_os_drivers::kprintln!(
+            "[OTA] ##### trust={} reason={}",
+            trust.as_str(), trust_reason.as_str());
+        robot_os_drivers::kprintln!(
+            "[OTA] ##### This image's origin is UNPROVEN — CRC-32 is computed \
+             by the sender and authenticates nothing. Anyone who can reach \
+             this TCP port can install code that runs as this robot's kernel.");
+        robot_os_drivers::kprintln!(
+            "[OTA] ##### Do NOT ship a build in this state: install a prod key \
+             (tools/gen_prod_key.py) and build --features secure-boot-enforced.");
+    } else {
+        robot_os_drivers::kprintln!(
+            "[OTA] Signature VERIFIED for staged slot {} image",
+            if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
+    }
+
     // OT02.A — promote .TMP to .BIN. FAT32 has no atomic rename so the
     // pattern is: unlink old .BIN (if any), then write the .TMP contents
     // to .BIN. Power-loss between unlink and final-write means the slot
@@ -1264,7 +1429,22 @@ fn cmd_ota_recv(port: u16) {
     robot_os_drivers::kprintln!("[OTA] CRC OK — {} bytes written to slot {}",
         total_written, if target_slot == robot_os_ota::SLOT_A { 'A' } else { 'B' });
 
-    // Update boot metadata: switch to new slot, record CRC + size for verify
+    // Update boot metadata: switch to new slot, record CRC + size for verify.
+    //
+    // Reaching this line means the image either verified, or is an
+    // `Unverified` install on a build that has explicitly not opted into
+    // enforcement (and screamed about it above). Only now is `active_slot`
+    // allowed to move.
+    //
+    // CAVEAT on the version fields, for whoever reads this next:
+    // `header.fw_version` is still the unsigned, sender-chosen number from the
+    // wire header (see the anti-rollback comment in the accept loop). Recording
+    // it here is what later lets `ota_mark_boot_good_pure()` raise
+    // `min_fw_version` to it — so on an install path that is not signature-
+    // gated, a peer who sends `fw_version = 0xFFFFFFFF` does not just bypass
+    // the floor, it PINS the floor at u32::MAX once the boot is marked good,
+    // permanently rejecting every future legitimate update. Closing that needs
+    // the version bound into something signed; it cannot be fixed here.
     let mut meta = robot_os_ota::ota_read_boot_meta();
     meta.active_slot = target_slot;
     meta.boot_count = 0;
@@ -1838,7 +2018,6 @@ fn parse_ip_shell(s: &[u8]) -> Option<[u8; 4]> {
 // ── Phase D: PMP + WDT + fuzz commands ────────────────────────────────────────
 
 /// Show the Robot OS PMP memory-protection policy (informational; M-mode only to enforce).
-#[cfg(not(feature = "esp32c3"))]
 fn cmd_pmp() {
     use robot_os_arch::pmp;
     // Use platform kernel-load address as firmware_end; PMM watermark as proxy for heap.
@@ -1856,10 +2035,6 @@ fn cmd_pmp() {
             if r.perm.x { "X" } else { "-" });
     }
 }
-#[cfg(feature = "esp32c3")]
-fn cmd_pmp() {
-    robot_os_drivers::kprintln!("[PMP] Not available on ESP32-C3 (no PMP in M-mode stub)");
-}
 
 /// Show hardware watchdog status.
 fn cmd_wdt() {
@@ -1875,6 +2050,47 @@ fn cmd_wdt() {
 }
 
 /// WCET report and jitter statistics (F16).
+/// `bench [subsystem|all] [iters]` — run synthetic kernel microbenches.
+///
+/// Each subsystem emits one `[BENCH-RES] <subsystem>.<name> iters=N
+/// min_cycles=… max_cycles=… avg_cycles=… total_cycles=…` line per
+/// microbench.  The bench harness parses these into the bench JSON.
+///
+/// Defaults: `bench all` with `iters=1000`.  Override iters with the
+/// second arg, e.g. `bench ipc 100` or `bench all 5000`.
+fn cmd_bench(args: &[&[u8]; MAX_ARGS], argc: usize) {
+    let subsystem: &[u8] = if argc >= 2 { args[1] } else { b"all" };
+    let iters: u64 = if argc >= 3 {
+        // Quick decimal parse; fallback to default on garbage.
+        let mut n = 0u64;
+        for &b in args[2] {
+            if !b.is_ascii_digit() { n = 0; break; }
+            n = n.saturating_mul(10).saturating_add((b - b'0') as u64);
+        }
+        if n == 0 { robot_os_bench::DEFAULT_ITERS } else { n }
+    } else {
+        robot_os_bench::DEFAULT_ITERS
+    };
+
+    let emitted = match subsystem {
+        b"all"    => robot_os_bench::run_all(iters),
+        b"ipc"    => robot_os_bench::ipc::run(iters),
+        b"mm"     => robot_os_bench::mm::run(iters),
+        b"sched"  => robot_os_bench::sched::run(iters),
+        b"net"    => robot_os_bench::net::run(iters),
+        b"fs"     => robot_os_bench::fs::run(iters),
+        b"crypto" => robot_os_bench::crypto::run(iters),
+        b"auth"   => robot_os_bench::auth::run(iters),
+        _         => {
+            robot_os_drivers::kprintln!(
+                "[BENCH] unknown subsystem; valid: all ipc mm sched net fs crypto auth",
+            );
+            0
+        }
+    };
+    let _ = emitted;
+}
+
 fn cmd_wcet(args: &[&[u8]; MAX_ARGS], argc: usize) {
     if argc >= 2 && args[1] == b"reset" {
         robot_os_drivers::wcet::wcet_reset_all();
@@ -2208,7 +2424,12 @@ fn cmd_dhcp() {
 #[cfg(not(feature = "no-mmu"))]
 fn cmd_fork() {
     robot_os_drivers::kprintln!("[FORK] Calling sys_fork_impl()...");
-    let rc = robot_os_sched::process::sys_fork_impl();
+    // Debug shell command, not a real ecall trap — there is no genuine
+    // sepc/user_sp to thread through. The forked child's sret target is
+    // meaningless here; this exercises fork's kernel-side bookkeeping only.
+    // K-C11: likewise no genuine register file — a zeroed one is consistent
+    // with the zeroed sepc/user_sp above.
+    let rc = robot_os_sched::process::sys_fork_impl(0, 0, &[0u64; 32]);
     robot_os_drivers::kprintln!("[FORK] Result: {}", rc);
 }
 
@@ -2254,6 +2475,7 @@ pub fn shell_run() -> ! {
                 else if cmd == b"ps"       { cmd_ps(); }
                 else if cmd == b"mem"      { cmd_mem(); }
                 else if cmd == b"uptime"   { cmd_uptime(); }
+                else if cmd == b"drvls"    { cmd_drvls(); }
                 else if cmd == b"ls"       { cmd_ls(&args, argc); }
                 else if cmd == b"cat"      { cmd_cat(&args, argc); }
                 else if cmd == b"write"    { cmd_write(&args, argc); }
@@ -2319,6 +2541,7 @@ pub fn shell_run() -> ! {
                 }
                 else if cmd == b"crash"    { cmd_crash(&args, argc); }
                 else if cmd == b"wcet"     { cmd_wcet(&args, argc); }
+                else if cmd == b"bench"    { cmd_bench(&args, argc); }
                 else if cmd == b"shutdown" { cmd_shutdown(); }
                 else if cmd == b"reboot"   { cmd_reboot(); }
                 else {

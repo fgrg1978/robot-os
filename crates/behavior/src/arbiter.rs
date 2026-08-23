@@ -5,6 +5,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::types::*;
 use crate::layers;
+use wcet_macro::wcet;
 
 /// Per-layer enable flags.  Index 0 is always true.
 static LAYER_ENABLED: [AtomicBool; NUM_LAYERS] = [
@@ -27,6 +28,7 @@ pub const LAYER_NAMES: [&str; NUM_LAYERS] = [
 
 /// Run the subsumption arbiter.  Iterates L0→L3; first layer that produces
 /// a valid output wins.
+#[wcet(80_us)]
 pub fn arbitrate(state: &SensorState, _mlp: &MlpResult) -> BehaviorOutput {
     // L0: emergency stop — always runs, cannot be disabled
     {

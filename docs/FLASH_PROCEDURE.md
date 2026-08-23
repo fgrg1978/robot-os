@@ -46,7 +46,7 @@ This produces `target/riscv64imac-unknown-none-elf/release/robot_os_kernel`
 | vf2 | `cargo build --release --features vf2` | VisionFive 2 (JH7110) |
 | k1 | `cargo build --release --features k1` | SpacemiT K1 |
 | no-ml | `cargo build --release --features no-ml` | Boards without ML |
-| no-mmu | `cargo build --release --features no-mmu` | ESP32-C3 |
+| no-mmu | `cargo build --release --features no-mmu` | MMU-less builds / bare-metal debug |
 
 For VisionFive 2 specifically:
 

@@ -13,7 +13,7 @@ pub mod trajectory;
 
 pub use pid::{Pid, Fixed, FIXED_ONE, fixed_mul, fixed_to_i32};
 pub use motor::{
-    motor_init, motor_set, motor_stop, motor_brake, motor_info,
+    motor_init, motor_set, motor_stop, motor_stop_panic, motor_brake, motor_info,
     Motor, MotorDir, MAX_MOTORS,
 };
 pub use encoder::{

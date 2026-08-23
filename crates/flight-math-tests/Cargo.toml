@@ -1,0 +1,13 @@
+[package]
+name = "robot_os_flight_math_tests"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side unit tests for robot_os_flight_math (D04 trig + wind estimator). Excluded from workspace. Run with: cd crates/flight-math-tests && cargo test"
+license = "Apache-2.0"
+
+# Mirror of dfu-tests / ota-tests pattern. Run with:
+#   cd crates/flight-math-tests && cargo test
+# Pinned to stable via rust-toolchain.toml.
+
+[dependencies]
+robot_os_flight_math = { path = "../flight-math" }

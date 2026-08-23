@@ -234,11 +234,11 @@ pub fn can_send(frame: &CanFrame) -> i32 {
         // Loopback: TX appears in RX if filter matches
         if drv.matches_filter(frame) {
             drv.rx_push(*frame);
-            drv.rx_count += 1;
+            drv.rx_count = drv.rx_count.wrapping_add(1);
         }
     }
 
-    drv.tx_count += 1;
+    drv.tx_count = drv.tx_count.wrapping_add(1);
     0
 }
 

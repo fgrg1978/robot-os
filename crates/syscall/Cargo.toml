@@ -2,8 +2,10 @@
 name = "robot_os_syscall"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [dependencies]
+robot_os_abi = { workspace = true }
 robot_os_sched = { workspace = true }
 robot_os_mm = { workspace = true }
 robot_os_fs = { workspace = true }
@@ -18,3 +20,14 @@ robot_os_imu = { workspace = true }
 robot_os_gps = { workspace = true }
 robot_os_common = { workspace = true }
 robot_os_driver_server = { workspace = true }
+
+[features]
+# Traza del camino rápido de IPC. Apagada por defecto: imprime por cada
+# CALL/ACCEPT/REPLY, y `write` a la UART cuesta ~160 us por 64 bytes en QEMU,
+# asi que encenderla cambia por completo la temporizacion que se investiga.
+# Se activa desde el kernel con --features ipc-trace.
+ipc-trace = []
+# Censo periodico del estado de las ranuras de fast-IPC. Independiente de
+# ipc-trace A PROPOSITO: la traza por intercambio perturba la temporizacion lo
+# bastante para esconder la carrera que el censo existe para diagnosticar.
+ipc-census = []

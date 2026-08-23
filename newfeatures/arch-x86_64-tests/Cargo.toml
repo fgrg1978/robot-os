@@ -1,0 +1,23 @@
+[package]
+name = "robot_os_arch_x86_64_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side unit tests for arch-x86_64 pure logic — MADT parser (B2.acpi) and any future host-portable helpers. Excluded from workspace."
+
+# Mirror of crates/ota-tests / crates/topology-tests / crates/abi-tests:
+# excluded from the workspace so cargo builds for the host triple
+# (Apple Silicon) instead of the riscv64-none-elf the kernel uses.
+#
+# Run with:
+#   cd crates/arch-x86_64-tests && cargo +stable test
+#
+# IMPORTANT: must use `+stable`. The repo's pinned nightly inherits
+# the workspace `[unstable] build-std = ["core", "alloc"]` setting
+# even with `build-std = []` here, which then double-links `core`
+# and trips `E0152: duplicate lang item`. Stable doesn't accept the
+# `-Z` flag so cargo skips build-std entirely — same workaround
+# `crates/ota-tests` and the other host-test crates need today.
+
+[dependencies]
+bitflags = "2"

@@ -1,0 +1,256 @@
+# Kconfig.timing — Scheduler, WCET, networking timers, watchdog
+#
+# RFC-0026 Phase C1.  All timing/WCET constants with per-arch and per-profile
+# defaults matching the current codebase values.
+
+menu "Timing & WCET"
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+config SCHED_HZ
+    int "Scheduler tick frequency (Hz)"
+    range 10 1000
+    default 100  if PROFILE_EMBEDDED
+    default 100  if PROFILE_EDGE && BOARD_QEMU
+    default 250  if PROFILE_EDGE && BOARD_VF2
+    default 250  if PROFILE_EDGE && BOARD_K1
+    default 500  if PROFILE_FLEET
+    default 100
+    help
+      Periodic timer interrupt rate.  Drives RR scheduler preemption,
+      WDT kick, and tickless-idle `set_next_tick_smart`.
+      Higher SCHED_HZ reduces task-switch latency but increases ISR
+      overhead.  QEMU TCG amplifies ISR cost ~5× — keep it lower there.
+      Current codebase: 100 Hz (crates/drivers/src/clint.rs AtomicU32).
+
+config DEFAULT_QUANTUM_US
+    int "Round-robin default quantum (μs)"
+    range 100 1000000
+    default 20000 if PROFILE_EMBEDDED
+    default 10000 if PROFILE_EDGE
+    default 5000  if PROFILE_FLEET
+    help
+      Time slice length for SCHED_RR tasks.  Tasks consuming a full
+      quantum are preempted and put at the back of their priority queue.
+      Current codebase: 10 000 μs (crates/sched/src/policies/rr.rs).
+
+config TIME_SLICE_TICKS
+    int "Ticks per RR time-slice"
+    range 1 1000
+    default 1
+    help
+      Number of SCHED_HZ ticks that constitute one RR quantum.
+      The actual quantum duration = TIME_SLICE_TICKS / SCHED_HZ seconds.
+      Usually 1 (one tick = one preemption opportunity).
+      Current codebase: 1 (crates/sched/src/task.rs TIME_SLICE_TICKS).
+
+# ---------------------------------------------------------------------------
+# Scheduler backend selection
+# ---------------------------------------------------------------------------
+
+choice
+    prompt "Default scheduler backend"
+    default SCHED_BACKEND_LEGACY
+    help
+      Which dispatch backend the scheduler boots with.  Selected at config
+      time; the typed registry (crates/sched/src/runtime/registry.rs) can
+      still switch at runtime via `use_aps_dispatch(bool)`.  Only Legacy
+      and APS have a live dispatch path today; the per-policy standalone
+      backends (FIFO/EDF/RR/CFS/Sporadic) are reserved for a future phase
+      and are not offered here yet.
+
+      Surfaces as `robot_os_limits::SCHED_BACKEND_APS` (bool: true = APS,
+      false = Legacy).  The boot path in kernel/src/main.rs reads this const
+      and calls `robot_os_sched::use_aps_dispatch()` once, after the
+      diagnostic smoke-test, before `start()`.
+
+    config SCHED_BACKEND_LEGACY
+        bool "Legacy priority-queue (default, production)"
+        help
+          The original priority-queue scheduler.  Validated, always-available
+          default.  Recommended for all production use today.
+
+    config SCHED_BACKEND_APS
+        bool "APS — Adaptive Partitioning (EXPERIMENTAL, smoke-tested only)"
+        help
+          Class-first Adaptive Partitioning combinator.  Wired into the live
+          dispatch path but only smoke-tested — NOT validated as a production
+          dispatcher (it falls back to Legacy on any per-tick error).  Select
+          only for development or experimentation; do not use in production.
+
+endchoice
+
+# ---------------------------------------------------------------------------
+# WCET budgets
+# ---------------------------------------------------------------------------
+
+config WCET_BOUND_PID_US
+    int "PID loop WCET bound (μs)"
+    range 1 100000
+    default 50  if ARCH_RISCV64 && BOARD_K1
+    default 80  if ARCH_RISCV64 && BOARD_VF2
+    default 30  if ARCH_AARCH64
+    default 25  if ARCH_X86_64
+    default 50
+    help
+      If the PID loop ISR runs longer than this, the WCET subsystem
+      logs a violation.  Based on measured rdcycle counts on each
+      platform.  Current codebase: 50 μs (crates/drivers/src/wcet.rs).
+
+config WCET_BOUND_SENSOR_US
+    int "Sensor read WCET bound (μs)"
+    range 1 100000
+    default 100
+    help
+      Maximum allowed wall time for a sensor driver poll callback.
+      Violations indicate a driver blocking on a stuck I2C/SPI bus.
+      Current codebase: 100 μs (crates/drivers/src/wcet.rs).
+
+config WCET_BOUND_CTX_SWITCH_US
+    int "Context switch WCET bound (μs)"
+    range 1 10000
+    default 5
+    help
+      Maximum allowed time to save/restore a full task context.
+      Includes FP register save area flush.  Should be well under
+      DEFAULT_QUANTUM_US / 1000.
+      Current codebase: 5 μs (crates/drivers/src/wcet.rs).
+
+config WCET_BOUND_TIMER_ISR_US
+    int "Timer ISR WCET bound (μs) — 0 = disabled"
+    range 0 100000
+    default 0  if BOARD_QEMU
+    default 10
+    help
+      Timer IRQ top-half WCET budget.  Set to 0 under QEMU because
+      rdcycle under TCG SMP measures wall-virtual-time (not work-time),
+      producing spurious violations.  On real hardware: 10 μs.
+      Current codebase: 0 under `qemu` feature, 10 otherwise.
+
+config WCET_BOUND_ACTUATOR_US
+    int "Actuator write WCET bound (μs)"
+    range 1 100000
+    default 10
+    help
+      Maximum allowed time to push a motor command out through the
+      PWM / motor-PID pathway.  Violations indicate blocked I2C or
+      SPI writes.  Current codebase: 10 μs (crates/drivers/src/wcet.rs).
+
+# ---------------------------------------------------------------------------
+# TCP / networking timers
+# ---------------------------------------------------------------------------
+
+config RTO_INITIAL_MS
+    int "TCP RTO initial value (ms)"
+    range 100 30000
+    default 1000
+    help
+      Initial retransmission timeout before the first measured RTT.
+      RFC 6298 recommends 1 second.  Reducing this makes the first
+      retransmit faster but can cause spurious retransmits on high-
+      latency links.  Current codebase: 1000 ms (crates/net/src/tcp.rs).
+
+config RTO_MIN_MS
+    int "TCP RTO minimum (ms)"
+    range 10 5000
+    default 200
+    help
+      Lower bound on RTO after RTT measurement.  Linux uses 200 ms.
+      Prevents the RTO shrinking below link latency on fast local nets.
+      Current codebase: 200 ms.
+
+config RTO_MAX_MS
+    int "TCP RTO maximum (ms)"
+    range 1000 300000
+    default 60000
+    help
+      Upper bound on exponential backoff.  RFC 6298 recommends 60 s.
+      Caps retransmit storms on severely congested or intermittent links.
+      Current codebase: 60 000 ms.
+
+config RETX_MAX_ATTEMPTS
+    int "TCP retransmit attempts before RST"
+    range 1 255
+    default 8
+    help
+      Number of consecutive RTO expirations before the connection is
+      aborted with RST.  Balances responsiveness vs. resilience on
+      unreliable wireless links.
+      Current codebase: 8 (crates/net/src/tcp.rs).
+
+config KEEPALIVE_INTERVAL_TICKS
+    int "TCP keepalive probe interval (timer ticks)"
+    range 1 4294967295
+    default 300000000
+    help
+      Idle time (in CLINT/generic-timer ticks) before the first keepalive
+      probe is sent.  300 000 000 ticks at 10 MHz = 30 s.
+      Current codebase: 30 × 10_000_000 ticks (30 s at 10 MHz).
+
+config KEEPALIVE_MAX_PROBES
+    int "TCP keepalive maximum probes before close"
+    range 1 255
+    default 3
+    help
+      Number of unanswered keepalive probes before the connection is
+      declared dead and RST.  3 probes × KEEPALIVE_INTERVAL = 90 s
+      total dead-connection detection time at default settings.
+      Current codebase: 3.
+
+# ---------------------------------------------------------------------------
+# Robot / behavior timers
+# ---------------------------------------------------------------------------
+
+config OFFLINE_RECONNECT_INTERVAL_TICKS
+    int "Offline mode reconnect attempt interval (timer ticks)"
+    range 1000000 4294967295
+    default 50000000
+    help
+      How often the offline autonomy module retries connecting to the
+      brain server.  50 000 000 ticks at 10 MHz = 5 s.
+      Current codebase: 50_000_000 (crates/behavior/src/offline.rs).
+
+config SAFETY_COMMS_TIMEOUT_TICKS
+    int "Safety comms watchdog timeout (timer ticks)"
+    range 1000000 4294967295
+    default 50000000
+    help
+      If no heartbeat packet is received from the brain server within
+      this many ticks, the safety module triggers an ESTOP.
+      50 000 000 ticks at 10 MHz = 5 s.
+      Current codebase: 50_000_000 (crates/behavior/src/safety.rs).
+
+config SAFETY_DRONE_COMMS_TIMEOUT_TICKS
+    int "Drone comms watchdog timeout (timer ticks)"
+    range 1000000 4294967295
+    default 30000000
+    help
+      Drone-specific comms loss timeout.  Tighter than the wheeled robot
+      timeout because loss of control of an airborne robot is more
+      dangerous.  30 000 000 ticks at 10 MHz = 3 s.
+      Current codebase: 30_000_000 (crates/behavior/src/safety.rs).
+
+config PID_DT_MS
+    int "Motor PID loop delta-T (ms)"
+    range 1 1000
+    default 10
+    help
+      Time step between PID controller invocations.  10 ms = 100 Hz
+      control loop.  Must be consistent with the timer interrupt
+      period driving the motor update callback.
+      Current codebase: 10 ms (crates/drivers/src/motor_pid.rs).
+
+config WDT_TIMEOUT_MS
+    int "Hardware watchdog timeout (ms)"
+    range 100 60000
+    default 500
+    help
+      Hardware WDT must be kicked within this period or the SoC resets.
+      500 ms gives ~50 missed scheduler ticks at 100 Hz before reset.
+      Must be > DEFAULT_QUANTUM_US × MAX_TASKS × 2 to avoid spurious
+      resets under heavy CPU load.
+      Current codebase runtime default: 500 ms (CFG_WATCHDOG_MS).
+
+endmenu # Timing & WCET

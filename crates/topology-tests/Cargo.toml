@@ -1,0 +1,43 @@
+[package]
+name = "robot_os_topology_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for the W2 topology parser and the P1 topology->cap_store cap-seed bridge. Excluded from workspace."
+
+# Excluded from workspace; run with:
+#   cd crates/topology-tests && cargo test
+#
+# The local .cargo/config.toml overrides the workspace target so this
+# builds for aarch64-apple-darwin (precompiled std/core/alloc).
+
+# `cap.rs` carries `#[cfg(kani)]` proof harnesses; the kernel's own
+# `crates/ipc/Cargo.toml` declares the same check-cfg. Without it the host
+# build emits an `unexpected_cfg` warning, and warnings count as failures in
+# this project (see `crates/cap-tests/Cargo.toml`, same reason).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
+
+[dependencies]
+robot_os_abi = { path = "../abi" }
+robot_os_crypto = { path = "../crypto" }
+robot_os_topology = { path = "../topology" }
+
+# P1 cap-seed bridge suite: `crates/ipc/src/{cap,cap_store,gpio_cap,i2c_cap,
+# pwm_cap,motor_cap,cap_seed}.rs` are pulled in via `#[path]` (see
+# `src/lib.rs`), same trick as `crates/cap-tests`. `cap.rs` needs these two;
+# `cap_store.rs` needs `robot_os_sync`/`robot_os_sched` (shimmed below);
+# `gpio_cap.rs`/`i2c_cap.rs`/`pwm_cap.rs`/`motor_cap.rs` need
+# `robot_os_drivers` (shimmed below — the real one is RV64-only).
+robot_os_degrade_policy = { path = "../degrade-policy" }
+wcet-macro = { path = "../wcet-macro" }
+robot_os_limits = { path = "../limits" }
+
+# Host stand-ins for the three RV64-only kernel crates the pulled-in ipc
+# modules call into. Renamed so the module sources compile unmodified — see
+# each shim's crate doc for why the real crate cannot be used on the host.
+robot_os_sync = { path = "shims/sync", package = "topology_seed_test_sync" }
+robot_os_sched = { path = "shims/sched", package = "topology_seed_test_sched" }
+robot_os_drivers = { path = "shims/drivers", package = "topology_seed_test_drivers" }
+
+[dev-dependencies]

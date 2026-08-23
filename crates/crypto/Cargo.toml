@@ -2,5 +2,14 @@
 name = "robot_os_crypto"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "PHANES crypto primitives. Hand-rolled SHA-256 + AES-128 + X25519 (task #212) + secure_channel. Ed25519 verify is via the vetted ed25519-dalek crate (no_std) to avoid the HMAC-SHA256 stub trap (task #213)."
 
 [dependencies]
+# Vetted X25519 + Ed25519 (tasks #212/#213). `default-features = false`
+# strips std + rand_core; we only need the verifier + scalar-mult paths
+# which are pure no_std. The hand-written in-tree impls are kept around
+# for now (gated behind `legacy-x25519` cargo feature) so a regression
+# tester can A/B against the dalek reference.
+curve25519-dalek = { version = "4", default-features = false, features = ["zeroize"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }

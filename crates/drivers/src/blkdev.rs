@@ -11,39 +11,25 @@
 
 // ── QEMU / VirtIO backend ─────────────────────────────────────────────────────
 
-#[cfg(not(any(feature = "vf2", feature = "k1", feature = "esp32c3")))]
+#[cfg(not(any(feature = "vf2", feature = "k1")))]
 pub fn init() -> Result<(), ()> {
     crate::virtio::blk::init()
 }
 
-#[cfg(not(any(feature = "vf2", feature = "k1", feature = "esp32c3")))]
+#[cfg(not(any(feature = "vf2", feature = "k1")))]
 pub fn capacity_sectors() -> u64 {
     crate::virtio::blk::capacity_sectors()
 }
 
-#[cfg(not(any(feature = "vf2", feature = "k1", feature = "esp32c3")))]
+#[cfg(not(any(feature = "vf2", feature = "k1")))]
 pub fn read(sector: u64, count: u32, buf: &mut [u8]) -> Result<(), ()> {
     crate::virtio::blk::read(sector, count, buf)
 }
 
-#[cfg(not(any(feature = "vf2", feature = "k1", feature = "esp32c3")))]
+#[cfg(not(any(feature = "vf2", feature = "k1")))]
 pub fn write(sector: u64, count: u32, buf: &[u8]) -> Result<(), ()> {
     crate::virtio::blk::write(sector, count, buf)
 }
-
-// ── ESP32-C3: no block device (yet) ────────────────────────────────────────
-
-#[cfg(feature = "esp32c3")]
-pub fn init() -> Result<(), ()> { Err(()) }
-
-#[cfg(feature = "esp32c3")]
-pub fn capacity_sectors() -> u64 { 0 }
-
-#[cfg(feature = "esp32c3")]
-pub fn read(_sector: u64, _count: u32, _buf: &mut [u8]) -> Result<(), ()> { Err(()) }
-
-#[cfg(feature = "esp32c3")]
-pub fn write(_sector: u64, _count: u32, _buf: &[u8]) -> Result<(), ()> { Err(()) }
 
 // ── Real-hardware SDHCI backend (VisionFive 2 + SpacemiT K1) ─────────────────
 //

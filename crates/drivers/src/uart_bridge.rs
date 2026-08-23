@@ -1,7 +1,7 @@
 /// UART bridge driver — secondary UART for ESP32-C3 WiFi bridge.
 ///
 /// VF2: NS16550A UART1 at 0x10010000, 115200 baud.
-/// QEMU/K1/ESP32-C3: stubs (no bridge hardware).
+/// QEMU/K1: stubs (no bridge hardware).
 ///
 /// Architecture:
 ///   VF2 ──UART1 (TX/RX/GND)──→ ESP32-C3 ──WiFi/TCP──→ macOS (brain server)
@@ -10,7 +10,7 @@
 /// UART1.  The ESP32 firmware is a transparent byte relay between its UART
 /// and a TCP socket to the brain server.
 
-// ── QEMU / K1 / ESP32-C3: no bridge hardware ────────────────────────────────
+// ── QEMU / K1: no bridge hardware ───────────────────────────────────────────
 
 #[cfg(not(feature = "vf2"))]
 pub fn bridge_init() -> i32 { -1 }

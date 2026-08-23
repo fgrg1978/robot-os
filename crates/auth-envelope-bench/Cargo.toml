@@ -1,0 +1,21 @@
+[package]
+name = "robot_os_auth_envelope_bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side benchmark crate for the HMAC-SHA-256 auth envelope (wire format in crates/behavior/src/auth_envelope.rs). Excluded from workspace. Catches performance regressions in the kernel TCP auth path."
+
+# The kernel's auth_envelope.rs depends on robot_os_drivers::clint::get_time()
+# and uses static-mut key state (both kernel-only). Instead of pulling those in,
+# this bench re-implements the envelope wire format locally — only ~50 lines —
+# and uses robot_os_crypto::sha256 (host-buildable) for the HMAC primitive.
+# Option (b) from the task spec: test pure math, keep bench independent of
+# kernel-only static state.
+#
+# Run with:
+#   cd crates/auth-envelope-bench && cargo +stable test --release -- --nocapture
+#
+# Pinned to stable via rust-toolchain.toml.
+
+[dependencies]
+robot_os_crypto = { path = "../crypto" }

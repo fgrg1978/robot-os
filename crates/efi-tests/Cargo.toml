@@ -1,0 +1,11 @@
+[package]
+name = "robot_os_efi_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for robot_os_efi — BootInfo magic/version, EfiMemoryIter stride iteration, boot_info_from_ptr alignment + magic guards, PE/COFF + EFI spec constants."
+
+# Run with:  cd crates/efi-tests && cargo test
+
+[dependencies]
+robot_os_efi = { path = "../efi" }

@@ -2,13 +2,14 @@
 name = "robot_os_mm"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [features]
 small-mem = []
-esp32c3 = ["robot_os_arch/esp32c3"]
 
 [dependencies]
 robot_os_arch = { workspace = true }
 robot_os_sync = { workspace = true }
 robot_os_common = { workspace = true }
+robot_os_limits = { workspace = true }
 linked_list_allocator = { workspace = true }

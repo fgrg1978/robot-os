@@ -1,0 +1,12 @@
+[package]
+name = "robot-os-sync-hostshim"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host stand-in for robot_os_sync::SpinLock, used only by crates/ipc-chan-tests."
+
+# The lib is deliberately named `robot_os_sync` so that the kernel sources
+# pulled in with #[path] resolve `use robot_os_sync::SpinLock;` unchanged.
+[lib]
+name = "robot_os_sync"
+path = "src/lib.rs"

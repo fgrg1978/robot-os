@@ -2,12 +2,12 @@
 
 ## Vision
 
-Robot OS bare-metal sobre RISC-V como plataforma de referencia para vehiculos
-autonomos (drones, rovers, coches) con arquitectura **robot-servidor**:
+Robot OS bare-metal on RISC-V as reference platform for autonomous vehicles
+(drones, rovers, cars) with **robot-server** architecture:
 
-- **Robot (RISC-V)**: control RT, sensores, actuadores, safety — latencia <1ms
-- **Server (x86/GPU)**: percepcion pesada, planning, VLA, SLAM — latencia 50-200ms
-- **Link**: WiFi/Ethernet, protocolo binario existente (OBS_MAGIC/ACT_MAGIC)
+- **Robot (RISC-V)**: RT control, sensors, actuators, safety — latency <1ms
+- **Server (x86/GPU)**: heavy perception, planning, VLA, SLAM — latency 50-200ms
+- **Link**: WiFi/Ethernet, existing binary protocol (OBS_MAGIC/ACT_MAGIC)
 
 ```
   SERVER (x86/GPU)                    ROBOT (RISC-V bare-metal)
@@ -25,14 +25,14 @@ autonomos (drones, rovers, coches) con arquitectura **robot-servidor**:
                                    +---------------------------+
 ```
 
-La razon de esta arquitectura: un SoC RISC-V (VF2/K1) no tiene GPU ni NPU
-suficiente para correr YOLO o VLAs de 1B+ params a 10 Hz. Pero SI puede
-controlar motores a 1 kHz, fusionar IMU a 1 kHz, y ejecutar MLPs ligeros
-para safety a 100 Hz. El servidor aporta cerebro, el robot aporta reflejos.
+The reason for this architecture: a RISC-V SoC (VF2/K1) has no GPU or NPU
+sufficient to run YOLO or 1B+ param VLAs at 10 Hz. But it CAN control motors
+at 1 kHz, fuse IMU at 1 kHz, and run lightweight MLPs for safety at 100 Hz. The
+server provides the brain, the robot provides the reflexes.
 
 ---
 
-## Estado actual (completado)
+## Current Status (Completed)
 
 ### Kernel base (Phases 1-18)
 - [x] UART, memory manager (PMM+VMM Sv39), trap handling, PLIC, CLINT
@@ -61,7 +61,7 @@ para safety a 100 Hz. El servidor aporta cerebro, el robot aporta reflejos.
 - [x] Scheduler Hz configurable (10-10000 Hz)
 - [x] IMU driver MPU-6050 (I2C, calibration offsets)
 - [x] Barometer BMP280
-- [x] Feature gates (no-ml, no-mmu, esp32c3)
+- [x] Feature gates (no-ml, no-mmu)
 - [x] Subsumption behavior engine (L0-L3)
 - [x] VLA remote protocol (TCP, OBS/ACT/GOAL packets)
 - [x] Persistent state recovery (first-boot defaults, full subsystem apply)
@@ -85,15 +85,17 @@ para safety a 100 Hz. El servidor aporta cerebro, el robot aporta reflejos.
 - [x] Proximity channel — sensor_ahrs_task publishes ProximityData at ~20 Hz (M+N)
 - [x] Full SLAM server — tools/slam_server.py, occupancy grid, pose correction, ASCII map (N3)
 
-### ESP32-C3 Companion (Phase O)
+### ESP32-C3 build target (Phase O, aparcado)
 - [x] WiFi driver stub — crates/drivers/src/wifi.rs, station mode, UDP send/recv (O1+O2)
+- Build target `esp32c3` removed from tree on 2026-08-18 (never compiled,
+  never in CI); see `newfeatures/esp32c3/REVISAR.md`
 
 ---
 
-## Fase H — Channel<T> Middleware
+## Phase H — Channel<T> Middleware
 
-**Objetivo**: reemplazar los IPC ad-hoc (SpinLock<MotorCmd>) con channels
-tipados genéricos, fundamento para desacoplar todos los módulos.
+**Goal**: replace ad-hoc IPC (SpinLock<MotorCmd>) with generic typed channels,
+foundation to decouple all modules.
 
 ### H1 — Channel<T> core
 ```
@@ -110,11 +112,11 @@ crates/channel/ (NEW crate robot_os_channel)
     Channel::age_ticks(&self) -> u64
     Channel::seq(&self) -> u64
 ```
-- Zero-alloc, no heap, solo requiere `T: Copy`
-- `seq` permite detectar datos nuevos sin comparar contenido
-- `ts` permite watchdog generico
+- Zero-alloc, no heap, only requires `T: Copy`
+- `seq` allows detecting new data without content comparison
+- `ts` allows generic watchdog
 
-### H2 — Channels predefinidos
+### H2 — Predefined Channels
 ```
 crates/channels/ (NEW crate robot_os_channels)
   static CH_MOTOR_CMD:  Channel<MotorCmd>
@@ -127,24 +129,24 @@ crates/channels/ (NEW crate robot_os_channels)
   static CH_RC_INPUT:   Channel<RcInput>      // remote control
   static CH_GPS:        Channel<GpsPosition>
 ```
-- Cada modulo lee/escribe channels sin saber quien esta al otro lado
-- behavior_task lee CH_IMU + CH_PERCEPTION, escribe CH_MOTOR_CMD
-- rt_motor_task lee CH_MOTOR_CMD, escribe PWM
+- Each module reads/writes channels without knowing who is on the other side
+- behavior_task reads CH_IMU + CH_PERCEPTION, writes CH_MOTOR_CMD
+- rt_motor_task reads CH_MOTOR_CMD, writes PWM
 
-### H3 — Migrar modulos existentes
+### H3 — Migrate Existing Modules
 - `robot::MOTOR_CMD` SpinLock → `CH_MOTOR_CMD` Channel
-- `behavior_task` → lee channels en vez de llamar directamente
-- `rt_motor_task` → lee CH_MOTOR_CMD
-- Mantener backward compat via re-exports
+- `behavior_task` → reads channels instead of calling directly
+- `rt_motor_task` → reads CH_MOTOR_CMD
+- Maintain backward compat via re-exports
 
 ---
 
-## Fase I — Attitude Estimation (dron)
+## Phase I — Attitude Estimation (Drone)
 
-**Objetivo**: fusion IMU + barometro para estimar orientacion y altitud,
-requisito minimo para que un dron vuele estable.
+**Goal**: fuse IMU + barometer to estimate orientation and altitude,
+minimum requirement for stable drone flight.
 
-### I1 — Complementary filter
+### I1 — Complementary Filter
 ```
 crates/ahrs/ (NEW crate robot_os_ahrs)
   src/lib.rs:
@@ -157,12 +159,12 @@ crates/ahrs/ (NEW crate robot_os_ahrs)
     ahrs_update(imu: &ImuData, baro_pa: u32, dt_us: u32) -> Attitude
 ```
 - Complementary filter: `angle = alpha * (angle + gyro*dt) + (1-alpha) * accel_angle`
-- alpha = 0.98 (confiar mas en gyro a corto plazo, accel corrige drift)
-- Altitud: barometric formula `alt = 44330 * (1 - (P/P0)^0.1903)` en enteros
-- Sin trigonometria: usar atan2 aproximado (CORDIC o lookup table 256 entries)
-- Publica en CH_ATTITUDE a 500-1000 Hz
+- alpha = 0.98 (trust gyro short-term, accel corrects drift)
+- Altitude: barometric formula `alt = 44330 * (1 - (P/P0)^0.1903)` in integers
+- No trigonometry: use approximate atan2 (CORDIC or lookup table 256 entries)
+- Publishes to CH_ATTITUDE at 500-1000 Hz
 
-### I2 — GPS driver (UART NMEA)
+### I2 — GPS Driver (UART NMEA)
 ```
 crates/gps/ (NEW crate robot_os_gps)
   src/lib.rs:
@@ -177,36 +179,36 @@ crates/gps/ (NEW crate robot_os_gps)
     gps_init(uart_bus: u8, baud: u32) -> bool
     gps_parse_nmea(buf: &[u8]) -> Option<GpsPosition>
 ```
-- Parser NMEA: $GPGGA (posicion), $GPRMC (velocidad/rumbo)
+- NMEA parser: $GPGGA (position), $GPRMC (velocity/heading)
 - Integer parsing (no float): "4807.038" = 48 deg + 07.038 min = 48_1173000 deg7
-- Publica en CH_GPS a 1-10 Hz (segun receptor)
+- Publishes to CH_GPS at 1-10 Hz (depends on receiver)
 
-### I3 — Fusion IMU + GPS (Extended Complementary)
-- Position hold: GPS corrige drift de dead-reckoning
-- Heading: magnetometro o GPS course-over-ground
-- Para dron: no se necesita Kalman completo; complementary es suficiente
-  para vuelo estabilizado y position hold
+### I3 — Fuse IMU + GPS (Extended Complementary)
+- Position hold: GPS corrects dead-reckoning drift
+- Heading: magnetometer or GPS course-over-ground
+- For drone: no need for full Kalman; complementary is sufficient
+  for stabilized flight and position hold
 
 ---
 
-## Fase J — Flight Controller
+## Phase J — Flight Controller
 
-**Objetivo**: controlar 4+ motores brushless via ESC/PWM para vuelo
-multirotor estable.
+**Goal**: control 4+ brushless motors via ESC/PWM for stable
+multirotor flight.
 
-### J1 — ESC/PWM output (4 canales)
+### J1 — ESC/PWM Output (4 Channels)
 ```
 crates/drivers/src/esc.rs (NEW):
-    esc_init(channels: &[u8])       // PWM channels para motores
-    esc_arm()                        // secuencia de armado ESC
+    esc_init(channels: &[u8])       // PWM channels for motors
+    esc_arm()                        // ESC arming sequence
     esc_set_throttle(ch: u8, pct: u16)  // 0-1000 (0.0%-100.0%)
     esc_disarm()
 ```
-- PWM a 400 Hz (standard ESC) o 32 kHz (DShot, futuro)
-- Mapeo: pct 0 = 1000us pulse, pct 1000 = 2000us pulse
-- Safety: si CH_ATTITUDE.age > 50ms → disarm inmediato
+- PWM at 400 Hz (standard ESC) or 32 kHz (DShot, future)
+- Mapping: pct 0 = 1000us pulse, pct 1000 = 2000us pulse
+- Safety: if CH_ATTITUDE.age > 50ms → immediate disarm
 
-### J2 — Mixer (geometria multirotor)
+### J2 — Mixer (Multirotor Geometry)
 ```
 crates/flight/ (NEW crate robot_os_flight)
   src/mixer.rs:
@@ -214,7 +216,7 @@ crates/flight/ (NEW crate robot_os_flight)
     mixer_update(throttle: i32, roll: i32, pitch: i32, yaw: i32)
       -> [u16; MAX_MOTORS]   // throttle per motor (0-1000)
 ```
-Tabla QuadX (el mas comun):
+QuadX Table (most common):
 ```
   Motor 1 (front-right): +throttle -roll +pitch -yaw
   Motor 2 (rear-left):   +throttle +roll -pitch -yaw
@@ -222,7 +224,7 @@ Tabla QuadX (el mas comun):
   Motor 4 (rear-right):  +throttle -roll -pitch +yaw
 ```
 
-### J3 — PID de vuelo (rate + angle)
+### J3 — Flight PID (Rate + Angle)
 ```
 crates/flight/src/pid_flight.rs:
     // Cascaded PID: outer loop (angle) -> inner loop (rate)
@@ -234,10 +236,10 @@ crates/flight/src/pid_flight.rs:
     flight_pid_update(target: &FlightTarget, attitude: &Attitude,
                       gyro: &[i32;3]) -> MixerInput
 ```
-- Inner loop (rate PID): 1000 Hz, lee gyro directamente
-- Outer loop (angle PID): 250-500 Hz, lee attitude estimada
-- Alt hold PID: 50 Hz, lee CH_BARO
-- Todos los PID configurables via CONFIG.INI (Phase G2 ya soporta)
+- Inner loop (rate PID): 1000 Hz, reads gyro directly
+- Outer loop (angle PID): 250-500 Hz, reads estimated attitude
+- Alt hold PID: 50 Hz, reads CH_BARO
+- All PIDs configurable via CONFIG.INI (Phase G2 already supports)
 
 ### J4 — Flight task (RT loop)
 ```
@@ -261,93 +263,93 @@ kernel/src/main.rs:
 
 ---
 
-## Fase K — RC Input + Safety (dron)
+## Phase K — RC Input + Safety (Drone)
 
-**Objetivo**: recibir comandos de control remoto y failsafes de vuelo.
+**Goal**: receive remote control commands and flight failsafes.
 
-### K1 — RC receiver driver
+### K1 — RC Receiver Driver
 ```
 crates/drivers/src/rc.rs (NEW):
-    // SBUS (serial, 100K baud, inverted) o PPM (timer capture)
+    // SBUS (serial, 100K baud, inverted) or PPM (timer capture)
     pub struct RcInput {
         channels: [u16; 16],  // 1000-2000us per channel
         rssi:     u8,
         failsafe: bool,
     }
-    rc_init(mode: RcMode)    // SBUS o PPM
+    rc_init(mode: RcMode)    // SBUS or PPM
     rc_read() -> Option<RcInput>
 ```
-- SBUS: 25 bytes, 100000 baud, 8E2 (invertido) — el mas comun en drones
-- Mapeo standard: CH1=roll, CH2=pitch, CH3=throttle, CH4=yaw, CH5=mode
+- SBUS: 25 bytes, 100000 baud, 8E2 (inverted) — most common in drones
+- Standard mapping: CH1=roll, CH2=pitch, CH3=throttle, CH4=yaw, CH5=mode
 
-### K2 — Flight modes
+### K2 — Flight Modes
 ```
 crates/flight/src/modes.rs:
     pub enum FlightMode {
-        Manual,       // RC directo a mixer (solo rate PID)
+        Manual,       // RC direct to mixer (rate PID only)
         Stabilize,    // RC = target angle, angle+rate PID
         AltHold,      // Stabilize + altitude PID
         PosHold,      // AltHold + GPS position PID
-        Auto,         // Sigue waypoints del servidor
+        Auto,         // Follow server waypoints
         RTL,          // Return To Launch (failsafe)
-        Land,         // Descenso controlado
+        Land,         // Controlled descent
     }
 ```
-- Manual/Stabilize: no necesita servidor — vuelo local puro
-- PosHold/Auto: necesita GPS + opcionalmente servidor
-- RTL/Land: failsafe automatico si se pierde link
+- Manual/Stabilize: no server needed — pure local flight
+- PosHold/Auto: need GPS + optionally server
+- RTL/Land: automatic failsafe if link is lost
 
-### K3 — Failsafe chain
+### K3 — Failsafe Chain
 ```
-Prioridad (mayor gana):
-  1. HW watchdog timeout           → disarm (motores OFF)
+Priority (higher wins):
+  1. HW watchdog timeout           → disarm (motors OFF)
   2. Attitude estimation failure   → level + descend
-  3. RC link loss (>1s)            → RTL o Land
-  4. Server link loss (>3s)        → switch a PosHold
-  5. Low battery (futuro)          → RTL
-  6. Geofence violation (futuro)   → RTL
+  3. RC link loss (>1s)            → RTL or Land
+  4. Server link loss (>3s)        → switch to PosHold
+  5. Low battery (future)          → RTL
+  6. Geofence violation (future)   → RTL
 ```
-- Integra con L0 (emergency-stop) del behavior engine existente
-- Stack canaries + system WDT ya cubren el caso de crash del kernel
+- Integrates with L0 (emergency-stop) from existing behavior engine
+- Stack canaries + system WDT already cover kernel crash case
 
 ---
 
-## Fase L — Server Protocol + Ground Station
+## Phase L — Server Protocol + Ground Station
 
-**Objetivo**: protocolo completo robot-servidor y UI de ground station.
+**Goal**: complete robot-server protocol and ground station UI.
 
-### L1 — Protocolo binario v2
-El protocolo existente (OBS_MAGIC/ACT_MAGIC/GOAL_MAGIC) se extiende:
+### L1 — Binary Protocol v2
+Existing protocol (OBS_MAGIC/ACT_MAGIC/GOAL_MAGIC) is extended:
 ```
-Paquetes Robot → Server:
+Robot → Server Packets:
   TELEM (10 Hz):  attitude, position, battery, mode, channels
   SENSOR (5 Hz):  IMU raw, baro, GPS, ultrasonic distances
   STATUS (1 Hz):  task health, canary status, config summary
 
-Paquetes Server → Robot:
-  CMD_ATTITUDE:   target roll/pitch/yaw/throttle (para Auto mode)
+Server → Robot Packets:
+  CMD_ATTITUDE:   target roll/pitch/yaw/throttle (for Auto mode)
   CMD_WAYPOINT:   lat/lon/alt + speed (mission upload)
   CMD_MODE:       switch flight mode
   CMD_CONFIG:     update config key remotely
   CMD_ARM/DISARM: arm/disarm motors
-  CMD_MODEL:      OTA model update (ya existe)
+  CMD_MODEL:      OTA model update (already exists)
 
 Header (8 bytes): magic[4] + length[2] + type[1] + seq[1]
-Checksum: CRC-8 al final (1 byte)
+Checksum: CRC-8 at end (1 byte)
 ```
 
-### L2 — Server daemon (Python/Rust)
+### L2 — Server Daemon (Python/Rust)
 ```
 server/
-  ground_station.py:    # o Rust binary
-    - Recibe telemetria via UDP
-    - Muestra mapa + actitud + estado en terminal/web
-    - Envia comandos (waypoints, mode, arm)
-    - Integra con VLA model para planning autonomo
-    - Logging a disco (replay)
+  ground_station.py:    # or Rust binary
+    - Receives telemetry via UDP
+    - Shows map + attitude + state in terminal/web
+    - Sends commands (waypoints, mode, arm)
+    - Integrates with VLA model for autonomous planning
+    - Logging to disk (replay)
 ```
 
-### L3 — Telemetry task en kernel
+### L3 — Telemetry Task in Kernel
 ```
 kernel/src/main.rs:
     fn telemetry_task(_: usize) {
@@ -364,13 +366,13 @@ kernel/src/main.rs:
 
 ---
 
-## Fase M — Percepcion Real
+## Phase M — Real Perception
 
-**Objetivo**: percepcion con sensores reales, split robot/servidor.
+**Goal**: perception with real sensors, robot/server split.
 
-### M1 — Sensores de proximidad (on-board, sin servidor)
+### M1 — Proximity Sensors (On-board, No Server)
 ```
-crates/drivers/src/ultrasonic.rs:  // HC-SR04 o similar
+crates/drivers/src/ultrasonic.rs:  // HC-SR04 or similar
     us_init(trig: u8, echo: u8)
     us_read_mm() -> Option<u32>    // 20-4000mm
 
@@ -378,10 +380,10 @@ crates/drivers/src/tof.rs:        // VL53L0X (I2C)
     tof_init(bus: u8, addr: u8)
     tof_read_mm() -> Option<u16>   // 0-2000mm
 ```
-- Estos corren en el robot a 10-50 Hz
-- Alimentan L1 (avoid-obstacle) directamente, sin servidor
+- These run on the robot at 10-50 Hz
+- Feed L1 (avoid-obstacle) directly, no server
 
-### M2 — Camera driver real (VF2/K1)
+### M2 — Real Camera Driver (VF2/K1)
 ```
 crates/drivers/src/csi.rs:
     csi_init(width: u16, height: u16, format: PixFmt)
@@ -389,35 +391,35 @@ crates/drivers/src/csi.rs:
 ```
 - VF2: MIPI CSI-2 via JH7110 ISP
 - K1: MIPI CSI-2 via SpacemiT ISP
-- Frame buffer: 320x240 grayscale = 75KB (cabe en heap)
+- Frame buffer: 320x240 grayscale = 75KB (fits in heap)
 
-### M3 — Server-side perception
+### M3 — Server-Side Perception
 ```
-Flujo:
-  Robot captura frame → comprime (JPEG simple o raw) → UDP al servidor
-  Servidor corre YOLO/segmentation → extrae obstaculos
-  Servidor envia CMD_OBSTACLES al robot
-  Robot incorpora en CH_PERCEPTION → behavior engine L1/L2
+Flow:
+  Robot captures frame → compresses (simple JPEG or raw) → UDP to server
+  Server runs YOLO/segmentation → extracts obstacles
+  Server sends CMD_OBSTACLES to robot
+  Robot incorporates in CH_PERCEPTION → behavior engine L1/L2
 ```
-- El robot NO corre YOLO — solo captura y transmite
-- La latencia de red (20-50ms WiFi) es aceptable para planning
-- La safety local (ultrasonic + IMU) no depende del servidor
+- Robot does NOT run YOLO — only captures and transmits
+- Network latency (20-50ms WiFi) acceptable for planning
+- Local safety (ultrasonic + IMU) independent of server
 
 ---
 
-## Fase N — Path Planning + SLAM
+## Phase N — Path Planning + SLAM
 
-**Objetivo**: navegacion autonoma con mapa y planificacion de ruta.
+**Goal**: autonomous navigation with map and route planning.
 
-### N1 — Occupancy grid (servidor)
+### N1 — Occupancy Grid (Server)
 ```
 server/slam/:
-    - Grid 2D: 100x100 celdas, 10cm/celda = 10m x 10m local map
-    - Actualizado con datos de perception (obstaculos)
-    - Enviado al robot como bitmap comprimido (1.25 KB)
+    - 2D Grid: 100x100 cells, 10cm/cell = 10m x 10m local map
+    - Updated with perception data (obstacles)
+    - Sent to robot as compressed bitmap (1.25 KB)
 ```
 
-### N2 — Waypoint following (robot)
+### N2 — Waypoint Following (Robot)
 ```
 crates/flight/src/nav.rs:
     pub struct Waypoint {
@@ -429,42 +431,47 @@ crates/flight/src/nav.rs:
     }
     nav_update(current: &GpsPosition, target: &Waypoint) -> FlightTarget
 ```
-- Waypoints cargados del servidor o de FAT32 (mission file)
-- Pure-pursuit o L1 guidance para seguimiento de ruta
-- Corre en el robot (no necesita servidor para seguir waypoints)
+- Waypoints loaded from server or FAT32 (mission file)
+- Pure-pursuit or L1 guidance for route following
+- Runs on robot (no server needed to follow waypoints)
 
-### N3 — Full SLAM (servidor, futuro)
-- Visual SLAM (ORB-SLAM3 o similar) en el servidor
-- LiDAR SLAM si se agrega sensor
-- El robot envia IMU + camera frames, el servidor mantiene el mapa
-- El robot recibe pose corregida via CMD_POSITION
+### N3 — Full SLAM (Server, Future)
+- Visual SLAM (ORB-SLAM3 or similar) on server
+- LiDAR SLAM if sensor added
+- Robot sends IMU + camera frames, server maintains map
+- Robot receives corrected pose via CMD_POSITION
 
 ---
 
-## Fase O — ESP32-C3 Companion (micro-dron)
+## Phase O — ESP32-C3 Build Target (Micro-Drone) — PARKED
 
-**Objetivo**: soporte para micro-drones con ESP32-C3 (RV32IMC, 400KB RAM).
+**Status (2026-08-18)**: the `esp32c3` build target (kernel running directly on
+ESP32-C3, RV32IMC, 400KB RAM, for micro-drones) never compiled and was never in
+CI. Removed from tree; the defconfig, linker script, boot assembly and notes on
+what is needed to revive it remain in `newfeatures/esp32c3/` — see
+`newfeatures/esp32c3/REVISAR.md`.
 
-### O1 — Build minimo
+**Original goal**: support for micro-drones with ESP32-C3 (RV32IMC, 400KB RAM).
+
+### O1 — Minimal Build (Parked)
 ```
-cargo build --release --features esp32c3
+cargo build --release --features esp32c3   # feature no longer exists; see newfeatures/esp32c3/
   = no-mmu + no-ml + robot_os_drivers/esp32c3
   Target: riscv32imc-unknown-none-elf
 ```
-- Feature gate ya existe (Phase F), falta driver real
-- Solo: attitude + PID + mixer + RC + safety
-- Sin FAT32, sin TCP/IP, sin ML — puro flight controller
-- Config hardcoded (no INI, no disco)
+- Only: attitude + PID + mixer + RC + safety
+- No FAT32, no TCP/IP, no ML — pure flight controller
+- Config hardcoded (no INI, no disk)
 
-### O2 — WiFi link a servidor
-- ESP32-C3 tiene WiFi nativo
-- UDP telemetria al servidor
-- Comandos del servidor via WiFi
-- El ESP32 no tiene recursos para percepcion — todo al servidor
+### O2 — WiFi Link to Server (Parked)
+- ESP32-C3 has native WiFi
+- UDP telemetry to server
+- Server commands via WiFi
+- ESP32 has no resources for perception — all on server
 
 ---
 
-## Resumen: que corre donde
+## Summary: What Runs Where
 
 ```
                      ON-BOARD (RISC-V)        SERVER (x86/GPU)
@@ -491,76 +498,76 @@ cargo build --release --features esp32c3
 
 ---
 
-## Dependencias entre fases
+## Phase Dependencies
 
 ```
-Existente ─── H (channels) ─┬─ I (attitude) ─── J (flight) ─── K (RC+safety)
-                             │
-                             ├─ L (server protocol) ─── M (percepcion)
-                             │                          │
-                             │                          └── N (planning+SLAM)
-                             │
-                             └─ O (ESP32-C3, independiente)
+Existing ─── H (channels) ─┬─ I (attitude) ─── J (flight) ─── K (RC+safety)
+                            │
+                            ├─ L (server protocol) ─── M (perception)
+                            │                         │
+                            │                         └── N (planning+SLAM)
+                            │
+                            └─ O (ESP32-C3, parked — see newfeatures/esp32c3/)
 ```
 
-- **H es prerrequisito de todo** — los channels desacoplan modulos
-- **I+J+K** son el flight controller minimo (dron vuela sin servidor)
-- **L** conecta el servidor (dron vuela con servidor)
-- **M+N** son percepcion/planning (dron navega autonomo)
-- **O** es independiente (micro-dron con ESP32-C3)
+- **H is prerequisite for everything** — channels decouple modules
+- **I+J+K** is the minimal flight controller (drone flies without server)
+- **L** connects the server (drone flies with server)
+- **M+N** are perception/planning (drone navigates autonomously)
+- **O** parked (micro-drone with ESP32-C3; see `newfeatures/esp32c3/REVISAR.md`)
 
 ---
 
-## Hardware objetivo para dron
+## Target Hardware for Drone
 
-### Minimo viable (dev/test)
+### Minimum Viable (Dev/Test)
 - **FC**: SpacemiT K1 (BananaPi BPI-F3) — RV64GCV, 8 cores, RVV
-- **IMU**: MPU-6050 (ya soportado) o ICM-42688 (mejor)
-- **Baro**: BMP280 (ya soportado)
+- **IMU**: MPU-6050 (already supported) or ICM-42688 (better)
+- **Baro**: BMP280 (already supported)
 - **GPS**: u-blox NEO-M8N (UART NMEA, $15)
-- **ESC**: 4x ESC standard (PWM 400 Hz)
+- **ESC**: 4x standard ESC (PWM 400 Hz)
 - **RC**: FrSky SBUS receiver
 - **Frame**: F450 quadcopter kit ($30)
-- **Server**: laptop con WiFi (desarrollo)
+- **Server**: laptop with WiFi (development)
 
-### Produccion
-- **FC**: K1 o futuro RISC-V con NPU
+### Production
+- **FC**: K1 or future RISC-V with NPU
 - **IMU**: ICM-42688-P (SPI, 32 kHz ODR)
-- **Baro**: BMP390 (menor ruido)
+- **Baro**: BMP390 (lower noise)
 - **GPS**: u-blox ZED-F9P (RTK, cm precision)
-- **Camera**: OV5647 o IMX219 (MIPI CSI-2)
-- **Rangefinder**: TF-Luna (ToF, 12m) o VL53L1X (I2C, 4m)
-- **Radio**: SiK 915MHz telemetry (largo alcance) + WiFi (video)
-- **Server**: edge box con GPU (Jetson-class o x86+GPU)
+- **Camera**: OV5647 or IMX219 (MIPI CSI-2)
+- **Rangefinder**: TF-Luna (ToF, 12m) or VL53L1X (I2C, 4m)
+- **Radio**: SiK 915MHz telemetry (long range) + WiFi (video)
+- **Server**: edge box with GPU (Jetson-class or x86+GPU)
 
 ---
 
-## Principios de diseno (heredados + nuevos)
+## Design Principles (Inherited + New)
 
-### Heredados (aplican siempre)
-1. **Seguridad sin GC**: ownership, zero panics
-2. **Determinismo real**: latencias predecibles
-3. **Hardware cercano**: sin HAL innecesario
-4. **Composabilidad**: crates independientes por capas
+### Inherited (Always Apply)
+1. **Safety without GC**: ownership, zero panics
+2. **Real determinism**: predictable latencies
+3. **Close to hardware**: no unnecessary HAL
+4. **Composability**: independent crates per layer
 
-### Nuevos para dron autonomo
-5. **Fly-first**: el dron debe poder volar sin servidor (Stabilize mode)
-6. **Degrade gracefully**: si pierde servidor → PosHold; si pierde GPS → Stabilize; si pierde IMU → disarm
-7. **Split compute**: RT en robot, IA en servidor. La frontera es el Channel.
-8. **Config-driven**: todo parametrizable via CONFIG.INI (PID gains, frame type, sensor buses)
-9. **Test without hardware**: QEMU + simulated sensors antes de volar
+### New for Autonomous Drone
+5. **Fly-first**: drone must fly without server (Stabilize mode)
+6. **Degrade gracefully**: lose server → PosHold; lose GPS → Stabilize; lose IMU → disarm
+7. **Split compute**: RT on robot, AI on server. The boundary is the Channel.
+8. **Config-driven**: everything configurable via CONFIG.INI (PID gains, frame type, sensor buses)
+9. **Test without hardware**: QEMU + simulated sensors before flying
 
 ---
 
-## Metricas de exito
+## Success Metrics
 
-| Milestone | Criterio | Fase |
-|-----------|----------|------|
-| Channels work | behavior_task migrado a channels, 0 regressions | H |
+| Milestone | Criterion | Phase |
+|-----------|-----------|-------|
+| Channels work | behavior_task migrated to channels, 0 regressions | H |
 | Attitude OK | roll/pitch error < 2 deg (IMU bench test) | I |
-| First hover | QuadX estable 10s en QEMU simulado | J |
-| RC control | Manual + Stabilize mode con SBUS | K |
-| Telemetry | Ground station ve actitud + GPS en tiempo real | L |
-| Obstacle avoid | Ultrasonic → frenado a 1m (sin servidor) | M1 |
-| Auto mission | 4 waypoints en cuadrado, autonomo | N2 |
-| Full auto | Servidor detecta obstaculos, replannea ruta | M3+N |
+| First hover | QuadX stable 10s in simulated QEMU | J |
+| RC control | Manual + Stabilize mode with SBUS | K |
+| Telemetry | Ground station sees attitude + GPS real-time | L |
+| Obstacle avoid | Ultrasonic → brake at 1m (no server) | M1 |
+| Auto mission | 4 waypoints in square, autonomous | N2 |
+| Full auto | Server detects obstacles, replans route | M3+N |

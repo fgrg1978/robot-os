@@ -16,6 +16,7 @@ mod ipc_tests;
 mod fs_tests;
 mod security_tests;
 mod auth_envelope_tests;
+mod host_microbench;
 
 // ── DTB parser bugs (REVIEW.dtb-4) ────────────────────────────────────────
 // We pull dtb's lib.rs in as a sub-module via #[path] so we exercise the

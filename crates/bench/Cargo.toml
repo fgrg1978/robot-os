@@ -1,0 +1,36 @@
+[package]
+name = "robot_os_bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Synthetic microbenchmarks for kernel subsystems (ipc, mm, sched, net, fs, crypto, auth). Runs in-kernel via shell `bench` command; emits parseable [BENCH-RES] lines for the brain bench collector to ingest."
+
+[dependencies]
+# Subsystems we bench.  Add deps as we add per-subsystem modules.
+robot_os_drivers = { path = "../drivers" }
+robot_os_ipc     = { path = "../ipc" }
+robot_os_sched   = { path = "../sched" }
+robot_os_sync    = { path = "../sync" }
+robot_os_behavior = { path = "../behavior" }
+robot_os_net     = { path = "../net" }
+robot_os_crypto  = { path = "../crypto" }
+robot_os_fs      = { path = "../fs" }
+robot_os_mm      = { path = "../mm" }
+robot_os_ota     = { path = "../ota" }
+
+[features]
+default = []
+# Each subsystem gateable independently so build-time exclusion is trivial.
+ipc      = []
+mm       = []
+sched    = []
+net      = []
+fs       = []
+crypto   = []
+auth     = []
+cap      = []
+protocol = []
+ota      = []
+asyncrt  = []
+# Convenience: enable everything.
+all      = ["ipc", "mm", "sched", "net", "fs", "crypto", "auth", "cap", "protocol", "ota", "asyncrt"]

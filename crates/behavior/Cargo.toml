@@ -2,12 +2,27 @@
 name = "robot_os_behavior"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [features]
 no-ml = []
+# K-C5. Forwarded from kernel/Cargo.toml; the const the gate reads lives in
+# robot_os_encrypt_link, this crate only re-exports the policy surface
+# (auth_envelope::link_policy_denial and friends).
+link-encrypt-enforced = ["robot_os_encrypt_link/link-encrypt-enforced"]
 
 [dependencies]
-robot_os_sync    = { workspace = true }
-robot_os_drivers = { workspace = true }
-robot_os_fs      = { workspace = true }
-robot_os_crypto  = { path = "../crypto" }
+robot_os_sync         = { workspace = true }
+robot_os_drivers      = { workspace = true }
+robot_os_fs           = { workspace = true }
+robot_os_crypto       = { path = "../crypto" }
+robot_os_encrypt_link = { path = "../encrypt-link" }
+# RFC-0037: graded degrade level — motor_envelope reads degrade_level() from
+# ipc and level_cap_pct() from the dep-free degrade-policy leaf.
+robot_os_ipc          = { workspace = true }
+# RFC-0037: degrade taxonomy + speed-ceiling constants (motor-actuation policy).
+robot_os_degrade_policy = { workspace = true }
+# RFC-0027: #[wcet(N_us)] proc-macro for per-function WCET budget annotations.
+# Host-built proc-macro; Cargo resolves it correctly for cross-compilation
+# because proc-macros are always built for the host (build target).
+wcet-macro = { path = "../wcet-macro" }

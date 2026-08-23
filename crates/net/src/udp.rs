@@ -209,29 +209,78 @@ pub fn close(sock: i32) {
     unbind(sock as usize);
 }
 
-/// Handle an incoming UDP segment (called from ip::handle).
-/// Dispatches payload to the correct bound socket's ring buffer.
 /// DNS client port — intercept DNS responses before socket dispatch.
 const DNS_CLIENT_PORT: u16 = 5353;
 /// NTP client source port — intercept NTP responses before socket dispatch.
 const NTP_CLIENT_PORT: u16 = 1123;
 
-pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
-    if data.len() < UDP_HDR_SIZE { return; }
+/// Validate the UDP length field against what IP actually delivered and return
+/// the datagram trimmed to it.
+///
+/// RFC 768: `length` covers header + payload and is never below the 8-byte
+/// header.  IP may hand us trailing padding (minimum Ethernet frame size), and
+/// a crafted packet may declare a length longer than the bytes received — both
+/// must be rejected/trimmed *before* any range is derived from the field, or
+/// the slice below panics (kernel halt under `panic = "abort"`).
+fn udp_segment(data: &[u8]) -> Option<&[u8]> {
+    if data.len() < UDP_HDR_SIZE { return None; }
     let hdr = unsafe { &*(data.as_ptr() as *const UdpHdr) };
+    let len = u16::from_be_bytes(hdr.length) as usize;
+    if len < UDP_HDR_SIZE || len > data.len() { return None; }
+    Some(&data[..len])
+}
+
+/// Handle an incoming UDP datagram with receive-side checksum validation.
+/// Called from `ip::handle`, which forwards both IP endpoints.
+///
+/// Requires both endpoints because the UDP checksum covers the IPv4
+/// pseudo-header (src, dst, proto, length).  This is the ONLY ingress path:
+/// there is deliberately no unvalidated entry point, so a future caller cannot
+/// accidentally bypass the checks below.
+pub fn handle_checked(src_ip: &[u8; 4], dst_ip: &[u8; 4], data: &[u8]) {
+    let seg = match udp_segment(data) { Some(s) => s, None => return };
+
+    // RFC 768: for IPv4 the UDP checksum is OPTIONAL, and an all-zero field
+    // means "the sender did not compute one".  Such a datagram must be
+    // accepted unvalidated, not dropped — `dhcp.rs` transmits this way and so
+    // do many real DHCP/TFTP servers, so rejecting it here would silently
+    // break address acquisition.
+    let hdr  = unsafe { &*(seg.as_ptr() as *const UdpHdr) };
+    let csum = u16::from_be_bytes(hdr.checksum);
+    if csum != 0 {
+        // Verification sums the segment *including* the stored checksum; a
+        // correct datagram folds to 0xFFFF, so the complement must be zero.
+        // (A computed zero is transmitted as 0xFFFF, which verifies the same.)
+        let pseudo = ip::pseudo_checksum(src_ip, dst_ip, ip::IP_PROTO_UDP, seg.len() as u16);
+        if super::tcp::tcp_checksum(pseudo, seg) != 0 { return; }
+    }
+
+    dispatch(src_ip, seg);
+}
+
+/// Route a length-validated datagram to its interceptor or bound socket.
+/// `seg` is guaranteed to be at least `UDP_HDR_SIZE` bytes by `udp_segment`.
+fn dispatch(src_ip: &[u8; 4], seg: &[u8]) {
+    let hdr = unsafe { &*(seg.as_ptr() as *const UdpHdr) };
     let dst_port = u16::from_be_bytes(hdr.dst_port);
     let src_port = u16::from_be_bytes(hdr.src_port);
-    let payload  = &data[UDP_HDR_SIZE..];
+    let payload  = &seg[UDP_HDR_SIZE..];
 
-    // F05: Intercept DNS responses
+    // F05 / F05.2: intercept DNS and NTP responses.
+    //
+    // Both handlers receive the source endpoint, not just the payload. Routing
+    // on `dst_port` alone tells you only which of OUR ports a datagram was
+    // aimed at — which is public knowledge and exactly what an off-path
+    // forgery targets. Only the source, checked against the server the query
+    // actually went to, distinguishes an answer from an injection, and neither
+    // handler can perform that check without these two arguments.
     if dst_port == DNS_CLIENT_PORT {
-        super::dns::handle_response(payload);
+        super::dns::handle_response(src_ip, src_port, payload);
         return;
     }
 
-    // F05.2: Intercept NTP responses
     if dst_port == NTP_CLIENT_PORT {
-        super::ntp::handle_response(payload);
+        super::ntp::handle_response(src_ip, src_port, payload);
         return;
     }
 
@@ -247,17 +296,54 @@ pub fn handle(src_ip: &[u8; 4], data: &[u8]) {
 /// Receive a UDP-over-IPv6 datagram.
 ///
 /// Called from `ipv6::ipv6_rx` when `next_hdr == NEXTHDR_UDP`.
-/// Routes the payload to the matching bound socket (port match only;
-/// IPv6 source address is not yet checked for socket filtering).
-pub fn udpv6_rx(src_ipv6: &[u8; 16], _dst_ipv6: &[u8; 16], data: &[u8]) {
-    if data.len() < UDP_HDR_SIZE { return; }
-    let hdr = unsafe { &*(data.as_ptr() as *const UdpHdr) };
+/// Routes the payload to the matching bound socket by destination port.
+///
+/// # Source address and the v4 socket table
+///
+/// There is no AF_INET6 socket API in this stack, so a v6 datagram has to be
+/// delivered — if at all — through the same table the IPv4 path uses, whose
+/// `src_ip` field is four bytes wide. This function used to fill that field
+/// with the last four bytes of the IPv6 source address. That is a forgery
+/// primitive: those four bytes are entirely under a remote sender's control,
+/// so any consumer that authenticates a peer by comparing `src_ip` (the
+/// boot-time TFTP fetch in `tftp_client.rs` is the in-tree example) could be
+/// handed a datagram that claims to be from the server while coming from an
+/// arbitrary IPv6 host — and unlike the IPv4 path, nothing on the way here
+/// checked it against a real v4 peer.
+///
+/// The source is therefore reported as the unspecified address `0.0.0.0`,
+/// which is never a valid unicast peer, so every equality check against a real
+/// server address fails closed. A future AF_INET6 socket layer should carry
+/// the full 128-bit source instead of narrowing it; until one exists, refusing
+/// to synthesize is the honest answer.
+pub fn udpv6_rx(src_ipv6: &[u8; 16], dst_ipv6: &[u8; 16], data: &[u8]) {
+    // Same rule as the IPv4 path: trim to the declared UDP length before any
+    // range is derived from it, and reject a length below the header size or
+    // beyond what IP actually delivered.
+    let seg = match udp_segment(data) { Some(s) => s, None => return };
+    let hdr = unsafe { &*(seg.as_ptr() as *const UdpHdr) };
+
+    // RFC 8200 §8.1 INVERTS the IPv4 rule: over IPv6 the UDP checksum is
+    // mandatory.  A zero checksum field is not "sender opted out" — it is
+    // malformed and MUST be dropped.  A non-zero checksum must verify against
+    // the IPv6 pseudo-header (both 128-bit addresses, UDP length, next-header).
+    if u16::from_be_bytes(hdr.checksum) == 0 { return; }
+    // `ipv6::pseudo_checksum` returns the RFC-1071 complement over the
+    // pseudo-header plus `seg` (checksum field included); a valid datagram
+    // folds to 0xFFFF, so the complement must be zero.
+    if super::ipv6::pseudo_checksum(src_ipv6, dst_ipv6, super::ipv6::NEXTHDR_UDP, seg) != 0 {
+        return;
+    }
+
     let dst_port = u16::from_be_bytes(hdr.dst_port);
     let src_port = u16::from_be_bytes(hdr.src_port);
-    let payload  = &data[UDP_HDR_SIZE..];
+    let payload  = &seg[UDP_HDR_SIZE..];
 
-    // Map IPv6 source to a synthetic IPv4 for socket RX (link-local last 4 bytes).
-    let src_ip4: [u8; 4] = [src_ipv6[12], src_ipv6[13], src_ipv6[14], src_ipv6[15]];
+    // Do NOT narrow the IPv6 source into the v4 field — see the note above.
+    // 0.0.0.0 is the unspecified address: no peer legitimately has it, so a
+    // consumer comparing it against an expected server address rejects.
+    const SRC_UNSPECIFIED: [u8; 4] = [0, 0, 0, 0];
+    let src_ip4 = SRC_UNSPECIFIED;
 
     let mut socks = UDP_SOCKETS.lock();
     for i in 0..UDP_MAX_SOCKETS {

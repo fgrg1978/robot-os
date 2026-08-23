@@ -117,10 +117,10 @@ pub fn argmax(v: &[f32]) -> usize {
 
 // ── Dot-product dispatcher ────────────────────────────────────────────────────
 
+/// Delegates to `robot_os_arch::vector`, which picks the best available
+/// implementation (RVV when the hardware and feature allow it, scalar
+/// otherwise).
 #[inline(always)]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(feature = "rvv")]
-    { robot_os_arch::rvv::dot_f32_rvv(a, b) }
-    #[cfg(not(feature = "rvv"))]
-    { robot_os_arch::rvv::dot_f32_scalar(a, b) }
+    robot_os_arch::vector::dot_f32_best(a, b)
 }

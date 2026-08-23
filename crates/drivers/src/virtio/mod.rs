@@ -98,6 +98,13 @@ pub struct Virtq {
     pub free_count:    u8,
     pub last_used_idx: u16,
     pub desc_used:     [bool; VIRTIO_QUEUE_SIZE],
+    /// Used-ring entries consumed whose `id` was out of range. Nonzero means
+    /// the device wrote garbage into the used ring — a device fault, not a
+    /// driver state. The entry is still consumed (see `virtq_poll_with_len`:
+    /// leaving it would wedge the queue on the same entry forever), so this
+    /// counter is the ONLY trace the fault leaves; drivers should treat a
+    /// nonzero value as reason to distrust the device.
+    pub bad_completions: u16,
 }
 
 impl Virtq {
@@ -111,6 +118,7 @@ impl Virtq {
             free_count:    0,
             last_used_idx: 0,
             desc_used:     [false; VIRTIO_QUEUE_SIZE],
+            bad_completions: 0,
         }
     }
 }
@@ -311,6 +319,14 @@ pub unsafe fn virtq_alloc_desc(vq: &mut Virtq) -> Option<usize> {
         return None;
     }
     let idx = vq.free_head as usize;
+    // Defensive: if the free list ever got corrupted (accounting drift, a
+    // stray write), `free_head` could be the 0xFFFF terminator or worse while
+    // `free_count` still claims descriptors are free. Indexing would then be
+    // an OOB write into `desc.add(idx)` and a panic in `desc_used[idx]`
+    // (panic == board reset). Fail the allocation instead.
+    if idx >= vq.num as usize {
+        return None;
+    }
     vq.free_head    = (*vq.desc.add(idx)).next;
     vq.free_count  -= 1;
     vq.desc_used[idx] = true;
@@ -323,7 +339,20 @@ pub unsafe fn virtq_free_desc(vq: &mut Virtq, idx: usize) {
     if idx >= vq.num as usize || !vq.desc_used[idx] {
         return;
     }
-    (*vq.desc.add(idx)).next = vq.free_head;
+    let d = vq.desc.add(idx);
+    // Scrub the descriptor, don't just relink it. Two reasons:
+    //  * A freed descriptor used to keep its old `flags`, so it still looked
+    //    like "has next" while `.next` now pointed into the free list. Any
+    //    chain walk that reaches an already-freed descriptor (duplicate
+    //    completion from a hostile device) would follow the free list to the
+    //    0xFFFF terminator and index far outside the table. With flags
+    //    cleared, such a walk terminates at the first freed descriptor.
+    //  * Zeroing addr/len means a device that (out of spec) re-reads a stale
+    //    descriptor sees a zero-length buffer instead of a live address.
+    (*d).addr  = 0;
+    (*d).len   = 0;
+    (*d).flags = 0;
+    (*d).next  = vq.free_head;
     vq.free_head             = idx as u16;
     vq.free_count           += 1;
     vq.desc_used[idx]        = false;
@@ -332,6 +361,12 @@ pub unsafe fn virtq_free_desc(vq: &mut Virtq, idx: usize) {
 // ---- virtq_submit (port of virtq_submit in virtio.c) ----
 
 pub unsafe fn virtq_submit(dev: &VirtioDev, queue_idx: u32, desc_head: usize, vq: &mut Virtq) {
+    // An uninitialized queue would be a division by zero (`% vq.num`) and a
+    // null deref below — both panic, and panic == board reset. Submitting
+    // nothing is the safer failure mode.
+    if vq.num == 0 || vq.avail.is_null() {
+        return;
+    }
     let avail_idx = ((*vq.avail).idx as usize) % vq.num as usize;
     (*vq.avail).ring[avail_idx] = desc_head as u16;
 
@@ -365,22 +400,50 @@ pub unsafe fn virtq_poll(vq: &mut Virtq) -> Option<usize> {
 /// can write any value. We bounds-check both before returning so callers
 /// can trust them as array indices / slice lengths without further checks.
 pub unsafe fn virtq_poll_with_len(vq: &mut Virtq) -> Option<(usize, usize)> {
-    fence(Ordering::Acquire); // fence r,r
-
-    if vq.last_used_idx == (*vq.used).idx {
+    // An uninitialized queue would be a null deref and a division by zero
+    // (`% vq.num`) — both panic, and panic == board reset. Report "empty".
+    if vq.num == 0 || vq.used.is_null() {
         return None;
     }
 
+    // The used ring is written by the device (DMA), so read the index
+    // volatile: callers busy-wait on this function, and a plain load of
+    // device-written memory is exactly what the optimizer is allowed to
+    // treat as loop-invariant.
+    let used_idx_now = core::ptr::read_volatile(core::ptr::addr_of!((*vq.used).idx));
+    if vq.last_used_idx == used_idx_now {
+        return None;
+    }
+
+    // fence r,r AFTER observing the new index and BEFORE reading the ring
+    // entry (and before the caller reads any DMA'd payload/status). RISC-V
+    // may satisfy the later loads early; without this fence the entry — or
+    // the buffer contents the caller inspects next — can be stale even
+    // though `idx` was seen to advance.
+    fence(Ordering::Acquire);
+
     let used_idx = (vq.last_used_idx as usize) % vq.num as usize;
-    let id  = (*vq.used).ring[used_idx].id  as usize;
-    let len = (*vq.used).ring[used_idx].len as usize;
+    let elem = core::ptr::addr_of!((*vq.used).ring[used_idx]);
+    let id  = core::ptr::read_volatile(core::ptr::addr_of!((*elem).id))  as usize;
+    let len = core::ptr::read_volatile(core::ptr::addr_of!((*elem).len)) as usize;
     vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
 
     // Defensive bounds: a malicious / malfunctioning device could write
     // an `id` outside the descriptor table. Indexing without this check
     // is OOB read in `vq.desc.add(id)` calls higher up the stack.
+    //
+    // The entry was already consumed above (`last_used_idx` advanced) — on
+    // purpose: NOT consuming it would re-read the same corrupt entry forever
+    // and wedge the queue. The cost is that the caller cannot tell this
+    // `None` from "ring empty", so the associated buffer/descriptor cannot be
+    // recovered (for RX that is a permanently lost buffer). `bad_completions`
+    // records the fault so drivers and health checks can see the device is
+    // misbehaving instead of the loss being fully silent.
     let qsize = vq.num as usize;
-    if id >= qsize { return None; }
+    if id >= qsize {
+        vq.bad_completions = vq.bad_completions.saturating_add(1);
+        return None;
+    }
     // `len` larger than the descriptor's buffer length should also be
     // impossible per virtio spec, but we let the caller cap it against
     // its own buffer size so we don't have to re-derive that here.

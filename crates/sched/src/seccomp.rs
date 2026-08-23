@@ -5,10 +5,35 @@
 //!
 //! Profiles:
 //!   UNRESTRICTED — all syscalls allowed (kernel tasks, default)
-//!   SENSOR       — read sensors, I2C, GPIO input. No motors, no net, no fs.
+//!   SENSOR       — sensor reads, GPIO input, ADC, and I2C *read and write*.
+//!                  No net, no fs, no PWM/motor syscalls.
 //!   MOTOR        — PWM, motor control, GPIO output. No net, no fs.
 //!   NET          — sockets, DNS. No GPIO, no motors, no sensors.
 //!   MINIMAL      — only exit, yield, sleep, write(stdout), brk.
+//!
+//! WHAT `SENSOR` DOES NOT GUARANTEE (corrected claim — read this before
+//! trusting the profile with anything):
+//!
+//! This header used to say SENSOR meant "No motors". It does not, and the
+//! allowlist is the honest half of the pair. SENSOR grants `SYS_I2C_WRITE`,
+//! whose signature is `sys_i2c_write(bus, addr, ptr, len)` — the target
+//! device address is a caller-supplied argument, so the grant is *bus-wide*.
+//! On a board with an I2C-attached motor controller (PCA9685, an I2C ESC),
+//! a SENSOR-profiled task can drive the motors through it. Seccomp filters
+//! syscall *numbers*; it cannot see arguments, so no arrangement of this
+//! allowlist can express "I2C, but not that address".
+//!
+//! The allowlist is nonetheless correct as written: essentially every I2C
+//! sensor (MPU-6050, BME280, VL53L0X…) requires register-select and init
+//! writes before it can be read at all. Removing `SYS_I2C_WRITE` would not
+//! tighten the profile, it would make it non-functional — so the header was
+//! the thing that had to change, not the profile.
+//!
+//! What actually scopes I2C to a device today is the separate capability
+//! check inside `sys_i2c_write` — bus/addr packed identically to the typed
+//! `Cap<I2c>` resource in `crates/ipc/src/i2c_cap.rs` (`bus << 8 | addr`).
+//! Address-scoped caps are the real fix; this profile is a coarse second layer, not the
+//! boundary between a sensor task and the motors.
 
 use crate::task::SyscallFilter;
 
@@ -66,8 +91,17 @@ const COMMON: &[u16] = &[
 ];
 
 /// Build a SyscallFilter from a profile ID.
-pub fn profile_to_filter(profile_id: u64) -> SyscallFilter {
-    match profile_id {
+///
+/// Returns `None` for an id that names no profile. The `Option` is the
+/// whole point: `PROFILE_UNRESTRICTED` legitimately maps to a *disabled*
+/// filter, so a bare `SyscallFilter` return value cannot distinguish
+/// "the caller asked for no sandbox" from "the caller asked for a
+/// sandbox that does not exist". The previous `_ => disabled()` arm
+/// collapsed the two, so a typo'd profile id silently produced an
+/// unrestricted task while every caller was told it had succeeded.
+/// Callers MUST decide explicitly what an unknown id means for them.
+pub fn profile_to_filter(profile_id: u64) -> Option<SyscallFilter> {
+    Some(match profile_id {
         PROFILE_UNRESTRICTED => SyscallFilter::disabled(),
         PROFILE_SENSOR => build_filter(&[
             SYS_SENSOR_READ, SYS_GPIO_READ, SYS_I2C_READ,
@@ -83,8 +117,8 @@ pub fn profile_to_filter(profile_id: u64) -> SyscallFilter {
             SYS_CONNECT, SYS_SEND, SYS_RECV,
         ]),
         PROFILE_MINIMAL => build_filter(&[]),
-        _ => SyscallFilter::disabled(), // unknown → unrestricted (safe default)
-    }
+        _ => return None, // unknown id — NOT "unrestricted"; see the doc above
+    })
 }
 
 /// Build a filter from common + extra syscalls.
@@ -100,14 +134,39 @@ fn build_filter(extra: &[u16]) -> SyscallFilter {
     filter
 }
 
+/// Error: the task already has a filter installed (one-way, no downgrade).
+pub const SECCOMP_E_ALREADY: i64 = -1;
+/// Error: `profile_id` names no profile. Nothing was installed.
+pub const SECCOMP_E_BADPROFILE: i64 = -2;
+
 /// Activate a security profile on the current task (one-way).
-/// Returns 0 on success, -1 if already filtered (can't downgrade).
+///
+/// Returns 0 on success, [`SECCOMP_E_ALREADY`] if a filter is already
+/// installed, [`SECCOMP_E_BADPROFILE`] for an unknown profile id.
+///
+/// The unknown-id check happens BEFORE anything is installed. It used to
+/// fall through to a disabled (= unrestricted) filter and still return 0:
+/// a task that meant to sandbox itself but passed a typo'd id was told it
+/// had succeeded and kept full syscall authority. A security mechanism
+/// that reports success while installing nothing is worse than none at
+/// all, because the caller stops looking.
+///
+/// Note for callers: `activate_profile(PROFILE_UNRESTRICTED)` is a
+/// deliberate no-op that returns 0 — it installs a disabled filter, so
+/// `enabled` stays false and the one-way gate above is NOT burned. That
+/// is by design (it names "no sandbox"), but it means a 0 return does not
+/// on its own prove the task is now confined.
 pub fn activate_profile(profile_id: u64) -> i64 {
+    // Reject the unknown id first — never touch the task's filter on a
+    // request we could not honour.
+    let filter = match profile_to_filter(profile_id) {
+        Some(f) => f,
+        None => return SECCOMP_E_BADPROFILE,
+    };
     let current = crate::scheduler::current_syscall_filter();
     if current.enabled {
-        return -1; // already filtered — one-way, can't change
+        return SECCOMP_E_ALREADY; // already filtered — one-way, can't change
     }
-    let filter = profile_to_filter(profile_id);
     crate::scheduler::set_current_syscall_filter(filter);
     0
 }

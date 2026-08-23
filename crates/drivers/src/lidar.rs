@@ -25,6 +25,8 @@ const LD19_HEADER: u8 = 0x54;
 const LD19_VERLEN: u8 = 0x2C;
 const LD19_POINTS_PER_PACKET: usize = 12;
 const LD19_PACKET_SIZE: usize = 47;
+/// Centi-degrees in a full revolution (LD19 reports angles in 0.01° units).
+const LD19_FULL_TURN_CDEG: u16 = 36000;
 
 /// Maximum scan points in a full revolution buffer.
 pub const SCAN_BUF_MAX_POINTS: usize = 360;
@@ -171,6 +173,13 @@ unsafe fn process_packet() {
     let start_angle = u16::from_le_bytes([PKT_BUF[4], PKT_BUF[5]]);
     let end_angle = u16::from_le_bytes([PKT_BUF[42], PKT_BUF[43]]);
 
+    // CRC-8 catches bit-flips but not out-of-range values. Reject a packet
+    // whose angles exceed a full turn: the u32 arithmetic below stays exact,
+    // but a bogus angle would still poison the interpolated scan points.
+    if start_angle >= LD19_FULL_TURN_CDEG || end_angle >= LD19_FULL_TURN_CDEG {
+        return;
+    }
+
     // Detect revolution wrap: end_angle < last_end_angle → new scan
     if end_angle < LAST_END_ANGLE && SCAN_BACK_COUNT.load(Ordering::Relaxed) > 0 {
         // Swap buffers
@@ -184,10 +193,12 @@ unsafe fn process_packet() {
     LAST_END_ANGLE = end_angle;
 
     // Interpolate angles for the 12 points in this packet
-    let angle_step = if end_angle >= start_angle {
-        (end_angle - start_angle) / (LD19_POINTS_PER_PACKET as u16)
+    // Computed in u32: `LD19_FULL_TURN_CDEG + end_angle` overflows u16.
+    let angle_step: u32 = if end_angle >= start_angle {
+        (end_angle as u32 - start_angle as u32) / LD19_POINTS_PER_PACKET as u32
     } else {
-        (36000 + end_angle - start_angle) / (LD19_POINTS_PER_PACKET as u16)
+        (LD19_FULL_TURN_CDEG as u32 + end_angle as u32 - start_angle as u32)
+            / LD19_POINTS_PER_PACKET as u32
     };
 
     // Parse 12 data points (each 3 bytes: distance_mm u16 LE + intensity u8)
@@ -204,7 +215,8 @@ unsafe fn process_packet() {
         let distance_mm = u16::from_le_bytes([PKT_BUF[off], PKT_BUF[off + 1]]);
         // intensity at PKT_BUF[off + 2] — ignored for now
 
-        let angle_cdeg = (start_angle + (i as u16) * angle_step) % 36000;
+        let angle_cdeg =
+            ((start_angle as u32 + i as u32 * angle_step) % LD19_FULL_TURN_CDEG as u32) as u16;
 
         SCAN_BACK[pt_idx] = ScanPoint { angle_cdeg, distance_mm };
     }

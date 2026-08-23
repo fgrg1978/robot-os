@@ -47,6 +47,27 @@ pub const INTEGRAL_WINDUP_LIMIT: i64 = 10_000;
 /// Number of motor channels (left pair + right pair).
 pub const NUM_CHANNELS: usize = 2;
 
+/// Largest velocity error (ticks/s) the PID math will act on.
+///
+/// Anything past this is not a real wheel speed — it is a corrupt encoder
+/// read or a hostile syscall argument — and letting such a value reach the
+/// gain multiplications below is what turns bad input into an arithmetic
+/// overflow. Clamping keeps the operands bounded; the `saturating_*` calls
+/// in [`PidController::update`] are the belt to this suspenders, because a
+/// caller can set gains as large as `i32::MAX` via `motor_pid_set_gains`
+/// and `kp * error` must not trap even for that combination.
+pub const ERROR_LIMIT: i64 = 1_000_000;
+
+/// Longest interval (ms) that still yields a usable velocity estimate.
+///
+/// Two consecutive ticks further apart than this tell us nothing about
+/// current wheel speed: the robot may have travelled anywhere in between.
+/// Rather than feed a meaningless derivative into the motors, the loop
+/// re-establishes its baseline and outputs zero for one cycle. The RT task
+/// calls at `PID_DT_MS` (10 ms), so this is 100x the nominal period —
+/// it fires on genuine loss of sync, not on jitter.
+pub const MAX_DT_MS: u64 = 1_000;
+
 /// Index for left motor channel.
 pub const CH_LEFT: usize = 0;
 
@@ -108,14 +129,43 @@ impl PidController {
             return 0;
         }
 
-        let error = (setpoint - measurement) as i64;
+        // Widen to i64 BEFORE subtracting, then clamp.
+        //
+        // This was `(setpoint - measurement) as i64` — an **i32**
+        // subtraction whose result was only then widened. With
+        // `overflow-checks = true` that traps whenever the operands are far
+        // apart, and `measurement` is reachable at `i32::MIN`: it is the
+        // velocity computed in `motor_pid_tick` from encoder ticks that a
+        // ring-3 task passes in through `sys_motor_tick_typed`. A trap here
+        // is not a caught error — `panic = "abort"` makes it a full board
+        // reset, i.e. a moving robot losing its controller. Widening first
+        // makes the subtraction total for every i32 pair.
+        //
+        // This function is `pub` on a `pub` struct, so the guard belongs
+        // here and not only in the caller: it must hold for any future
+        // caller that does not clamp its own inputs.
+        let error = (setpoint as i64 - measurement as i64)
+            .clamp(-ERROR_LIMIT, ERROR_LIMIT);
 
         // Proportional term: P = Kp * error
-        let p = self.kp * error / FIXED_SCALE;
+        //
+        // `kp` is Q16.16, so `motor_pid_set_gains(i32::MAX, ..)` yields
+        // |kp| up to 2^47; against a clamped |error| of 2^20 the product
+        // still exceeds i64. Saturating is the right failure mode for a
+        // controller: the output is clamped to ±100 anyway, so a saturated
+        // term and a merely enormous one command the same full-scale PWM.
+        let p = self.kp.saturating_mul(error) / FIXED_SCALE;
 
         // Integral term: I += Ki * error * dt
         // dt in seconds = dt_ms / 1000, so: Ki * error * dt_ms / 1000
-        self.integral += self.ki * error * dt_ms as i64 / (FIXED_SCALE * 1000);
+        let i_step = self
+            .ki
+            .saturating_mul(error)
+            .saturating_mul(dt_ms as i64)
+            / (FIXED_SCALE * 1000);
+        // Saturating add: the accumulator is clamped on the next line, but
+        // the addition itself must not trap on the way there.
+        self.integral = self.integral.saturating_add(i_step);
         // Anti-windup clamping
         let windup_limit = INTEGRAL_WINDUP_LIMIT * FIXED_SCALE;
         self.integral = self.integral.clamp(-windup_limit, windup_limit);
@@ -123,14 +173,26 @@ impl PidController {
 
         // Derivative term: D = Kd * d(error)/dt
         // d(error)/dt = (error - prev_error) / dt_seconds
+        //
+        // `de` cannot overflow: both terms are already clamped to
+        // ±ERROR_LIMIT, so |de| ≤ 2·ERROR_LIMIT. The divisor cannot
+        // overflow either — FIXED_SCALE · u32::MAX ≈ 2.8e14 — and cannot be
+        // zero, because `dt_ms == 0` returned above.
         let de = error - self.prev_error;
-        let d = self.kd * de * 1000 / (FIXED_SCALE * dt_ms as i64);
+        let d = self
+            .kd
+            .saturating_mul(de)
+            .saturating_mul(1000)
+            / (FIXED_SCALE * dt_ms as i64);
         let d = d / FIXED_SCALE;
 
         self.prev_error = error;
 
-        // Sum and clamp
-        let output = p + i + d;
+        // Sum and clamp. Saturating: each term is individually bounded well
+        // below i64::MAX after the divisions above, but the sum is written
+        // this way so that widening any single term later cannot silently
+        // reintroduce a trapping add on the path to the motors.
+        let output = p.saturating_add(i).saturating_add(d);
         output.clamp(self.output_min as i64, self.output_max as i64) as i32
     }
 
@@ -182,6 +244,19 @@ impl TickState {
 static TICK_STATE: SpinLock<TickState> = SpinLock::new(TickState::new());
 
 // ── Public API ───────────────────────────────────────────────────────────────
+
+/// Clamp an i64 into i32 range instead of truncating.
+///
+/// `as i32` on an out-of-range value wraps, so a very large positive velocity
+/// becomes a large negative one and the PID responds by driving the motor
+/// backwards. Saturating keeps the sign, which is the property that matters
+/// when the number feeds an actuator.
+#[inline]
+fn clamp_i32(v: i64) -> i32 {
+    if v > i32::MAX as i64 { i32::MAX }
+    else if v < i32::MIN as i64 { i32::MIN }
+    else { v as i32 }
+}
 
 /// Initialize both PID controllers and enable closed-loop control.
 ///
@@ -243,10 +318,21 @@ pub fn motor_pid_tick(ticks_l: i64, ticks_r: i64, now: u64) -> (i32, i32) {
     }
 
     // Compute elapsed time in milliseconds.
+    //
+    // `now` comes straight from userspace: sys_motor_tick_typed passes a0..a3
+    // through motor_cap::motor_tick_cap to here with no range validation on
+    // the way. With `overflow-checks = true` and `panic = "abort"`, a bare
+    // `elapsed * 1000` is a board reset two calls away — pass `now = 1`, then
+    // `now = 0x8000_0000_0000_0001`, and the multiply overflows u64. On a
+    // robot a spontaneous reset is a physical-safety event, so this is a
+    // security bound, not a robustness nicety.
+    //
+    // Saturating rather than rejecting: a saturated `dt_ms` yields a velocity
+    // of ~0, which the PID treats as "no motion measured" — the safe reading.
     let elapsed_clint = now.wrapping_sub(ts.prev_time);
     let timer_freq = crate::clint::TIMER_FREQ;
     let dt_ms = if timer_freq > 0 {
-        (elapsed_clint * 1000 / timer_freq) as u32
+        (elapsed_clint.saturating_mul(1000) / timer_freq).min(u32::MAX as u64) as u32
     } else {
         PID_DT_MS // fallback
     };
@@ -257,10 +343,17 @@ pub fn motor_pid_tick(ticks_l: i64, ticks_r: i64, now: u64) -> (i32, i32) {
     }
 
     // Compute actual velocity (ticks per second).
-    let delta_l = ticks_l - ts.prev_ticks_l;
-    let delta_r = ticks_r - ts.prev_ticks_r;
-    let vel_l = (delta_l * 1000 / dt_ms as i64) as i32;
-    let vel_r = (delta_r * 1000 / dt_ms as i64) as i32;
+    //
+    // Same provenance as `now` above: `ticks_l`/`ticks_r` are userspace
+    // values. `i64::MAX` followed by `i64::MIN` overflows the subtraction, and
+    // the `* 1000` overflows well before that. Both saturate, and the result
+    // is clamped into i32 rather than truncated — a wrapped cast would turn a
+    // huge positive velocity into a large negative one, which the PID would
+    // answer by driving the motor the wrong way.
+    let delta_l = ticks_l.saturating_sub(ts.prev_ticks_l);
+    let delta_r = ticks_r.saturating_sub(ts.prev_ticks_r);
+    let vel_l = clamp_i32(delta_l.saturating_mul(1000) / dt_ms as i64);
+    let vel_r = clamp_i32(delta_r.saturating_mul(1000) / dt_ms as i64);
 
     // Save current state for next iteration.
     ts.prev_ticks_l = ticks_l;

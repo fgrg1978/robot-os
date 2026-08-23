@@ -1,0 +1,20 @@
+[package]
+name = "robot_os_drivers_api_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for robot_os_drivers_api. Excluded from workspace."
+
+# The api crate is no_std + architecture-neutral, so it compiles on
+# the host. This excluded crate is the documented run entry point,
+# matching the abi-tests / sched-policy-tests pattern.
+#
+# Run with:
+#   cd crates/drivers-api-tests && cargo +stable test \
+#       --target aarch64-apple-darwin
+
+[dependencies]
+robot_os_abi         = { path = "../abi" }
+robot_os_drivers_api = { path = "../drivers-api" }
+
+[dev-dependencies]

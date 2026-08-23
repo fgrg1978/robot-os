@@ -1,0 +1,14 @@
+[package]
+name = "robot_os_ipc_fast_tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tests for the fast-path IPC slot logic in crates/ipc/src/fast_ipc.rs. Excluded from workspace."
+
+# No dependencies on purpose. `fast_ipc.rs` names `robot_os_sync` and
+# `robot_os_sched`, both RV64-only, but only under `cfg(not(test))`; under
+# `cfg(test)` it uses the host substitutes it carries itself. If this list ever
+# grows, check that whatever was added is host-buildable.
+[dependencies]
+
+[dev-dependencies]

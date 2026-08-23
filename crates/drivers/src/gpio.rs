@@ -70,6 +70,30 @@ mod sim {
         0
     }
 
+    /// Emergency GPIO write for the panic handler — bypasses the `GPIO`
+    /// spinlock entirely instead of calling `.lock()`.
+    ///
+    /// This deliberately sacrifices mutual exclusion: if another hart is
+    /// inside `gpio_write`/`gpio_set_direction`/`gpio_toggle` holding
+    /// `GPIO` at the exact moment of a panic, waiting for that lock (as
+    /// `gpio_write` does) would spin forever and the panic message would
+    /// never reach UART. During a panic, stopping actuators and getting
+    /// the crash reason printed matters more than leaving the simulated
+    /// GPIO state internally consistent. This is a conscious trade-off,
+    /// not an oversight — do not "fix" it by adding a lock back in.
+    ///
+    /// # Safety
+    /// May race with a concurrent `gpio_write`/`gpio_set_direction` on
+    /// another hart, producing a torn read-modify-write of `GpioState`.
+    /// Only call this from the panic handler.
+    pub fn gpio_write_panic(pin: u32, val: u32) -> i32 {
+        if pin as usize >= GPIO_MAX_PINS { return -1; }
+        let g = unsafe { GPIO.get_mut_unchecked() };
+        if g.direction[pin as usize] != GpioDir::Output { return -1; }
+        g.value[pin as usize] = (val & 1) as u8;
+        0
+    }
+
     pub fn gpio_info() {
         crate::kprintln!("[GPIO] Simulated GPIO — {} pins", GPIO_MAX_PINS);
         let g = GPIO.lock();
@@ -111,9 +135,20 @@ pub use sim::*;
 mod mmio {
     use super::*;
     use crate::platform::hw::{GPIO_BASE, GPIO_DOUT0, GPIO_OEN0, GPIO_DIN0};
+    use robot_os_sync::SpinLock;
 
     // Bank 1 registers are offset by 0x08 from bank 0.
     const BANK1_OFFSET: usize = 0x08;
+
+    // GPIOOUT0/OEN0 (and their bank-1 counterparts) are read-modify-write
+    // registers: set_direction/write/toggle all read the current register,
+    // flip one bit, and write it back. Bank 0 is shared by motors, the
+    // payload actuator and the camera, so two harts touching different
+    // pins in the same bank can race — one hart's read-modify-write
+    // clobbers the other's update with a stale value. Mirrors the lock
+    // already used by the QEMU `sim` path above (`static GPIO: SpinLock<..>`)
+    // to serialize the same class of RMW.
+    static GPIO_MMIO_LOCK: SpinLock<()> = SpinLock::new(());
 
     #[inline(always)]
     fn reg_read32(offset: usize) -> u32 {
@@ -139,6 +174,7 @@ mod mmio {
     pub fn gpio_set_direction(pin: u32, dir: GpioDir) -> i32 {
         if pin as usize >= GPIO_MAX_PINS { return -1; }
         let (boff, bit) = bank(pin);
+        let _guard = GPIO_MMIO_LOCK.lock();
         let mut oen = reg_read32(GPIO_OEN0 + boff);
         match dir {
             GpioDir::Output => oen &= !(1 << bit),  // 0 = output enabled
@@ -157,6 +193,7 @@ mod mmio {
     pub fn gpio_write(pin: u32, val: u32) -> i32 {
         if pin as usize >= GPIO_MAX_PINS { return -1; }
         let (boff, bit) = bank(pin);
+        let _guard = GPIO_MMIO_LOCK.lock();
         let mut out = reg_read32(GPIO_DOUT0 + boff);
         if val & 1 != 0 { out |=  1 << bit; }
         else             { out &= !(1 << bit); }
@@ -167,7 +204,37 @@ mod mmio {
     pub fn gpio_toggle(pin: u32) -> i32 {
         if pin as usize >= GPIO_MAX_PINS { return -1; }
         let (boff, bit) = bank(pin);
+        let _guard = GPIO_MMIO_LOCK.lock();
         let out = reg_read32(GPIO_DOUT0 + boff) ^ (1 << bit);
+        reg_write32(GPIO_DOUT0 + boff, out);
+        0
+    }
+
+    /// Emergency GPIO write for the panic handler — bypasses
+    /// `GPIO_MMIO_LOCK` entirely instead of calling `.lock()`.
+    ///
+    /// `GPIO_MMIO_LOCK` was added to serialize the GPIOOUT/GPIOOEN
+    /// read-modify-write across harts (see the lock's doc comment above).
+    /// That is exactly right for normal operation, but it means a panic
+    /// on one hart while another hart holds this lock would spin forever
+    /// in the panic handler and the crash reason would never reach UART.
+    /// This function deliberately sacrifices RMW exclusion — a torn
+    /// bank write that leaves some unrelated pin's output bit wrong is
+    /// an acceptable price during a panic; a kernel that hangs silently
+    /// instead of printing why it crashed is not. Conscious trade-off,
+    /// not an oversight — do not "fix" it by adding the lock back.
+    ///
+    /// # Safety
+    /// May race with a concurrent `gpio_write`/`gpio_set_direction`/
+    /// `gpio_toggle` on another hart touching the same register bank,
+    /// producing a torn read-modify-write. Only call this from the
+    /// panic handler.
+    pub fn gpio_write_panic(pin: u32, val: u32) -> i32 {
+        if pin as usize >= GPIO_MAX_PINS { return -1; }
+        let (boff, bit) = bank(pin);
+        let mut out = reg_read32(GPIO_DOUT0 + boff);
+        if val & 1 != 0 { out |=  1 << bit; }
+        else             { out &= !(1 << bit); }
         reg_write32(GPIO_DOUT0 + boff, out);
         0
     }

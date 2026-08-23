@@ -55,19 +55,34 @@ pub fn imu_init(bus: u8, addr: u8) -> bool {
     }
 
     // Wake up: clear SLEEP bit (bit 6) in PWR_MGMT_1, select internal 8 MHz clock
-    i2c::i2c_write(bus, addr, &[REG_PWR_MGMT_1, 0x00]);
+    if i2c::i2c_write(bus, addr, &[REG_PWR_MGMT_1, 0x00]) < 0 {
+        robot_os_drivers::kprintln!("[IMU] Failed to write PWR_MGMT_1 register");
+        return false;
+    }
 
     // Sample rate divider: 0 → 1 kHz / (1+0) = 1 kHz sample rate
-    i2c::i2c_write(bus, addr, &[REG_SMPLRT_DIV, 0x00]);
+    if i2c::i2c_write(bus, addr, &[REG_SMPLRT_DIV, 0x00]) < 0 {
+        robot_os_drivers::kprintln!("[IMU] Failed to write SMPLRT_DIV register");
+        return false;
+    }
 
     // DLPF config: 3 → accel BW 44 Hz, gyro BW 42 Hz
-    i2c::i2c_write(bus, addr, &[REG_CONFIG, 0x03]);
+    if i2c::i2c_write(bus, addr, &[REG_CONFIG, 0x03]) < 0 {
+        robot_os_drivers::kprintln!("[IMU] Failed to write CONFIG register");
+        return false;
+    }
 
     // Gyro config: FS_SEL=0 → ±250 °/s
-    i2c::i2c_write(bus, addr, &[REG_GYRO_CONFIG, 0x00]);
+    if i2c::i2c_write(bus, addr, &[REG_GYRO_CONFIG, 0x00]) < 0 {
+        robot_os_drivers::kprintln!("[IMU] Failed to write GYRO_CONFIG register");
+        return false;
+    }
 
     // Accel config: AFS_SEL=0 → ±2 g
-    i2c::i2c_write(bus, addr, &[REG_ACCEL_CONFIG, 0x00]);
+    if i2c::i2c_write(bus, addr, &[REG_ACCEL_CONFIG, 0x00]) < 0 {
+        robot_os_drivers::kprintln!("[IMU] Failed to write ACCEL_CONFIG register");
+        return false;
+    }
 
     IMU_BUS.store(bus, Ordering::Relaxed);
     IMU_ADDR.store(addr, Ordering::Relaxed);

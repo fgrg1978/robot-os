@@ -32,6 +32,8 @@ pub const SYS_IPC_DESTROY: u64 = 107;
 /// Map a shared memory region (created by SYS_IPC_SHARE) into the calling
 /// process's address space.  a0 = shm_id → returns VA base or -1.
 pub const SYS_IPC_MAP:     u64 = 115;
+// Cross-task cap delegation (frozen in crates/abi/src/syscall_nr.rs).
+pub const SYS_CAP_GRANT:   u64 = 116;
 
 // Fast-path IPC (M02): register-passing, ≤32 bytes, zero-copy
 pub const SYS_IPC_FAST_CALL:   u64 = 108; // client: a0=server_tid, a1..a4=data words
@@ -249,3 +251,54 @@ pub const SYS_DRIVER_REPLY:       u64 = 524;
 pub const SYS_DRIVER_REQUEST:     u64 = 525;
 pub const SYS_DRIVER_TRY_REPLY:   u64 = 526;
 pub const SYS_DRIVER_STATS:       u64 = 527;
+
+// PHANES Phase 1 W3 — Cap<T> typed IPC (RFC-0003).
+// Numbers must match `robot_os_abi::syscall_nr::SYS_*_TYPED`.
+pub const SYS_CHAN_WRITE_TYPED:   u64 = 528;
+pub const SYS_CHAN_READ_TYPED:    u64 = 529;
+
+// PHANES Phase 1 W5 — Cap<Port> typed port API.
+// RFC-0002 Driver registry bridge — userspace invokes a driver by
+// (kind, op) and the kernel routes through `dyn Driver`.
+pub const SYS_DRV_INVOKE:         u64 = 311;
+
+pub const SYS_PORT_CREATE_TYPED:  u64 = 530;
+pub const SYS_PORT_POLL_TYPED:    u64 = 531;
+pub const SYS_PORT_DESTROY_TYPED: u64 = 532;
+
+// PHANES Phase 1 W5 batch 2 — Cap<Shm> typed shared-memory API.
+pub const SYS_SHM_CREATE_TYPED:   u64 = 533;
+pub const SYS_SHM_ACQUIRE_TYPED:  u64 = 534;
+pub const SYS_SHM_RELEASE_TYPED:  u64 = 535;
+
+// PHANES Phase 1 W5 batch 3 — Cap<IoRing> typed io_ring API.
+pub const SYS_IORING_CREATE_TYPED:  u64 = 536;
+pub const SYS_IORING_SUBMIT_TYPED:  u64 = 537;
+pub const SYS_IORING_DESTROY_TYPED: u64 = 538;
+
+// PHANES Phase 1 W5 batch 5.1 — Cap<Gpio> typed hardware API.
+pub const SYS_GPIO_READ_TYPED:      u64 = 539;
+pub const SYS_GPIO_WRITE_TYPED:     u64 = 540;
+pub const SYS_GPIO_SET_DIR_TYPED:   u64 = 541;
+
+// PHANES Phase 1 W5 batch 5.2 — Cap<I2c> typed hardware API.
+pub const SYS_I2C_READ_TYPED:       u64 = 542;
+pub const SYS_I2C_WRITE_TYPED:      u64 = 543;
+pub const SYS_I2C_DETECT_TYPED:     u64 = 544;
+
+// PHANES Phase 1 W5 batch 5.3 — Cap<Pwm> typed hardware API.
+// Fills the last 5 slots of the 528..=549 cap-typed range.
+pub const SYS_PWM_ENABLE_TYPED:       u64 = 545;
+pub const SYS_PWM_DISABLE_TYPED:      u64 = 546;
+pub const SYS_PWM_SET_PERIOD_TYPED:   u64 = 547;
+pub const SYS_PWM_SET_DUTY_TYPED:     u64 = 548;
+pub const SYS_PWM_SET_DUTY_PCT_TYPED: u64 = 549;
+
+// PHANES Phase 1 W5 batch 5.4 — Cap<Motor> typed hardware API.
+// Opens the cap-typed extension range 550..=569.
+pub const SYS_MOTOR_SET_TARGET_TYPED: u64 = 550;
+pub const SYS_MOTOR_TICK_TYPED:       u64 = 551;
+pub const SYS_MOTOR_ENABLE_TYPED:     u64 = 552;
+pub const SYS_MOTOR_ENABLED_TYPED:    u64 = 553;
+pub const SYS_MOTOR_SET_GAINS_TYPED:  u64 = 554;
+pub const SYS_MOTOR_RESET_TYPED:      u64 = 555;

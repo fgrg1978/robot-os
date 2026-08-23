@@ -1,0 +1,22 @@
+[package]
+name = "robot_os_arch_x86_64"
+version = "0.1.0"
+edition = "2021"
+description = "PHANES Phase 2 — x86_64 ISA impl of robot_os_arch_api (Cpu / Interrupts / Mmu / Boot for 4-level paging + APIC + ACPI). Boot stub + APIC programming deferred to B2.boot."
+license = "Apache-2.0"
+repository = "https://github.com/phanes-project/phanes"
+
+[lib]
+name = "robot_os_arch_x86_64"
+
+# Workspace member; asm bodies cfg-gated to
+# `target_arch = "x86_64"`. On the workspace's riscv64 target the
+# crate compiles cleanly as essentially-empty.
+#
+# To exercise the impls standalone:
+#   rustup target add x86_64-unknown-none
+#   cargo build --target x86_64-unknown-none -p robot_os_arch_x86_64
+
+[dependencies]
+robot_os_arch_api = { workspace = true }
+bitflags          = { workspace = true }
